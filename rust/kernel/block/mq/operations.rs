@@ -29,6 +29,7 @@ use core::{
     marker::PhantomData,
     ptr::NonNull, //
 };
+use pin_init::PinInit;
 
 type ForeignBorrowed<'a, T> = <T as ForeignOwnable>::Borrowed<'a>;
 
@@ -44,9 +45,26 @@ type ForeignBorrowed<'a, T> = <T as ForeignOwnable>::Borrowed<'a>;
 /// [module level documentation]: kernel::block::mq
 #[macros::vtable]
 pub trait Operations: Sized {
+    /// Data associated with a request. This data is located next to the request
+    /// structure.
+    ///
+    /// To be able to handle accessing this data from interrupt context, this
+    /// data must be `Sync`.
+    ///
+    /// Requests may be cleaned up by a thread different from the allocating thread, so
+    /// `RequestData` must be `Send`.
+    ///
+    /// The `RequestData` object is initialized when the requests are allocated
+    /// during queue initialization, and it is are dropped when the requests are
+    /// dropped during queue teardown.
+    type RequestData: Sized + Sync + Send;
+
     /// Data associated with the `struct request_queue` that is allocated for
     /// the `GenDisk` associated with this `Operations` implementation.
     type QueueData: ForeignOwnable + Sync;
+
+    /// Called by the kernel to get an initializer for a `Pin<&mut RequestData>`.
+    fn new_request_data() -> impl PinInit<Self::RequestData>;
 
     /// Called by the kernel to queue a request with the driver. If `is_last` is
     /// `false`, the driver is allowed to defer committing the request.
@@ -252,6 +270,12 @@ impl<T: Operations> OperationsVTable<T> {
             // it is valid for writes.
             unsafe { RequestDataWrapper::refcount_ptr(pdu.as_ptr()).write(Refcount::new(0)) };
 
+            let initializer = T::new_request_data();
+
+            // SAFETY: `pdu` is a valid pointer as established above. We do not touch `pdu` if
+            // `__pinned_init` returns an error. We promise not to move the pointee of `pdu`.
+            unsafe { initializer.__pinned_init(RequestDataWrapper::data_ptr(pdu.as_ptr()))? };
+
             Ok(0)
         })
     }
@@ -271,7 +295,7 @@ impl<T: Operations> OperationsVTable<T> {
     ) {
         // SAFETY: The tagset invariants guarantee that all requests are allocated with extra memory
         // for the request data.
-        let pdu = unsafe { bindings::blk_mq_rq_to_pdu(rq) }.cast::<RequestDataWrapper>();
+        let pdu = unsafe { bindings::blk_mq_rq_to_pdu(rq) }.cast::<RequestDataWrapper<T>>();
 
         // SAFETY: `pdu` is valid for read and write and is properly initialised.
         unsafe { core::ptr::drop_in_place(pdu) };
