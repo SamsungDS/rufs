@@ -56,6 +56,7 @@ impl NullBlkDevice {
         let tagset = Arc::pin_init(
             TagSet::new(
                 1,
+                (),
                 256,
                 1,
                 kernel::alloc::NumaNode::NO_NODE,
@@ -82,6 +83,12 @@ struct QueueData {
 #[vtable]
 impl Operations for NullBlkDevice {
     type QueueData = KBox<QueueData>;
+    type TagSetData = ();
+    type RequestData = ();
+
+    fn new_request_data() -> impl PinInit<Self::RequestData> {
+        Ok(())
+    }
 
     #[inline(always)]
     fn queue_rq(queue_data: &QueueData, rq: Owned<mq::Request<Self>>, _is_last: bool) -> Result {
