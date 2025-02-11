@@ -7,6 +7,7 @@
 use core::pin::Pin;
 
 use crate::{
+    alloc::NumaNode,
     bindings,
     block::mq::{
         operations::OperationsVTable,
@@ -57,6 +58,7 @@ impl<T: Operations> TagSet<T> {
         nr_hw_queues: u32,
         num_tags: u32,
         num_maps: u32,
+        numa_node: NumaNode,
         flags: Flags,
     ) -> impl PinInit<Self, error::Error> {
         let tag_set: bindings::blk_mq_tag_set = pin_init::zeroed();
@@ -67,7 +69,7 @@ impl<T: Operations> TagSet<T> {
                     ops: OperationsVTable::<T>::build(),
                     nr_hw_queues,
                     timeout: 0, // 0 means default which is 30Hz in C
-                    numa_node: bindings::NUMA_NO_NODE,
+                    numa_node: numa_node.id(),
                     queue_depth: num_tags,
                     cmd_size,
                     flags: flags.into(),
