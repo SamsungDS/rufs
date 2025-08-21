@@ -53,7 +53,10 @@ impl NullBlkDevice {
         capacity_mib: u64,
         irq_mode: IRQMode,
     ) -> Result<GenDisk<Self>> {
-        let tagset = Arc::pin_init(TagSet::new(1, 256, 1), GFP_KERNEL)?;
+        let tagset = Arc::pin_init(
+            TagSet::new(1, 256, 1, mq::tag_set::Flags::default()),
+            GFP_KERNEL,
+        )?;
 
         let queue_data = Box::new(QueueData { irq_mode }, GFP_KERNEL)?;
 
