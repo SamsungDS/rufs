@@ -17,5 +17,7 @@ impl_flags! {
         /// processing IO. When this flag is not set, IO is processed in atomic
         /// context. When this flag is set, IO is processed in process context.
         Blocking = bindings::BLK_MQ_F_BLOCKING,
+        /// Use shared tag bitmap for all submission queues.
+        TagHctxShared = bindings::BLK_MQ_F_TAG_HCTX_SHARED,
     }
 }
