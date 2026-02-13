@@ -95,9 +95,10 @@ impl Operations for NullBlkDevice {
     fn queue_rq(
         _hw_data: (),
         queue_data: &QueueData,
-        rq: Owned<mq::Request<Self>>,
+        rq: Owned<mq::IdleRequest<Self>>,
         _is_last: bool,
     ) -> Result {
+        let rq = rq.start();
         match queue_data.irq_mode {
             IRQMode::None => rq.end_ok(),
             IRQMode::Soft => mq::Request::complete(rq.into()),

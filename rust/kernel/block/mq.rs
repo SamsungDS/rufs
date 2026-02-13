@@ -88,10 +88,10 @@
 //!     fn queue_rq(
 //!         _hw_data: (),
 //!         _queue_data: (),
-//!         rq: Owned<Request<Self>>,
+//!         rq: Owned<IdleRequest<Self>>,
 //!         _is_last: bool
 //!     ) -> Result {
-//!         rq.end_ok();
+//!         rq.start().end_ok();
 //!         Ok(())
 //!     }
 //!
@@ -130,5 +130,5 @@ mod request;
 pub mod tag_set;
 
 pub use operations::Operations;
-pub use request::Request;
+pub use request::{IdleRequest, Request};
 pub use tag_set::TagSet;
