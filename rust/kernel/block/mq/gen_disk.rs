@@ -8,6 +8,7 @@
 use crate::{
     bindings,
     block::mq::{
+        Feature,
         Operations,
         TagSet, //
     },
@@ -43,6 +44,8 @@ pub struct GenDiskBuilder<T> {
     physical_block_size: u32,
     capacity_sectors: u64,
     max_hw_discard_sectors: u32,
+    write_cache: bool,
+    forced_unit_access: bool,
     _p: PhantomData<T>,
 }
 
@@ -54,6 +57,8 @@ impl<T> Default for GenDiskBuilder<T> {
             physical_block_size: bindings::PAGE_SIZE as u32,
             capacity_sectors: 0,
             max_hw_discard_sectors: 0,
+            write_cache: false,
+            forced_unit_access: false,
             _p: PhantomData,
         }
     }
@@ -125,6 +130,18 @@ impl<T: Operations> GenDiskBuilder<T> {
         self
     }
 
+    /// Declare that this device supports forced unit access.
+    pub fn forced_unit_access(mut self, enable: bool) -> Self {
+        self.forced_unit_access = enable;
+        self
+    }
+
+    /// Declare that this device has a write-back cache.
+    pub fn write_cache(mut self, enable: bool) -> Self {
+        self.write_cache = enable;
+        self
+    }
+
     /// Build a new `GenDisk` and add it to the VFS.
     pub fn build(
         self,
@@ -144,9 +161,16 @@ impl<T: Operations> GenDiskBuilder<T> {
         lim.physical_block_size = self.physical_block_size;
         lim.max_hw_discard_sectors = self.max_hw_discard_sectors;
         if self.rotational {
-            lim.features = bindings::BLK_FEAT_ROTATIONAL;
+            lim.features = Feature::Rotational.into();
         }
 
+        if self.write_cache {
+            lim.features |= Feature::WriteCache;
+        }
+
+        if self.forced_unit_access {
+            lim.features |= Feature::ForcedUnitAccess;
+        }
         // SAFETY: `tagset.raw_tag_set()` points to a valid and initialized tag set
         let gendisk = from_err_ptr(unsafe {
             bindings::__blk_mq_alloc_disk(
