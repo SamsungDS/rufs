@@ -89,7 +89,8 @@
 //!         _hw_data: (),
 //!         _queue_data: (),
 //!         rq: Owned<IdleRequest<Self>>,
-//!         _is_last: bool
+//!         _is_last: bool,
+//!         is_poll: bool
 //!     ) -> BlkResult {
 //!         rq.start().end_ok();
 //!         Ok(())
@@ -130,7 +131,10 @@ mod request;
 mod request_queue;
 pub mod tag_set;
 
-pub use operations::Operations;
+pub use operations::{
+    IoCompletionBatch,
+    Operations, //
+};
 pub use request::{
     Command,
     IdleRequest,
