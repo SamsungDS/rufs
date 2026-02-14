@@ -8,6 +8,7 @@ use configfs::IRQMode;
 use kernel::{
     block::{
         self,
+        error::BlkResult,
         mq::{
             self,
             gen_disk::{self, GenDisk},
@@ -97,7 +98,7 @@ impl Operations for NullBlkDevice {
         queue_data: &QueueData,
         rq: Owned<mq::IdleRequest<Self>>,
         _is_last: bool,
-    ) -> Result {
+    ) -> BlkResult {
         let rq = rq.start();
         match queue_data.irq_mode {
             IRQMode::None => rq.end_ok(),
