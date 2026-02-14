@@ -4,8 +4,6 @@
 //!
 //! C header: [`include/linux/blk-mq.h`](srctree/include/linux/blk-mq.h)
 
-use core::pin::Pin;
-
 use crate::{
     alloc::NumaNode,
     bindings,
@@ -26,7 +24,8 @@ use crate::{
 };
 use core::{
     convert::TryInto,
-    marker::PhantomData, //
+    marker::PhantomData,
+    pin::Pin, //
 };
 use pin_init::{
     pin_data,
@@ -163,6 +162,22 @@ impl<T: Operations> TagSet<T> {
         }
 
         Ok(())
+    }
+
+    /// Return the number of hardware queues for this tag set.
+    pub fn hw_queue_count(&self) -> u32 {
+        // SAFETY: By type invariant, `self.inner` is valid.
+        unsafe { (*self.inner.get()).nr_hw_queues }
+    }
+
+    /// Borrow the [`T::TagSetData`] associated with this tag set.
+    pub fn data(&self) -> <T::TagSetData as ForeignOwnable>::Borrowed<'_> {
+        // SAFETY: By type invariant, `self.inner` is valid.
+        let ptr = unsafe { (*self.inner.get()).driver_data };
+
+        // SAFETY: `ptr` was created by `into_foreign` during initialization and the target is not
+        // converted back with `from_foreign` while `&self` is live.
+        unsafe { T::TagSetData::borrow(ptr) }
     }
 }
 
