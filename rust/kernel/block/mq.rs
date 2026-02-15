@@ -138,7 +138,8 @@ pub use feature::{
 };
 pub use operations::{
     IoCompletionBatch,
-    Operations, //
+    Operations,
+    RequestTimeoutStatus, //
 };
 pub use request::{
     Command,
