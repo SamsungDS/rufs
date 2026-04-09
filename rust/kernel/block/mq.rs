@@ -130,6 +130,8 @@
 //! # Ok::<(), kernel::error::Error>(())
 //! ```
 
+/// DMA mapping iterator for block requests.
+pub mod dma_map_iter;
 mod feature;
 pub mod gen_disk;
 mod operations;

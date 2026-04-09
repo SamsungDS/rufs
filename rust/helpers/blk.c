@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <linux/blk-mq.h>
+#include <linux/blk-mq-dma.h>
 #include <linux/blkdev.h>
 
 __rust_helper void *rust_helper_blk_mq_rq_to_pdu(struct request *rq)
@@ -17,4 +18,37 @@ bool rust_helper_blk_mq_add_to_batch(struct request *req,
 				     void (*complete)(struct io_comp_batch *))
 {
 	return blk_mq_add_to_batch(req, iob, is_error, complete);
+}
+__rust_helper unsigned int rust_helper_blk_rq_payload_bytes(struct request *rq)
+{
+	return blk_rq_payload_bytes(rq);
+}
+
+__rust_helper unsigned short
+rust_helper_blk_rq_nr_phys_segments(struct request *rq)
+{
+	return blk_rq_nr_phys_segments(rq);
+}
+
+__rust_helper bool
+rust_helper_blk_dma_unmap(struct device *dma_dev,
+			  struct dma_iova_state *state,
+			  size_t mapped_len,
+			  enum pci_p2pdma_map_type map,
+			  enum dma_data_direction dir)
+{
+	if (map == PCI_P2PDMA_MAP_BUS_ADDR)
+		return true;
+
+	if (dma_use_iova(state)) {
+		unsigned int attrs = 0;
+
+		if (map == PCI_P2PDMA_MAP_THRU_HOST_BRIDGE)
+			attrs |= DMA_ATTR_MMIO;
+
+		dma_iova_destroy(dma_dev, state, mapped_len, dir, attrs);
+		return true;
+	}
+
+	return !dma_need_unmap(dma_dev);
 }
