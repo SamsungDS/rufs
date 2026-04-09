@@ -62,4 +62,10 @@ impl Command {
         // code.
         unsafe { core::mem::transmute(value) }
     }
+
+    /// Convert `Self` to the FFI representation.
+    pub fn as_raw(self) -> u32 {
+        // SAFETY: `Self` is `repr(u32)`, so it can be transmuted to `u32`.
+        unsafe { core::mem::transmute(self) }
+    }
 }
