@@ -6,7 +6,12 @@
 
 use crate::{
     bindings,
-    block::mq::Operations,
+    block::{
+        error::BlkResult,
+        mq::Operations, //
+    },
+    device::Device,
+    dma::DataDirection,
     sync::{
         aref::{
             ARef,
@@ -29,7 +34,14 @@ use core::{
     ptr::NonNull, //
 };
 
-use super::RequestQueue;
+use super::{
+    dma_map_iter::{
+        DmaMapIter,
+        DmaMapMempool, //
+    },
+    RequestQueue, //
+};
+
 mod command;
 pub use command::Command;
 
@@ -120,6 +132,10 @@ impl<T: Operations> RequestInner<T> {
     fn command_raw(&self) -> u32 {
         // SAFETY: By C API contract and type invariant, `cmd_flags` is valid for read
         unsafe { (*self.0.get()).cmd_flags & ((1 << bindings::REQ_OP_BITS) - 1) }
+    }
+
+    fn is_write(&self) -> bool {
+        self.command_raw() & 1 != 0
     }
 
     /// Get the command of this request.
@@ -330,6 +346,36 @@ impl<T: Operations> Request<T> {
         // valid. The existence of `&self` guarantees that the private data is
         // valid as a shared reference.
         unsafe { Self::wrapper_ptr(core::ptr::from_ref(self).cast_mut()).as_ref() }
+    }
+
+    /// Return a reference to the per-request data associated with this request.
+    pub fn data_ref(&self) -> &T::RequestData {
+        &self.wrapper_ref().data
+    }
+
+    /// Set the target sector for the request.
+    #[inline(always)]
+    pub fn set_sector(self: Pin<&mut Self>, sector: u64) {
+        // SAFETY: By type invariant of `Self`, `self.0` is valid and live.
+        unsafe { (*self.0 .0.get()).__sector = sector }
+    }
+
+    /// Create a DMA mapping iterator for this request.
+    pub fn dma_map_iter<const N: usize>(
+        self: ARef<Self>,
+        device: &Device,
+        mempool: DmaMapMempool<N>,
+    ) -> BlkResult<DmaMapIter<N, T>> {
+        DmaMapIter::new(self, device, mempool)
+    }
+
+    /// Return the DMA data direction for this request.
+    pub fn dma_direction(&self) -> kernel::dma::DataDirection {
+        if self.is_write() {
+            DataDirection::ToDevice
+        } else {
+            DataDirection::FromDevice
+        }
     }
 }
 
