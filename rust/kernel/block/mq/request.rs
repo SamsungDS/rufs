@@ -12,6 +12,7 @@ use crate::{
     },
     device::Device,
     dma::DataDirection,
+    prelude::*,
     sync::{
         aref::{
             ARef,
@@ -355,6 +356,60 @@ impl<T: Operations> Request<T> {
         } else {
             DataDirection::FromDevice
         }
+    }
+}
+
+/// A synchronous request to be submitted to a queue.
+#[repr(transparent)]
+pub struct SyncRequest<T: Operations> {
+    inner: RequestInner<T>,
+}
+
+impl<T: Operations> SyncRequest<T> {
+    /// Create a `Owned<Self>` from a request pointer.
+    ///
+    /// # Safety
+    ///
+    /// - `ptr` must be represent an unsubmitted requiest allocated by
+    ///   `RequestQueue::alloc_sync_request`.
+    /// - Ownership of of `ptr` is transferred to this function.
+    pub(crate) unsafe fn from_raw(ptr: *mut bindings::request) -> Owned<Self> {
+        // SAFETY: By function safety requirements, `ptr` is valid for use as `Owned<Request>`.
+        unsafe { Owned::from_raw(NonNull::<Self>::new_unchecked(ptr.cast())) }
+    }
+
+    /// Submits the request for execution by the request queue to which it belongs.
+    pub fn execute(self: Pin<&mut Self>, at_head: bool) -> Result {
+        // SAFETY: By type invariant, `self.inner` is a valid request allocated from a live
+        // request queue, so it can be executed.
+        let status = unsafe { bindings::blk_execute_rq(self.inner.as_raw(), at_head) };
+        // SAFETY: `blk_status_to_errno` is safe to call with any `blk_status_t` value.
+        let ret = unsafe { bindings::blk_status_to_errno(status) };
+        if ret < 0 {
+            Err(Error::from_errno(ret))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<T: Operations> Drop for SyncRequest<T> {
+    fn drop(&mut self) {}
+}
+
+impl<T: Operations> Deref for SyncRequest<T> {
+    type Target = RequestInner<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T: Operations> Ownable for SyncRequest<T> {
+    unsafe fn release(this: NonNull<Self>) {
+        // SAFETY: By the safety requirements of this function, `this` is a valid request that
+        // we own, so we can free it.
+        unsafe { bindings::blk_mq_free_request(this.as_ptr().cast()) };
     }
 }
 
