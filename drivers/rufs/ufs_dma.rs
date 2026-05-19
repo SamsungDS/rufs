@@ -9,6 +9,7 @@ use kernel::bits::genmask_u8;
 use kernel::sync::{Arc, SpinLock};
 use crate::ufs_reg::*;
 use crate::ufs_queue::*;
+use crate::ufs_dev::*;
 
 const PRDT_DATA_BYTE_COUNT_MAX: u32 = 0x00040000; // SZ_256K
 const PRDT_DATA_BYTE_COUNT_PAD: usize = 4;
@@ -672,8 +673,13 @@ impl UfsDma {
             let rsp_upiu_offset = ((ALIGNED_UPIU_SIZE >> 2) as u16).to_le();
             let prd_table_offset = ((ALIGNED_UPIU_SIZE >> 1) as u16).to_le();
 
-            // CAST: TODO
-            let command_desc_base_addr = kernel::ptr::project!(ucdl.as_ptr(), [tag]?).addr() as u64;
+            // The controller DMA-reads the UTP command descriptor for this tag,
+            // so this must be the descriptor's DMA (bus) address, not its CPU
+            // virtual address. `ucdl` is a contiguous slice, so element `tag`
+            // sits at `tag * size_of::<Ucd>()` bytes from the DMA base.
+            // TODO: use `io_project` when available https://lore.kernel.org/r/20260611-io_projection-v4-0-1f7224b02dcb@garyguo.net
+            let command_desc_base_addr =
+                ucdl.dma_handle() + (tag * core::mem::size_of::<Ucd>()) as dma::DmaAddress;
 
             dma_write!(utrdl, [tag]?, Utrd {
                     command_desc_base_addr: command_desc_base_addr.to_le(),

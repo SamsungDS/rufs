@@ -12,6 +12,7 @@ mod ufs_dma;
 mod ufs_irq;
 mod ufs_uic;
 mod ufs_queue;
+mod ufs_dev;
 
 use ufs_host::UfsHost;
 

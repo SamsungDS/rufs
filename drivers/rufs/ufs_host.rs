@@ -13,6 +13,7 @@ use crate::ufs_dma::*;
 use crate::ufs_irq::*;
 use crate::ufs_uic::*;
 use crate::ufs_queue::*;
+use crate::ufs_dev::*;
 
 const HBA_ENABLE_DELAY_US: i64 = 1000;
 
@@ -32,6 +33,7 @@ pub(crate) struct UfsHost {
     irq: Arc<UfsIrq>,
     uic: Arc<UfsUic>,
     queue: Arc<UfsQueue>,
+    dev: Arc<UfsDev>,
 
     max_hw_queues: u16,
     max_prdt_entries: u16,
@@ -55,7 +57,7 @@ impl UfsHost {
             irq.clone(),
             dma.clone(),
         )?;
-
+        let dev = UfsDev::new(queue.clone())?;
         let host = Arc::pin_init(
             pin_init!(Self {
                 reg,
@@ -63,6 +65,7 @@ impl UfsHost {
                 irq,
                 uic,
                 queue,
+                dev,
                 state <- new_spinlock!(HostState::Reset),
                 max_hw_queues: 1,
                 max_prdt_entries: 256,
@@ -73,6 +76,9 @@ impl UfsHost {
         fsleep(Delta::from_micros(HBA_ENABLE_DELAY_US));
         host.reg.wait_for_ctrl_enable(1000, 50)?;
 
+        let irq_vectors = pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?;
+        let irq_vector = *irq_vectors.start();
+
         /* ufshcd_link_startup() */
         host.irq.request_uic_irq(
             pdev,
@@ -81,6 +87,15 @@ impl UfsHost {
         )?;
         host.uic.link_startup()?;
         host.dma.make_hba_operational()?;
+
+        /* ufshcd_verify_dev_init */
+        host.irq.request_queue_irq(
+            pdev,
+            irq_vector,
+            host.reg.clone(),
+            host.queue.clone(),
+        )?;
+        host.dev.verify_dev_init()?;
 
         Ok(host)
     }

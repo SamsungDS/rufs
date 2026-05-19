@@ -8,6 +8,7 @@ use kernel::sync::{Arc, Mutex, SpinLock};
 use kernel::irq::{self, Flags, IrqReturn};
 use crate::ufs_reg::*;
 use crate::ufs_uic::*;
+use crate::ufs_queue::*;
 
 #[pin_data]
 struct UfsUicHandler {
@@ -29,9 +30,30 @@ impl irq::Handler for UfsUicHandler {
 }
 
 #[pin_data]
+pub(crate) struct UfsQueueHandler {
+    reg: Arc<UfsReg>,
+    queue: Arc<UfsQueue>,
+
+    #[pin]
+    placeholder: SpinLock<u32>,
+}
+
+impl irq::Handler for UfsQueueHandler {
+    fn handle(&self, _dev: &Device<Bound>) -> IrqReturn {
+        let interrupt_status = self.reg.read_transfer_interrupts();
+        self.reg.confirm_transfer_interrupts(interrupt_status);
+        self.queue.complete();
+
+        IrqReturn::Handled
+    }
+}
+
+#[pin_data]
 pub(crate) struct UfsIrq {
     #[pin]
     uic: Mutex<Option<Arc<irq::Registration<UfsUicHandler>>>>,
+    #[pin]
+    queue: Mutex<Option<Arc<irq::Registration<UfsQueueHandler>>>>,
 }
 
 impl UfsIrq {
@@ -39,6 +61,7 @@ impl UfsIrq {
         Arc::pin_init(
             try_pin_init!(Self {
                 uic <- new_mutex!(None),
+                queue <- new_mutex!(None),
             }), GFP_KERNEL,
         )
     }
@@ -66,6 +89,32 @@ impl UfsIrq {
 
         let reg = Arc::pin_init(irq, GFP_KERNEL)?;
         self.uic.lock().replace(reg);
+
+        Ok(())
+    }
+
+    pub(crate) fn request_queue_irq(
+        &self,
+        pdev: &pci::Device<Core>,
+        vector: pci::IrqVector<'_>,
+        reg: Arc<UfsReg>,
+        queue: Arc<UfsQueue>,
+    ) -> Result<()> {
+        let handler = try_pin_init!(UfsQueueHandler {
+            reg,
+            queue,
+            placeholder <- new_spinlock!(0),
+        });
+
+        let irq = pdev.request_irq(
+            vector,
+            Flags::SHARED,
+            c_str!("ufshcd-queue"),
+            handler,
+        );
+
+        let irq = Arc::pin_init(irq, GFP_KERNEL)?;
+        self.queue.lock().replace(irq);
 
         Ok(())
     }

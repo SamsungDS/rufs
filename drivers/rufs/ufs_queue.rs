@@ -5,21 +5,10 @@
 
 use kernel::{prelude::*, kvec, new_spinlock};
 use kernel::sync::{Arc, SpinLock, Completion};
-use kernel::time::Delta;
 use crate::ufs_reg::*;
 use crate::ufs_dma::*;
 use crate::ufs_irq::*;
-
-#[derive(Copy, Clone)]
-pub(crate) enum UfsDevCmd {
-
-}
-
-impl UfsDevCmd {
-    fn timeout(&self) -> Delta {
-        Delta::from_millis(1000) //TEMP
-    }
-}
+use crate::ufs_dev::*;
 
 #[derive(Copy, Clone)]
 pub(crate) enum UfsSCSICmd {}
@@ -84,7 +73,7 @@ impl UfsRequest {
         self.fetch()
     }
 
-    pub(crate) fn compose(&self, cmd: UfsCmd) -> Result<()> {
+    fn compose(&self, cmd: UfsCmd) -> Result<()> {
         if self.cmd.lock().is_some() {
             pr_err!("command already exist in UfsRequest");
             return Err(EIO);
@@ -101,7 +90,7 @@ impl UfsRequest {
         }
     }
 
-    pub(crate) fn submit(&self) -> Result<()> {
+    fn submit(&self) -> Result<()> {
         let cmd = match *self.cmd.lock() {
             Some(cmd) => cmd,
             None => {
@@ -121,7 +110,7 @@ impl UfsRequest {
         }
     }
 
-    pub(crate) fn wait(&self) -> Result<()> {
+    fn wait(&self) -> Result<()> {
         let cmd = match *self.cmd.lock() {
             Some(cmd) => cmd,
             None => {
@@ -146,7 +135,7 @@ impl UfsRequest {
         }
     }
 
-    pub(crate) fn fetch(&self) -> Result<UfsCmd> {
+    fn fetch(&self) -> Result<UfsCmd> {
         let cmd = match *self.cmd.lock() {
             Some(cmd) => cmd,
             None => {
