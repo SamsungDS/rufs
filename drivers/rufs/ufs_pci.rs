@@ -4,7 +4,10 @@
 //!
 //! Based on the C driver written by Santosh Yaraganavi <santosh.sy@samsung.com>.
 
-use kernel::{c_str, device::Core, devres::Devres, pci, prelude::*, sync::aref::ARef};
+use kernel::{device::Core, pci, prelude::*, sync::aref::ARef, sync::Arc};
+
+mod ufs_reg;
+use ufs_reg::UfsReg;
 
 kernel::pci_device_table!(
     PCI_TABLE,
@@ -16,14 +19,10 @@ kernel::pci_device_table!(
     )]
 );
 
-const UFS_BAR0_LEN: usize = 0x1000;
-type Bar0 = pci::Bar<UFS_BAR0_LEN>;
-
 #[pin_data(PinnedDrop)]
 struct UfsPci {
     pdev: ARef<pci::Device>,
-    #[pin]
-    bar: Devres<Bar0>
+    reg: Arc<UfsReg>,
 }
 
 impl pci::Driver for UfsPci {
@@ -33,23 +32,23 @@ impl pci::Driver for UfsPci {
     fn probe(pdev: &pci::Device<Core>, _info: &Self::IdInfo) -> impl PinInit<Self, Error> {
         pin_init::pin_init_scope(move || {
             pr_info!(
-                "rufs: probe: vendor={} device=0x{:04x}, BAR0=0x{:x}",
-                pdev.vendor_id(), pdev.device_id(), UFS_BAR0_LEN,
+                "rufs: probe: vendor={} device=0x{:04x}",
+                pdev.vendor_id(), pdev.device_id(),
             );
 
             pdev.enable_device_mem()?;
             pdev.set_master();
 
+            let reg = UfsReg::new(pdev)?;
+
+            pr_info!("rufs: probe done");
+
             Ok(try_pin_init!(Self {
-                bar <- pdev.iomap_region_sized::<{ UFS_BAR0_LEN }>(0, c_str!("rufs_pci")),
                 pdev: pdev.into(),
-                _: {
-                    pr_info!("rufs: probe done");
-                },
+                reg: reg.clone(),
             }))
         })
     }
-
 
     fn unbind(_pdev: &pci::Device<Core>, _this: Pin<&Self>) {
     }
