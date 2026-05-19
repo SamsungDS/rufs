@@ -6,10 +6,10 @@
 
 use kernel::{device::Core, pci, prelude::*, sync::aref::ARef, sync::Arc};
 
-mod ufs_reg;
-use ufs_reg::UfsReg;
-
 mod ufs_host;
+mod ufs_reg;
+mod ufs_dma;
+
 use ufs_host::UfsHost;
 
 kernel::pci_device_table!(
@@ -25,7 +25,6 @@ kernel::pci_device_table!(
 #[pin_data(PinnedDrop)]
 struct UfsPci {
     pdev: ARef<pci::Device>,
-    reg: Arc<UfsReg>,
     host: Arc<UfsHost>,
 }
 
@@ -43,17 +42,14 @@ impl pci::Driver for UfsPci {
             pdev.enable_device_mem()?;
             pdev.set_master();
 
-            let reg = UfsReg::new(pdev)?;
-
-            let host = UfsHost::new(reg.clone())?;
-            host.bring_up_controller()?;
+            let host = UfsHost::new(pdev)?;
+            //host.bring_up_controller()?;
 
             pr_info!("rufs: probe done");
 
             Ok(try_pin_init!(Self {
                 pdev: pdev.into(),
-                reg: reg.clone(),
-                host: host.clone(),
+                host: host,
             }))
         })
     }

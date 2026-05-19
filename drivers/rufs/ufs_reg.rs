@@ -17,18 +17,21 @@ const REG_CONTROLLER_STATUS:                 usize = 0x30; // HCS
 const REG_CONTROLLER_ENABLE:                 usize = 0x34; // HCE
 
 // Transfer Request List (UTRL)
-const REG_UTP_TRANSFER_REQ_LIST_BASE_L:      usize = 0x40; // UTRLBA
-const REG_UTP_TRANSFER_REQ_LIST_BASE_H:      usize = 0x44; // UTRLBAU
-const REG_UTP_TRANSFER_REQ_DOOR_BELL:        usize = 0x48; // UTRLDBR
-const REG_UTP_TRANSFER_REQ_LIST_RUN_STOP:    usize = 0x4C; // UTRLRSR
-const REG_UTP_TRANSFER_REQ_LIST_CLEAR:       usize = 0x50; // UTRLCLR
+const REG_UTP_TRANSFER_REQ_LIST_BASE_L:      usize = 0x50; // UTRLBA
+const REG_UTP_TRANSFER_REQ_LIST_BASE_H:      usize = 0x54; // UTRLBAU
+const REG_UTP_TRANSFER_REQ_DOOR_BELL:        usize = 0x58; // UTRLDBR
+const REG_UTP_TRANSFER_REQ_LIST_CLEAR:       usize = 0x5C; // UTRLCLR
+const REG_UTP_TRANSFER_REQ_LIST_RUN_STOP:    usize = 0x60; // UTRLRSR
 
 // Task Management Request List (UTMRL)
-const REG_UTP_TASK_REQ_LIST_BASE_L:          usize = 0x58; // UTMRLBA
-const REG_UTP_TASK_REQ_LIST_BASE_H:          usize = 0x5C; // UTMRLBAU
-const REG_UTP_TASK_REQ_DOOR_BELL:            usize = 0x60; // UTMRLDBR
-const REG_UTP_TASK_REQ_LIST_RUN_STOP:        usize = 0x64; // UTMRLRSR
-const REG_UTP_TASK_REQ_LIST_CLEAR:           usize = 0x68; // UTMRLCLR
+const REG_UTP_TASK_REQ_LIST_BASE_L:          usize = 0x70; // UTMRLBA
+const REG_UTP_TASK_REQ_LIST_BASE_H:          usize = 0x74; // UTMRLBAU
+const REG_UTP_TASK_REQ_DOOR_BELL:            usize = 0x78; // UTMRLDBR
+const REG_UTP_TASK_REQ_LIST_CLEAR:           usize = 0x7C; // UTMRLCLR
+const REG_UTP_TASK_REQ_LIST_RUN_STOP:        usize = 0x80; // UTMRLRSR
+                                                           //
+const UTP_TRANSFER_REQ_LIST_RUN_STOP_BIT:   u32 = 0x1;
+const UTP_TASK_REQ_LIST_RUN_STOP_BIT:       u32 = 0x1;
 
 // UIC command
 const REG_UIC_COMMAND:                       usize = 0x90; // UICCMD
@@ -106,13 +109,13 @@ impl UfsReg {
         )
     }
 
-    #[inline]
+    #[inline(always)]
     fn read(&self, offset: usize) -> u32 {
         let access = self.bar.try_access().unwrap();
         access.read32(offset)
     }
 
-    #[inline]
+    #[inline(always)]
     fn write(&self, offset: usize, value: u32) {
         let access = self.bar.try_access().unwrap();
         access.write32(value, offset);
@@ -126,7 +129,7 @@ impl UfsReg {
 
     #[inline]
     pub(crate) fn read_cap_hi(&self) -> u32 {
-        self.read(REG_CONTROLLER_CAPABILITIES)
+        self.read(REG_CONTROLLER_CAPABILITIES_H)
     }
 
     #[inline]
@@ -186,8 +189,8 @@ impl UfsReg {
     }
 
     #[inline]
-    pub(crate) fn ring_utrl_doorbell(&self, mask: u32) {
-        self.write(REG_UTP_TRANSFER_REQ_DOOR_BELL, mask)
+    pub(crate) fn ring_utrl_doorbell(&self, tag: usize) {
+        self.write(REG_UTP_TRANSFER_REQ_DOOR_BELL, 1 << tag)
     }
 
     #[inline]
@@ -274,42 +277,48 @@ impl UfsReg {
 
     // Helpers
     #[inline]
+    pub(crate) fn nutrs(&self) -> usize {
+        (self.read_cap_lo() & MASK_TRANSFER_REQUESTS_SLOTS_SDB) as usize + 1
+    }
+
+    #[inline]
+    pub(crate) fn nutmrs(&self) -> usize {
+        ((self.read_cap_lo() &
+          MASK_TASK_MANAGEMENT_REQUEST_SLOTS) >> 16) as usize + 1
+    }
+
+    #[inline]
+    pub(crate) fn autoh8(&self) -> bool {
+        (self.read_cap_lo() & MASK_AUTO_HIBERN8_SUPPORT) != 0
+    }
+
+    #[inline]
     pub(crate) fn ctrl_enable(&self) {
-        self.write_hce(CONTROLLER_ENABLE);
+        self.write_hce(self.read_hce() | CONTROLLER_ENABLE);
     }
 
     #[inline]
     pub(crate) fn clear_all_interrupts(&self) {
         let isb = self.read_is();
         if isb != 0 {
-            self. write_is(isb)
+            self.write_is(isb)
         }
     }
 
     #[inline]
-    pub(crate) fn set_utrl_base(&self, dma_addr: u64) {
+    pub(crate) fn disable_interrupts(&self) {
+        self.write_ie(0);
+    }
+
+    #[inline]
+    pub(crate) fn set_utrdl_base(&self, dma_addr: u64) {
         self.write_utrlba(dma_addr as u32);
         self.write_utrlbau((dma_addr >>32) as u32);
     }
 
     #[inline]
-    pub(crate) fn set_utmrl_base(&self, dma_addr: u64) {
+    pub(crate) fn set_utmrdl_base(&self, dma_addr: u64) {
         self.write_utmrlba(dma_addr as u32);
         self.write_utmrlbau((dma_addr >>32) as u32);
     }
-}
-
-#[inline]
-pub(crate) fn decode_nutrs(cap_lo: u32) -> u16 {
-    (cap_lo & MASK_TRANSFER_REQUESTS_SLOTS_SDB) as u16 + 1
-}
-
-#[inline]
-pub(crate) fn decode_nutmrs(cap_lo: u32) -> u8 {
-    (cap_lo & MASK_TASK_MANAGEMENT_REQUEST_SLOTS) as u8 + 1
-}
-
-#[inline]
-pub(crate) fn decode_autoh8(cap_lo: u32) -> bool {
-    (cap_lo & MASK_AUTO_HIBERN8_SUPPORT) != 0
 }
