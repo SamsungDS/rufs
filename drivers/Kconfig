@@ -121,6 +121,8 @@ source "drivers/mmc/Kconfig"
 
 source "drivers/ufs/Kconfig"
 
+source "drivers/rufs/Kconfig"
+
 source "drivers/memstick/Kconfig"
 
 source "drivers/leds/Kconfig"
