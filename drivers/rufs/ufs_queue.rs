@@ -3,12 +3,15 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
+use kernel::block::mq;
 use kernel::{bindings, prelude::*, kvec, new_spinlock};
 use kernel::sync::{Arc, SpinLock, Completion};
+use kernel::types::{ARef, OwnableRefCounted};
 use crate::ufs_reg::*;
 use crate::ufs_dma::*;
 use crate::ufs_irq::*;
 use crate::ufs_dev::*;
+use crate::ufs_lu::UfsLuBlockOps;
 
 const READ_10: u8 = 0x28;
 const WRITE_10: u8 = 0x2a;
@@ -30,12 +33,7 @@ pub(crate) struct UfsSCSICmd {
     direction: UfsScsiDataDirection,
     data_len: u32,
     cdb: [u8; 16],
-    rq: *mut bindings::request,
 }
-
-// SAFETY: `rq` is a blk-mq request pointer supplied by queue_rq. The driver
-// only uses it as command context while the owning block request is live.
-unsafe impl Send for UfsSCSICmd {}
 
 impl UfsSCSICmd {
     pub(crate) fn read_write(
@@ -71,7 +69,6 @@ impl UfsSCSICmd {
             direction,
             data_len,
             cdb,
-            rq: core::ptr::null_mut(),
         }
     }
 
@@ -84,7 +81,6 @@ impl UfsSCSICmd {
             direction: UfsScsiDataDirection::None,
             data_len: 0,
             cdb,
-            rq: core::ptr::null_mut(),
         }
     }
 
@@ -98,13 +94,7 @@ impl UfsSCSICmd {
             direction: UfsScsiDataDirection::Write,
             data_len,
             cdb,
-            rq: core::ptr::null_mut(),
         }
-    }
-
-    pub(crate) fn with_request(mut self, rq: *mut bindings::request) -> Self {
-        self.rq = rq;
-        self
     }
 
     pub(crate) fn lun(&self) -> u8 {
@@ -123,9 +113,6 @@ impl UfsSCSICmd {
         self.cdb
     }
 
-    pub(crate) fn request(&self) -> *mut bindings::request {
-        self.rq
-    }
 }
 
 #[derive(Copy, Clone)]
@@ -167,6 +154,8 @@ pub(crate) struct UfsRequest {
     #[pin]
     prdt: SpinLock<Option<UfsPrdtMapping>>,
     #[pin]
+    block_rq: SpinLock<Option<ARef<mq::Request<UfsLuBlockOps>>>>,
+    #[pin]
     state: SpinLock<RequestState>,
 }
 
@@ -178,10 +167,21 @@ impl UfsRequest {
                 tag,
                 cmd <- new_spinlock!(None),
                 prdt <- new_spinlock!(None),
+                block_rq <- new_spinlock!(None),
                 state <- new_spinlock!(RequestState::Idle),
             }),
             GFP_KERNEL,
         )
+    }
+
+    pub(crate) fn set_block_request(&self, rq: ARef<mq::Request<UfsLuBlockOps>>) -> Result<()> {
+        let mut current = self.block_rq.lock();
+        if current.is_some() {
+            return Err(EBUSY);
+        }
+
+        current.replace(rq);
+        Ok(())
     }
 
     pub(crate) fn issue(&self, cmd: UfsCmd) -> Result<UfsCmd> {
@@ -201,16 +201,24 @@ impl UfsRequest {
             UfsCmd::Device(cmd) => {
                 self.queue.compose_dev(cmd, self.tag)?;
             },
-            UfsCmd::SCSI(cmd) => {
-                let prdt = self.queue.compose_scsi(cmd, self.tag)?;
-                *self.prdt.lock() = prdt;
-                self.cmd.lock().replace(UfsCmd::SCSI(cmd));
-                return Ok(());
-            },
+            UfsCmd::SCSI(cmd) => return self.compose_scsi_cmd(cmd),
         }
 
         *self.prdt.lock() = None;
         self.cmd.lock().replace(cmd);
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn compose_scsi_cmd(&self, cmd: UfsSCSICmd) -> Result<()> {
+        let prdt = {
+            let block_rq = self.block_rq.lock();
+            let block_rq = block_rq.as_ref().ok_or(EINVAL)?;
+            self.queue.compose_scsi(cmd, self.tag, block_rq)?
+        };
+
+        *self.prdt.lock() = prdt;
+        self.cmd.lock().replace(UfsCmd::SCSI(cmd));
         Ok(())
     }
 
@@ -223,11 +231,13 @@ impl UfsRequest {
             },
         };
 
-        self.queue.prepare_dev_wait();
         *self.state.lock() = RequestState::Submitted;
 
         let result = match cmd {
-            UfsCmd::Device(cmd) => self.queue.submit_dev(cmd, self.tag),
+            UfsCmd::Device(cmd) => {
+                self.queue.prepare_dev_wait();
+                self.queue.submit_dev(cmd, self.tag)
+            },
             UfsCmd::SCSI(cmd) => self.queue.submit_scsi(cmd, self.tag),
         };
 
@@ -235,6 +245,7 @@ impl UfsRequest {
             Err(e) => {
                 *self.state.lock() = RequestState::Idle;
                 *self.prdt.lock() = None;
+                *self.block_rq.lock() = None;
                 *self.cmd.lock() = None;
                 Err(e)
             },
@@ -265,6 +276,7 @@ impl UfsRequest {
             Err(e) => {
                 *self.state.lock() = RequestState::Idle;
                 *self.prdt.lock() = None;
+                *self.block_rq.lock() = None;
                 *self.cmd.lock() = None;
                 Err(e)
             },
@@ -295,12 +307,14 @@ impl UfsRequest {
             Err(e) => {
                 *self.state.lock() = RequestState::Idle;
                 *self.prdt.lock() = None;
+                *self.block_rq.lock() = None;
                 *self.cmd.lock() = None;
                 Err(e)
             },
             Ok(cmd) => {
                 *self.state.lock() = RequestState::Idle;
                 *self.prdt.lock() = None;
+                *self.block_rq.lock() = None;
                 *self.cmd.lock() = None;
                 Ok(cmd)
             },
@@ -310,6 +324,7 @@ impl UfsRequest {
     pub(crate) fn clear(&self) {
         *self.state.lock() = RequestState::Idle;
         *self.prdt.lock() = None;
+        *self.block_rq.lock() = None;
         *self.cmd.lock() = None;
     }
 
@@ -323,11 +338,18 @@ impl UfsRequest {
             },
         };
 
-        *self.state.lock() = RequestState::Completed;
-
         match cmd {
-            UfsCmd::Device(cmd) => self.queue.complete_dev(cmd, self.tag),
-            UfsCmd::SCSI(cmd) => {},
+            UfsCmd::Device(cmd) => {
+                *self.state.lock() = RequestState::Completed;
+                self.queue.complete_dev(cmd, self.tag);
+            },
+            UfsCmd::SCSI(cmd) => {
+                let block_rq = self.block_rq.lock().take();
+                *self.state.lock() = RequestState::Idle;
+                *self.prdt.lock() = None;
+                *self.cmd.lock() = None;
+                self.queue.complete_scsi(cmd, self.tag, block_rq);
+            },
         };
     }
 }
@@ -420,8 +442,9 @@ impl UfsQueue {
         &self,
         cmd: UfsSCSICmd,
         tag: usize,
+        rq: &mq::Request<UfsLuBlockOps>,
     ) -> Result<Option<UfsPrdtMapping>> {
-        self.dma.compose_scsi_upiu(cmd, tag)
+        self.dma.compose_scsi_upiu(cmd, tag, rq.as_raw())
     }
 
     fn submit_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
@@ -485,5 +508,38 @@ impl UfsQueue {
 
     fn complete_dev(&self, cmd: UfsDevCmd, tag: usize) {
         self.completion.complete();
+    }
+
+    fn complete_scsi(
+        &self,
+        cmd: UfsSCSICmd,
+        tag: usize,
+        rq: Option<ARef<mq::Request<UfsLuBlockOps>>>,
+    ) {
+        let Some(rq) = rq else {
+            pr_err!("No block request for SCSI completion tag {}", tag);
+            return;
+        };
+
+        let status = match self.dma.fetch_scsi_completion(tag) {
+            UfsScsiCompletion::Good => bindings::BLK_STS_OK,
+            UfsScsiCompletion::Busy
+            | UfsScsiCompletion::TaskSetFull
+            | UfsScsiCompletion::Requeue => bindings::BLK_STS_RESOURCE,
+            UfsScsiCompletion::TaskAborted => bindings::BLK_STS_TARGET,
+            UfsScsiCompletion::ReservationConflict => bindings::BLK_STS_RESV_CONFLICT,
+            UfsScsiCompletion::CheckCondition | UfsScsiCompletion::Error => {
+                pr_err!("SCSI request failed tag {}\n", tag);
+                bindings::BLK_STS_IOERR
+            }
+        };
+
+        // Take exclusive ownership of the request so it can be handed back to
+        // the block layer.
+        let Ok(rq) = OwnableRefCounted::try_from_shared(rq) else {
+            pr_err!("Failed to complete SCSI request tag {}\n", tag);
+            return;
+        };
+        rq.end(status as u8);
     }
 }

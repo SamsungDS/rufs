@@ -210,12 +210,12 @@ impl UfsLu {
         &self,
         tag: usize,
         cmd: UfsSCSICmd,
-        rq: &IdleRequest<UfsLuBlockOps>,
-    ) -> Result<()> {
+        rq: &ARef<mq::Request<UfsLuBlockOps>>,
+    ) -> Result<Arc<UfsRequest>> {
         let request = self.queue.acquire(tag)?;
-        request.compose(UfsCmd::SCSI(cmd.with_request(rq.as_raw())))?;
-        request.clear();
-        Ok(())
+        request.set_block_request(rq.clone())?;
+        request.compose(UfsCmd::SCSI(cmd))?;
+        Ok(request)
     }
 }
 
@@ -243,7 +243,7 @@ impl Operations for UfsLuBlockOps {
         let geometry = lu.geometry();
         let mask = geometry.sectors_per_block() - 1;
 
-        match op {
+        let cmd = match op {
             bindings::req_op_REQ_OP_READ | bindings::req_op_REQ_OP_WRITE => {
                 if sectors == 0 {
                     pr_debug!("[RUFS] ufs_lu: zero-length request on LU {}\n", lu.lun());
@@ -260,7 +260,7 @@ impl Operations for UfsLuBlockOps {
                         sector,
                         sectors,
                     );
-                    rq.start().end_ok();
+                    rq.start().end(bindings::BLK_STS_INVAL as u8);
                     return Ok(());
                 }
 
@@ -272,7 +272,7 @@ impl Operations for UfsLuBlockOps {
                         sectors,
                         geometry.sectors_per_block(),
                     );
-                    rq.start().end_ok();
+                    rq.start().end(bindings::BLK_STS_INVAL as u8);
                     return Ok(());
                 }
 
@@ -288,24 +288,21 @@ impl Operations for UfsLuBlockOps {
                     blocks,
                 );
 
-                lu.compose_request(tag, cmd, &rq)?;
+                cmd
             }
             bindings::req_op_REQ_OP_FLUSH => {
-                let cmd = lu.build_scsi_cmd(op, 0, 0)?;
-                lu.compose_request(tag, cmd, &rq)?;
                 pr_debug!("[RUFS] ufs_lu: flush request on LU {}\n", lu.lun());
+                lu.build_scsi_cmd(op, 0, 0)?
             }
             bindings::req_op_REQ_OP_DISCARD => {
-                let lba = geometry.sectors_to_logical(sector);
-                let blocks = geometry.sectors_to_logical(u64::from(sectors));
-                let cmd = lu.build_scsi_cmd(op, lba, blocks)?;
-                lu.compose_request(tag, cmd, &rq)?;
-                pr_debug!(
-                    "[RUFS] ufs_lu: discard request on LU {} sector={} sectors={}\n",
+                pr_warn!(
+                    "[RUFS] ufs_lu: discard request is not supported yet on LU {} sector={} sectors={}\n",
                     lu.lun(),
                     sector,
                     sectors,
                 );
+                rq.start().end(bindings::BLK_STS_NOTSUPP as u8);
+                return Ok(());
             }
             _ => {
                 pr_warn!(
@@ -313,10 +310,25 @@ impl Operations for UfsLuBlockOps {
                     op,
                     lu.lun(),
                 );
+                rq.start().end(bindings::BLK_STS_NOTSUPP as u8);
+                return Ok(());
+            }
+        };
+
+        // Convert the request into a shared reference and keep it with the
+        // hardware command, so the completion path can hand it back to the
+        // block layer once the command finishes.
+        let rq = OwnableRefCounted::into_shared(rq.start());
+        let request = lu.compose_request(tag, cmd, &rq)?;
+
+        if request.submit().is_err() {
+            // `submit` dropped the request reference it stored, so we hold the
+            // only one and can complete it here.
+            if let Ok(rq) = OwnableRefCounted::try_from_shared(rq) {
+                rq.end(bindings::BLK_STS_IOERR as u8);
             }
         }
 
-        rq.start().end_ok();
         Ok(())
     }
 
