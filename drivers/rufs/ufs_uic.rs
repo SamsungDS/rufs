@@ -174,6 +174,6 @@ impl UfsUic {
     }
 
     pub(crate) fn complete_uic_cmd(&self) {
-        self.completion.complete_all();
+        self.completion.complete();
     }
 }

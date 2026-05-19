@@ -12,6 +12,7 @@ use crate::ufs_reg::*;
 use crate::ufs_dma::*;
 use crate::ufs_irq::*;
 use crate::ufs_uic::*;
+use crate::ufs_queue::*;
 
 const HBA_ENABLE_DELAY_US: i64 = 1000;
 
@@ -30,6 +31,7 @@ pub(crate) struct UfsHost {
     dma: Arc<UfsDma>,
     irq: Arc<UfsIrq>,
     uic: Arc<UfsUic>,
+    queue: Arc<UfsQueue>,
 
     max_hw_queues: u16,
     max_prdt_entries: u16,
@@ -48,6 +50,11 @@ impl UfsHost {
 
         let irq = UfsIrq::new()?;
         let uic = UfsUic::new(reg.clone(), irq.clone())?;
+        let queue = UfsQueue::new(
+            reg.clone(),
+            irq.clone(),
+            dma.clone(),
+        )?;
 
         let host = Arc::pin_init(
             pin_init!(Self {
@@ -55,6 +62,7 @@ impl UfsHost {
                 dma,
                 irq,
                 uic,
+                queue,
                 state <- new_spinlock!(HostState::Reset),
                 max_hw_queues: 1,
                 max_prdt_entries: 256,
