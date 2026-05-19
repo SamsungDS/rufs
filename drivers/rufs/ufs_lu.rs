@@ -213,8 +213,7 @@ impl UfsLu {
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
     ) -> Result<Arc<UfsRequest>> {
         let request = self.queue.acquire(tag)?;
-        request.set_block_request(rq.clone())?;
-        request.compose(UfsCmd::SCSI(cmd))?;
+        request.compose_block_request(rq.clone(), cmd)?;
         Ok(request)
     }
 }

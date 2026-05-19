@@ -5,7 +5,7 @@
 use kernel::{pci, prelude::*, c_str, new_mutex, new_spinlock};
 use kernel::device::{Device, Core, Bound};
 use kernel::sync::{Arc, Mutex, SpinLock};
-use kernel::irq::{self, Flags, IrqReturn};
+use kernel::irq::{self, Flags, IrqReturn, ThreadedIrqReturn};
 use crate::ufs_reg::*;
 use crate::ufs_uic::*;
 use crate::ufs_queue::*;
@@ -38,12 +38,20 @@ pub(crate) struct UfsQueueHandler {
     placeholder: SpinLock<u32>,
 }
 
-impl irq::Handler for UfsQueueHandler {
-    fn handle(&self, _dev: &Device<Bound>) -> IrqReturn {
+impl irq::ThreadedHandler for UfsQueueHandler {
+    fn handle(&self, _dev: &Device<Bound>) -> ThreadedIrqReturn {
         let interrupt_status = self.reg.read_transfer_interrupts();
-        self.reg.confirm_transfer_interrupts(interrupt_status);
-        self.queue.complete();
+        if interrupt_status == 0 {
+            return ThreadedIrqReturn::None;
+        }
 
+        self.reg.confirm_transfer_interrupts(interrupt_status);
+
+        ThreadedIrqReturn::WakeThread
+    }
+
+    fn handle_threaded(&self, _dev: &Device<Bound>) -> IrqReturn {
+        self.queue.complete();
         IrqReturn::Handled
     }
 }
@@ -53,7 +61,7 @@ pub(crate) struct UfsIrq {
     #[pin]
     uic: Mutex<Option<Arc<irq::Registration<UfsUicHandler>>>>,
     #[pin]
-    queue: Mutex<Option<Arc<irq::Registration<UfsQueueHandler>>>>,
+    queue: Mutex<Option<Arc<irq::ThreadedRegistration<UfsQueueHandler>>>>,
 }
 
 impl UfsIrq {
@@ -105,7 +113,7 @@ impl UfsIrq {
             placeholder <- new_spinlock!(0),
         });
 
-        let irq = pdev.request_irq(
+        let irq = pdev.request_threaded_irq(
             vector,
             Flags::SHARED,
             c_str!("ufshcd-queue"),
@@ -116,5 +124,16 @@ impl UfsIrq {
         self.queue.lock().replace(irq);
 
         Ok(())
+    }
+
+    pub(crate) fn wake_queue_thread(&self) {
+        let Some(irq) = self.queue.lock().as_ref().map(|irq| irq.clone()) else {
+            pr_err!("rufs: queue IRQ thread is not registered\n");
+            return;
+        };
+
+        if irq.wake_thread().is_err() {
+            pr_err!("rufs: failed to wake queue IRQ thread\n");
+        }
     }
 }

@@ -25,6 +25,7 @@ const SAM_STAT_RESERVATION_CONFLICT: u8 = 0x18;
 const SAM_STAT_TASK_SET_FULL: u8 = 0x28;
 const SAM_STAT_TASK_ABORTED: u8 = 0x40;
 
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum UfsScsiCompletion {
     Good,
     CheckCondition,
@@ -34,6 +35,39 @@ pub(crate) enum UfsScsiCompletion {
     TaskAborted,
     Requeue,
     Error,
+}
+
+pub(crate) struct UfsScsiResult {
+    pub(crate) completion: UfsScsiCompletion,
+    pub(crate) ocs: u8,
+    pub(crate) transaction: u8,
+    pub(crate) response: u8,
+    pub(crate) status: u8,
+    pub(crate) residual_transfer_count: u32,
+    pub(crate) sense_data_len: usize,
+    pub(crate) sense_data: [u8; UFS_SENSE_SIZE],
+}
+
+impl UfsScsiResult {
+    fn error(ocs: u8) -> Self {
+        Self {
+            completion: UfsScsiCompletion::Error,
+            ocs,
+            transaction: 0,
+            response: 0,
+            status: 0,
+            residual_transfer_count: 0,
+            sense_data_len: 0,
+            sense_data: [0; UFS_SENSE_SIZE],
+        }
+    }
+
+    fn requeue(ocs: u8) -> Self {
+        Self {
+            completion: UfsScsiCompletion::Requeue,
+            ..Self::error(ocs)
+        }
+    }
 }
 
 // UPIU
@@ -677,18 +711,29 @@ impl Upiu {
         self.header.response.into()
     }
 
-    fn scsi_completion(&self) -> UfsScsiCompletion {
+    fn scsi_result(&self, ocs: u8) -> UfsScsiResult {
+        let upiu = self.body;
+        let rsp = unsafe { upiu.rsp };
+        let sense_data_len = usize::from(u16::from_be(rsp.sendse_data_len))
+            .min(UFS_SENSE_SIZE);
+
+        let mut result = UfsScsiResult {
+            completion: UfsScsiCompletion::Error,
+            ocs,
+            transaction: self.header.transaction_code,
+            response: self.header.response,
+            status: self.header.status,
+            residual_transfer_count: u32::from_be(rsp.residual_transfer_count),
+            sense_data_len,
+            sense_data: rsp.sense_data,
+        };
+
         match self.transaction() {
             UpiuTransaction::Response => {},
-            _ => return UfsScsiCompletion::Error,
+            _ => return result,
         }
 
-        match self.response() {
-            UpiuResponse::Success => {},
-            _ => return UfsScsiCompletion::Error,
-        }
-
-        match self.header.status {
+        result.completion = match self.header.status {
             SAM_STAT_GOOD => UfsScsiCompletion::Good,
             SAM_STAT_CHECK_CONDITION => UfsScsiCompletion::CheckCondition,
             SAM_STAT_BUSY => UfsScsiCompletion::Busy,
@@ -696,7 +741,9 @@ impl Upiu {
             SAM_STAT_TASK_SET_FULL => UfsScsiCompletion::TaskSetFull,
             SAM_STAT_TASK_ABORTED => UfsScsiCompletion::TaskAborted,
             _ => UfsScsiCompletion::Error,
-        }
+        };
+
+        result
     }
 
     fn fetch_dev(&self, cmd: UfsDevCmd) -> Result<UfsDevCmd> {
@@ -1190,6 +1237,10 @@ impl Utrd {
             _ => Err(EIO),
         }
     }
+
+    fn ocs(&self) -> u8 {
+        self.header.ocs & MASK_OCS
+    }
 }
 
 // UTP Task Management Request Descriptor
@@ -1223,6 +1274,11 @@ pub(crate) struct UfsPrdtMapping {
     sg: KVec<bindings::scatterlist>,
     nents: i32,
     dma_dir: bindings::dma_data_direction,
+}
+
+struct UfsPrdt {
+    mapping: Option<UfsPrdtMapping>,
+    entries: KVec<PrdEntry>,
 }
 
 impl Drop for UfsPrdtMapping {
@@ -1315,11 +1371,11 @@ impl UfsDma {
     ) -> Result<()> {
         let inner = self.inner.lock();
 
-        let utrd = dma_read!(inner.utrdl, [tag]?);
-        dma_write!(inner.utrdl, [tag]?, utrd.build(UfsCmd::Device(cmd)));
-
         dma_write!(inner.ucdl, [tag]?.cmd_upiu, Upiu::device(cmd, tag));
         dma_write!(inner.ucdl, [tag]?.rsp_upiu, Upiu::default());
+
+        let utrd = dma_read!(inner.utrdl, [tag]?);
+        dma_write!(inner.utrdl, [tag]?, utrd.build(UfsCmd::Device(cmd)));
         Ok(())
     }
 
@@ -1329,32 +1385,50 @@ impl UfsDma {
         tag: usize,
         rq: *mut bindings::request,
     ) -> Result<Option<UfsPrdtMapping>> {
-        let mut inner = self.inner.lock();
-
-        let utrd = dma_read!(inner.utrdl, [tag]?);
-        dma_write!(inner.utrdl, [tag]?, utrd.build(UfsCmd::SCSI(cmd)));
+        let prdt = self.map_request_prdt(tag, cmd, rq)?;
+        let inner = self.inner.lock();
 
         dma_write!(inner.ucdl, [tag]?.cmd_upiu, Upiu::command(cmd, tag));
         dma_write!(inner.ucdl, [tag]?.rsp_upiu, Upiu::default());
 
-        self.map_request_prdt(&mut inner, tag, cmd, rq)
+        for (i, entry) in prdt.entries.iter().enumerate() {
+            // SAFETY: `tag` is checked against the UCD allocation, `i` is
+            // bounded by MAX_PRD_ENTRIES in `map_request_prdt`, and PRDT lives
+            // in a packed UCD so unaligned writes are required.
+            unsafe {
+                let ucd = inner.ucdl.as_mut_ptr().cast::<Ucd>().add(tag);
+                let table = core::ptr::addr_of_mut!((*ucd).prdt).cast::<PrdEntry>();
+                core::ptr::write_unaligned(table.add(i), *entry);
+            }
+        }
+
+        let utrd = dma_read!(inner.utrdl, [tag]?);
+        let mut utrd = utrd.build(UfsCmd::SCSI(cmd));
+        utrd.prd_table_length = (prdt.entries.len() as u16).to_le();
+        dma_write!(inner.utrdl, [tag]?, utrd);
+
+        Ok(prdt.mapping)
     }
 
     fn map_request_prdt(
         &self,
-        inner: &mut UfsDmaInner,
         tag: usize,
         cmd: UfsSCSICmd,
         rq: *mut bindings::request,
-    ) -> Result<Option<UfsPrdtMapping>> {
+    ) -> Result<UfsPrdt> {
+        let entries = KVec::new();
         if cmd.data_len() == 0 {
-            let mut utrd = dma_read!(inner.utrdl, [tag]?);
-            utrd.prd_table_length = 0;
-            dma_write!(inner.utrdl, [tag]?, utrd);
-            return Ok(None);
+            return Ok(UfsPrdt {
+                mapping: None,
+                entries,
+            });
         }
 
         if rq.is_null() {
+            return Err(EINVAL);
+        }
+
+        if tag >= self.reg.nutrs() {
             return Err(EINVAL);
         }
 
@@ -1407,12 +1481,9 @@ impl UfsDma {
             dma_dir,
         };
 
-        if tag >= inner.ucdl.len() {
-            return Err(EINVAL);
-        }
-
+        let mut entries = KVec::with_capacity(mapped as usize, GFP_KERNEL)?;
         let mut sgp = mapping.sg.as_mut_ptr();
-        for i in 0..mapped as usize {
+        for _ in 0..mapped as usize {
             if sgp.is_null() {
                 return Err(EIO);
             }
@@ -1431,24 +1502,16 @@ impl UfsDma {
                 size: (len - 1).to_le(),
             };
 
-            // SAFETY: `tag` is checked against the UCD allocation above, `i`
-            // is limited by `mapped <= nr_segments <= MAX_PRD_ENTRIES`, and
-            // PRDT lives in a packed UCD so unaligned writes are required.
-            unsafe {
-                let ucd = inner.ucdl.as_mut_ptr().cast::<Ucd>().add(tag);
-                let prdt = core::ptr::addr_of_mut!((*ucd).prdt).cast::<PrdEntry>();
-                core::ptr::write_unaligned(prdt.add(i), entry);
-            }
+            entries.push(entry, GFP_KERNEL)?;
 
             // SAFETY: `sgp` is a valid scatterlist entry.
             sgp = unsafe { bindings::sg_next(sgp) };
         }
 
-        let mut utrd = dma_read!(inner.utrdl, [tag]?);
-        utrd.prd_table_length = (mapped as u16).to_le();
-        dma_write!(inner.utrdl, [tag]?, utrd);
-
-        Ok(Some(mapping))
+        Ok(UfsPrdt {
+            mapping: Some(mapping),
+            entries,
+        })
     }
 
     pub(crate) fn fetch_devman_upiu(
@@ -1470,24 +1533,25 @@ impl UfsDma {
     pub(crate) fn fetch_scsi_completion(
         &self,
         tag: usize,
-    ) -> UfsScsiCompletion {
+    ) -> UfsScsiResult {
         let inner = self.inner.lock();
 
         let utrd = match (|| -> Result<_> { Ok(dma_read!(inner.utrdl, [tag]?)) })() {
             Ok(utrd) => utrd,
-            Err(_) => return UfsScsiCompletion::Error,
+            Err(_) => return UfsScsiResult::error(UtpOcs::InvalidCommandStatus as u8),
         };
+        let ocs = utrd.ocs();
 
         if utrd.check_response().is_err() {
             return match (utrd.header.ocs & MASK_OCS).into() {
-                UtpOcs::Aborted | UtpOcs::InvalidCommandStatus => UfsScsiCompletion::Requeue,
-                _ => UfsScsiCompletion::Error,
+                UtpOcs::Aborted | UtpOcs::InvalidCommandStatus => UfsScsiResult::requeue(ocs),
+                _ => UfsScsiResult::error(ocs),
             };
         }
 
         match (|| -> Result<_> { Ok(dma_read!(inner.ucdl, [tag]?.rsp_upiu)) })() {
-            Ok(rsp_upiu) => rsp_upiu.scsi_completion(),
-            Err(_) => UfsScsiCompletion::Error,
+            Ok(rsp_upiu) => rsp_upiu.scsi_result(ocs),
+            Err(_) => UfsScsiResult::error(ocs),
         }
     }
 }
