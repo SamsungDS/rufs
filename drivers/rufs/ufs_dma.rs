@@ -164,6 +164,18 @@ impl UfsDma {
             GFP_KERNEL
         )
     }
+
+    pub(crate) fn make_hba_operational(&self) -> Result<()> {
+        self.reg.enable_interrupts();
+
+        self.reg.set_utrdl_base(self.inner.lock().utrdl.dma_handle() as u64);
+        self.reg.set_utmrdl_base(self.inner.lock().utmrdl.dma_handle() as u64);
+
+        self.reg.wait_for_request_ready(1000, 50)?;
+        self.reg.enable_run_stop();
+
+        Ok(())
+    }
 }
 
 const _: () = { assert!(size_of::<ReqDescHeader>() == 16); };

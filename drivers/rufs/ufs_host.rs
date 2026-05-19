@@ -5,11 +5,15 @@
 #![allow(dead_code)]
 
 use kernel::{device::Core, pci, prelude::*, new_spinlock};
+use kernel::time::{Delta, delay::*};
 use kernel::sync::{Arc, SpinLock};
 
 use crate::ufs_reg::*;
 use crate::ufs_dma::*;
 use crate::ufs_irq::*;
+use crate::ufs_uic::*;
+
+const HBA_ENABLE_DELAY_US: i64 = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostState {
@@ -25,6 +29,7 @@ pub(crate) struct UfsHost {
     reg: Arc<UfsReg>,
     dma: Arc<UfsDma>,
     irq: Arc<UfsIrq>,
+    uic: Arc<UfsUic>,
 
     max_hw_queues: u16,
     max_prdt_entries: u16,
@@ -42,16 +47,32 @@ impl UfsHost {
         reg.disable_interrupts();
 
         let irq = UfsIrq::new()?;
+        let uic = UfsUic::new(reg.clone(), irq.clone())?;
+
         let host = Arc::pin_init(
             pin_init!(Self {
                 reg,
                 dma,
                 irq,
+                uic,
                 state <- new_spinlock!(HostState::Reset),
                 max_hw_queues: 1,
                 max_prdt_entries: 256,
             }), GFP_KERNEL,
         )?;
+
+        host.reg.ctrl_enable();
+        fsleep(Delta::from_micros(HBA_ENABLE_DELAY_US));
+        host.reg.wait_for_ctrl_enable(1000, 50)?;
+
+        /* ufshcd_link_startup() */
+        host.irq.request_uic_irq(
+            pdev,
+            host.reg.clone(),
+            host.uic.clone(),
+        )?;
+        host.uic.link_startup()?;
+        host.dma.make_hba_operational()?;
 
         Ok(host)
     }
