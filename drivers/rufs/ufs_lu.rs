@@ -9,9 +9,11 @@ use kernel::block::{
     mq::{self, gen_disk::GenDisk, gen_disk::GenDiskBuilder, IdleRequest, Operations, TagSet},
     SECTOR_SIZE,
 };
+use kernel::bindings;
 use kernel::sync::{Arc, ArcBorrow, Mutex, SpinLock};
 use kernel::types::{ARef, OwnableRefCounted, Owned};
 use kernel::{new_mutex, new_spinlock, prelude::*};
+use crate::ufs_queue::*;
 
 const SECTOR_SIZE_U64: u64 = SECTOR_SIZE as u64;
 
@@ -119,6 +121,7 @@ impl UfsLuGeometry {
 
 #[pin_data]
 pub(crate) struct UfsLu {
+    queue: Arc<UfsQueue>,
     lun: u8,
     geometry: UfsLuGeometry,
 
@@ -130,9 +133,10 @@ pub(crate) struct UfsLu {
 }
 
 impl UfsLu {
-    pub(crate) fn new(lun: u8, geometry: UfsLuGeometry) -> Result<Arc<Self>> {
+    pub(crate) fn new(queue: Arc<UfsQueue>, lun: u8, geometry: UfsLuGeometry) -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(Self {
+                queue,
                 lun,
                 geometry,
                 state <- new_spinlock!(UfsLuState::Reset),
@@ -179,6 +183,35 @@ impl UfsLu {
     pub(crate) fn is_operational(&self) -> bool {
         self.state() == UfsLuState::Operational
     }
+
+    fn build_scsi_cmd(&self, op: bindings::req_op, lba: u64, blocks: u64) -> Result<UfsSCSICmd> {
+        let blocks = u32::try_from(blocks).map_err(|_| EINVAL)?;
+        let data_len = u32::try_from(
+            u64::from(self.geometry.logical_block_size())
+                .checked_mul(u64::from(blocks))
+                .ok_or(EOVERFLOW)?,
+        )
+        .map_err(|_| EOVERFLOW)?;
+
+        match op {
+            bindings::req_op_REQ_OP_READ => {
+                Ok(UfsSCSICmd::read_write(self.lun, false, lba, blocks, data_len, false))
+            }
+            bindings::req_op_REQ_OP_WRITE => {
+                Ok(UfsSCSICmd::read_write(self.lun, true, lba, blocks, data_len, false))
+            }
+            bindings::req_op_REQ_OP_FLUSH => Ok(UfsSCSICmd::flush(self.lun)),
+            bindings::req_op_REQ_OP_DISCARD => Ok(UfsSCSICmd::unmap(self.lun, 24)),
+            _ => Err(ENOTSUPP),
+        }
+    }
+
+    fn compose_request(&self, tag: usize, cmd: UfsSCSICmd) -> Result<()> {
+        let request = self.queue.acquire(tag)?;
+        request.compose(UfsCmd::SCSI(cmd))?;
+        request.clear();
+        Ok(())
+    }
 }
 
 pub(crate) struct UfsLuBlockOps;
@@ -194,10 +227,90 @@ impl Operations for UfsLuBlockOps {
 
     fn queue_rq(
         _hw_data: (),
-        _queue_data: ArcBorrow<'_, UfsLu>,
+        lu: ArcBorrow<'_, UfsLu>,
         rq: Owned<IdleRequest<Self>>,
         _is_last: bool,
     ) -> BlkResult {
+        let op = rq.command() as bindings::req_op;
+        let sector = rq.sector();
+        let sectors = rq.sectors();
+        let tag = rq.tag() as usize;
+        let geometry = lu.geometry();
+        let mask = geometry.sectors_per_block() - 1;
+
+        match op {
+            bindings::req_op_REQ_OP_READ | bindings::req_op_REQ_OP_WRITE => {
+                if sectors == 0 {
+                    pr_debug!("[RUFS] ufs_lu: zero-length request on LU {}\n", lu.lun());
+                    rq.start().end_ok();
+                    return Ok(());
+                }
+
+                if sector.checked_add(u64::from(sectors)).ok_or(EINVAL)?
+                    > geometry.capacity_sectors().ok_or(EOVERFLOW)?
+                {
+                    pr_warn!(
+                        "[RUFS] ufs_lu: request exceeds LU {} capacity sector={} sectors={}\n",
+                        lu.lun(),
+                        sector,
+                        sectors,
+                    );
+                    rq.start().end_ok();
+                    return Ok(());
+                }
+
+                if (sector & mask) != 0 || (u64::from(sectors) & mask) != 0 {
+                    pr_warn!(
+                        "[RUFS] ufs_lu: unaligned request on LU {} sector={} sectors={} spb={}\n",
+                        lu.lun(),
+                        sector,
+                        sectors,
+                        geometry.sectors_per_block(),
+                    );
+                    rq.start().end_ok();
+                    return Ok(());
+                }
+
+                let lba = geometry.sectors_to_logical(sector);
+                let blocks = geometry.sectors_to_logical(u64::from(sectors));
+                let cmd = lu.build_scsi_cmd(op, lba, blocks)?;
+
+                pr_debug!(
+                    "[RUFS] ufs_lu: LU {} op={} lba={} blocks={}\n",
+                    lu.lun(),
+                    op,
+                    lba,
+                    blocks,
+                );
+
+                lu.compose_request(tag, cmd)?;
+            }
+            bindings::req_op_REQ_OP_FLUSH => {
+                let cmd = lu.build_scsi_cmd(op, 0, 0)?;
+                lu.compose_request(tag, cmd)?;
+                pr_debug!("[RUFS] ufs_lu: flush request on LU {}\n", lu.lun());
+            }
+            bindings::req_op_REQ_OP_DISCARD => {
+                let lba = geometry.sectors_to_logical(sector);
+                let blocks = geometry.sectors_to_logical(u64::from(sectors));
+                let cmd = lu.build_scsi_cmd(op, lba, blocks)?;
+                lu.compose_request(tag, cmd)?;
+                pr_debug!(
+                    "[RUFS] ufs_lu: discard request on LU {} sector={} sectors={}\n",
+                    lu.lun(),
+                    sector,
+                    sectors,
+                );
+            }
+            _ => {
+                pr_warn!(
+                    "[RUFS] ufs_lu: unsupported request op={} on LU {}\n",
+                    op,
+                    lu.lun(),
+                );
+            }
+        }
+
         rq.start().end_ok();
         Ok(())
     }

@@ -123,7 +123,7 @@ impl UfsHost {
             TagSet::<UfsLuBlockOps>::new(
                 1,
                 (),
-                self.reg.nutrs() as u32,
+                (self.reg.nutrs() - 1) as u32,
                 1,
                 kernel::alloc::NumaNode::NO_NODE,
                 kernel::block::mq::tag_set::Flags::default(),
@@ -143,7 +143,7 @@ impl UfsHost {
                 desc.logical_block_shift(),
                 desc.logical_block_count(),
             )?;
-            let lu = UfsLu::new(lun as u8, geometry)?;
+            let lu = UfsLu::new(self.queue.clone(), lun as u8, geometry)?;
             lu.init_disk(tagset.clone())?;
 
             pr_info!(

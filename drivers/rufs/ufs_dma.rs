@@ -151,7 +151,22 @@ impl UpiuHeader {
         }
     }
 
+    fn command(cmd: UfsSCSICmd, tag: usize) -> Self {
+        let flags = match cmd.direction() {
+            UfsScsiDataDirection::Read => UpiuFlag::Read,
+            UfsScsiDataDirection::Write => UpiuFlag::Write,
+            UfsScsiDataDirection::None => UpiuFlag::None,
+        };
 
+        Self {
+            transaction_code: UpiuTransaction::Command as u8,
+            flags: flags as u8,
+            lun: cmd.lun(),
+            task_tag: tag as u8,
+            cmd_set: 0,
+            ..Default::default()
+        }
+    }
 }
 
 #[repr(C, packed)]
@@ -168,6 +183,16 @@ impl Default for UpiuCmd {
             exp_data_transfer_len: 0,
             cdb: [0; UFS_CDB_SIZE],
             _padding: [0; 480],
+        }
+    }
+}
+
+impl UpiuCmd {
+    fn command(cmd: UfsSCSICmd) -> Self {
+        Self {
+            exp_data_transfer_len: cmd.data_len().to_be(),
+            cdb: cmd.cdb(),
+            ..Default::default()
         }
     }
 }
@@ -520,6 +545,9 @@ impl UpiuBody {
         Self { query_req: UpiuQueryReq::toggle_flag(cmd) }
     }
 
+    fn command(cmd: UfsSCSICmd) -> Self {
+        Self { cmd: UpiuCmd::command(cmd) }
+    }
 }
 
 #[repr(C, packed)]
@@ -592,6 +620,13 @@ impl Upiu {
         Self {
             header: UpiuHeader::query_write(tag),
             body: UpiuBody::toggle_flag(cmd),
+        }
+    }
+
+    fn command(cmd: UfsSCSICmd, tag: usize) -> Self {
+        Self {
+            header: UpiuHeader::command(cmd, tag),
+            body: UpiuBody::command(cmd),
         }
     }
 
@@ -752,6 +787,16 @@ impl From<dma::DataDirection> for UtpDataDirection {
     }
 }
 
+impl From<UfsScsiDataDirection> for UtpDataDirection {
+    fn from(direction: UfsScsiDataDirection) -> Self {
+        match direction {
+            UfsScsiDataDirection::Read => Self::DeviceToHost,
+            UfsScsiDataDirection::Write => Self::HostToDevice,
+            UfsScsiDataDirection::None => Self::NoDataTransfer,
+        }
+    }
+}
+
 // UTP Command Descriptor
 #[repr(C, packed)]
 #[derive(Default, Clone, Copy)]
@@ -773,7 +818,7 @@ impl Ucd {
     fn build(&self, cmd: UfsCmd, tag: usize) -> Self {
         match cmd {
             UfsCmd::Device(cmd) => self.device(cmd, tag),
-            UfsCmd::SCSI(cmd) => self.nop(tag),
+            UfsCmd::SCSI(cmd) => self.scsi(cmd, tag),
         }
     }
 
@@ -858,6 +903,14 @@ impl Ucd {
     fn toggle_flag(&self, cmd: UfsFlagCmd, tag: usize) -> Self {
         Self {
             cmd_upiu: Upiu::toggle_flag(cmd, tag),
+            rsp_upiu: Upiu::default(),
+            prdt: self.prdt,
+        }
+    }
+
+    fn scsi(&self, cmd: UfsSCSICmd, tag: usize) -> Self {
+        Self {
+            cmd_upiu: Upiu::command(cmd, tag),
             rsp_upiu: Upiu::default(),
             prdt: self.prdt,
         }
@@ -1048,7 +1101,12 @@ impl ReqDescHeader {
     }
 
     fn scsi(cmd: UfsSCSICmd) -> Self {
-        ReqDescHeader::default()
+        let mut header = ReqDescHeader::default();
+        header.set_cmd_type(UtpCmdType::UfsStorage);
+        header.set_direction(cmd.direction().into());
+        header.set_interrupt(true);
+        header.ocs = UtpOcs::InvalidCommandStatus as u8;
+        header
     }
 }
 
@@ -1197,6 +1255,21 @@ impl UfsDma {
         dma_write!(inner.utrdl, [tag]?, utrd.build(UfsCmd::Device(cmd)));
 
         dma_write!(inner.ucdl, [tag]?.cmd_upiu, Upiu::device(cmd, tag));
+        dma_write!(inner.ucdl, [tag]?.rsp_upiu, Upiu::default());
+        Ok(())
+    }
+
+    pub(crate) fn compose_scsi_upiu(
+        &self,
+        cmd: UfsSCSICmd,
+        tag: usize,
+    ) -> Result<()> {
+        let inner = self.inner.lock();
+
+        let utrd = dma_read!(inner.utrdl, [tag]?);
+        dma_write!(inner.utrdl, [tag]?, utrd.build(UfsCmd::SCSI(cmd)));
+
+        dma_write!(inner.ucdl, [tag]?.cmd_upiu, Upiu::command(cmd, tag));
         dma_write!(inner.ucdl, [tag]?.rsp_upiu, Upiu::default());
         Ok(())
     }

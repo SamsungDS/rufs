@@ -10,8 +10,106 @@ use crate::ufs_dma::*;
 use crate::ufs_irq::*;
 use crate::ufs_dev::*;
 
+const READ_10: u8 = 0x28;
+const WRITE_10: u8 = 0x2a;
+const SYNCHRONIZE_CACHE: u8 = 0x35;
+const UNMAP: u8 = 0x42;
+const READ_16: u8 = 0x88;
+const WRITE_16: u8 = 0x8a;
+
+#[derive(PartialEq, Copy, Clone)]
+pub(crate) enum UfsScsiDataDirection {
+    None,
+    Read,
+    Write,
+}
+
 #[derive(Copy, Clone)]
-pub(crate) enum UfsSCSICmd {}
+pub(crate) struct UfsSCSICmd {
+    lun: u8,
+    direction: UfsScsiDataDirection,
+    data_len: u32,
+    cdb: [u8; 16],
+}
+
+impl UfsSCSICmd {
+    pub(crate) fn read_write(
+        lun: u8,
+        write: bool,
+        lba: u64,
+        blocks: u32,
+        data_len: u32,
+        fua: bool,
+    ) -> Self {
+        let mut cdb = [0u8; 16];
+        let direction = if write {
+            UfsScsiDataDirection::Write
+        } else {
+            UfsScsiDataDirection::Read
+        };
+        let flags = if fua { 0x8 } else { 0 };
+
+        if blocks > u16::MAX as u32 || lba > u32::MAX as u64 {
+            cdb[0] = if write { WRITE_16 } else { READ_16 };
+            cdb[1] = flags;
+            cdb[2..10].copy_from_slice(&lba.to_be_bytes());
+            cdb[10..14].copy_from_slice(&blocks.to_be_bytes());
+        } else {
+            cdb[0] = if write { WRITE_10 } else { READ_10 };
+            cdb[1] = flags;
+            cdb[2..6].copy_from_slice(&(lba as u32).to_be_bytes());
+            cdb[7..9].copy_from_slice(&(blocks as u16).to_be_bytes());
+        }
+
+        Self {
+            lun,
+            direction,
+            data_len,
+            cdb,
+        }
+    }
+
+    pub(crate) fn flush(lun: u8) -> Self {
+        let mut cdb = [0u8; 16];
+        cdb[0] = SYNCHRONIZE_CACHE;
+
+        Self {
+            lun,
+            direction: UfsScsiDataDirection::None,
+            data_len: 0,
+            cdb,
+        }
+    }
+
+    pub(crate) fn unmap(lun: u8, data_len: u32) -> Self {
+        let mut cdb = [0u8; 16];
+        cdb[0] = UNMAP;
+        cdb[8] = data_len as u8;
+
+        Self {
+            lun,
+            direction: UfsScsiDataDirection::Write,
+            data_len,
+            cdb,
+        }
+    }
+
+    pub(crate) fn lun(&self) -> u8 {
+        self.lun
+    }
+
+    pub(crate) fn direction(&self) -> UfsScsiDataDirection {
+        self.direction
+    }
+
+    pub(crate) fn data_len(&self) -> u32 {
+        self.data_len
+    }
+
+    pub(crate) fn cdb(&self) -> [u8; 16] {
+        self.cdb
+    }
+}
 
 #[derive(Copy, Clone)]
 pub(crate) enum UfsCmd {
@@ -81,7 +179,7 @@ impl UfsRequest {
 
         let result = match cmd {
             UfsCmd::Device(cmd) => self.queue.compose_dev(cmd, self.tag),
-            UfsCmd::SCSI(_) => Err(ENOTSUPP),
+            UfsCmd::SCSI(cmd) => self.queue.compose_scsi(cmd, self.tag),
         };
 
         match result {
@@ -104,7 +202,7 @@ impl UfsRequest {
 
         let result = match cmd {
             UfsCmd::Device(cmd) => self.queue.submit_dev(cmd, self.tag),
-            UfsCmd::SCSI(_) => Err(ENOTSUPP),
+            UfsCmd::SCSI(cmd) => self.queue.submit_scsi(cmd, self.tag),
         };
 
         match result {
@@ -177,6 +275,11 @@ impl UfsRequest {
                 Ok(cmd)
             },
         }
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.state.lock() = RequestState::Idle;
+        *self.cmd.lock() = None;
     }
 
     // Interrupt Context
@@ -262,7 +365,13 @@ impl UfsQueue {
         };
 
         match slot {
-            Some(_) => Err(EINVAL),
+            Some(request) => {
+                if *request.state.lock() == RequestState::Idle {
+                    Ok(request.clone())
+                } else {
+                    Err(EBUSY)
+                }
+            },
             None => {
                 let request = UfsRequest::new(self.clone(), tag)?;
                 slot.replace(request.clone());
@@ -276,8 +385,17 @@ impl UfsQueue {
         self.dma.compose_devman_upiu(cmd, tag)
     }
 
+    fn compose_scsi(&self, cmd: UfsSCSICmd, tag: usize) -> Result<()> {
+        self.dma.compose_scsi_upiu(cmd, tag)
+    }
+
     fn submit_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
         //self.outstanding_slots.set_bit_atomic(tag);
+        self.reg.ring_utrl_doorbell(tag);
+        Ok(())
+    }
+
+    fn submit_scsi(&self, cmd: UfsSCSICmd, tag: usize) -> Result<()> {
         self.reg.ring_utrl_doorbell(tag);
         Ok(())
     }
