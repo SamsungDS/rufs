@@ -3,10 +3,10 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
-use kernel::{pci, device::Core, prelude::*, new_spinlock};
+use kernel::{bindings, device, pci, device::Core, prelude::*, new_spinlock};
 use kernel::{dma, dma_read, dma_write};
 use kernel::bits::genmask_u8;
-use kernel::sync::{Arc, SpinLock};
+use kernel::sync::{Arc, SpinLock, aref::ARef};
 use crate::ufs_reg::*;
 use crate::ufs_queue::*;
 use crate::ufs_dev::*;
@@ -1170,6 +1170,7 @@ struct UfsDmaInner {
 #[pin_data]
 pub(crate) struct UfsDma {
     reg: Arc<UfsReg>,
+    dev: ARef<device::Device>,
 
     #[pin]
     inner: SpinLock<UfsDmaInner>,
@@ -1177,6 +1178,29 @@ pub(crate) struct UfsDma {
 
 // SAFETY: UfsDma itself doesn't have any thread-affinity
 unsafe impl Send for UfsDma {}
+
+pub(crate) struct UfsPrdtMapping {
+    dev: ARef<device::Device>,
+    sg: KVec<bindings::scatterlist>,
+    nents: i32,
+    dma_dir: bindings::dma_data_direction,
+}
+
+impl Drop for UfsPrdtMapping {
+    fn drop(&mut self) {
+        // SAFETY: `sg` was mapped by `dma_map_sg_attrs` with this device,
+        // entry count, direction, and attributes.
+        unsafe {
+            bindings::dma_unmap_sg_attrs(
+                self.dev.as_raw(),
+                self.sg.as_mut_ptr(),
+                self.nents,
+                self.dma_dir,
+                0,
+            )
+        };
+    }
+}
 
 impl UfsDma {
     pub(crate) fn new(
@@ -1222,6 +1246,7 @@ impl UfsDma {
         Arc::pin_init(
             pin_init!(Self {
                 reg,
+                dev: pdev.as_ref().into(),
                 inner <- new_spinlock!(UfsDmaInner {
                     ucdl,
                     utrdl,
@@ -1263,15 +1288,127 @@ impl UfsDma {
         &self,
         cmd: UfsSCSICmd,
         tag: usize,
-    ) -> Result<()> {
-        let inner = self.inner.lock();
+    ) -> Result<Option<UfsPrdtMapping>> {
+        let mut inner = self.inner.lock();
 
         let utrd = dma_read!(inner.utrdl, [tag]?);
         dma_write!(inner.utrdl, [tag]?, utrd.build(UfsCmd::SCSI(cmd)));
 
         dma_write!(inner.ucdl, [tag]?.cmd_upiu, Upiu::command(cmd, tag));
         dma_write!(inner.ucdl, [tag]?.rsp_upiu, Upiu::default());
-        Ok(())
+
+        self.map_request_prdt(&mut inner, tag, cmd)
+    }
+
+    fn map_request_prdt(
+        &self,
+        inner: &mut UfsDmaInner,
+        tag: usize,
+        cmd: UfsSCSICmd,
+    ) -> Result<Option<UfsPrdtMapping>> {
+        if cmd.data_len() == 0 {
+            let mut utrd = dma_read!(inner.utrdl, [tag]?);
+            utrd.prd_table_length = 0;
+            dma_write!(inner.utrdl, [tag]?, utrd);
+            return Ok(None);
+        }
+
+        let rq = cmd.request();
+        if rq.is_null() {
+            return Err(EINVAL);
+        }
+
+        // SAFETY: `rq` is a live blk-mq request owned by the queue_rq callback.
+        let nr_segments = unsafe { (*rq).nr_phys_segments as usize };
+        if nr_segments == 0 || nr_segments > MAX_PRD_ENTRIES {
+            return Err(EINVAL);
+        }
+
+        let mut sg = KVec::with_capacity(nr_segments, GFP_KERNEL)?;
+        for _ in 0..nr_segments {
+            sg.push(bindings::scatterlist::default(), GFP_KERNEL)?;
+        }
+
+        // SAFETY: `sg` has `nr_segments` initialized entries.
+        unsafe { bindings::sg_init_table(sg.as_mut_ptr(), nr_segments as u32) };
+
+        let mut last_sg: *mut bindings::scatterlist = core::ptr::null_mut();
+
+        // SAFETY: `rq` is valid and `sg` points to a scatterlist table with enough entries.
+        let nents = unsafe { bindings::__blk_rq_map_sg(rq, sg.as_mut_ptr(), &mut last_sg) };
+        if nents <= 0 {
+            return Err(EIO);
+        }
+
+        let dma_dir = match cmd.direction() {
+            UfsScsiDataDirection::Read => bindings::dma_data_direction_DMA_FROM_DEVICE,
+            UfsScsiDataDirection::Write => bindings::dma_data_direction_DMA_TO_DEVICE,
+            UfsScsiDataDirection::None => bindings::dma_data_direction_DMA_NONE,
+        };
+
+        // SAFETY: `self.dev` is a valid DMA device and the scatterlist was populated above.
+        let mapped = unsafe {
+            bindings::dma_map_sg_attrs(
+                self.dev.as_raw(),
+                sg.as_mut_ptr(),
+                nents,
+                dma_dir,
+                0,
+            )
+        };
+        if mapped <= 0 {
+            return Err(ENOMEM);
+        }
+
+        let mut mapping = UfsPrdtMapping {
+            dev: self.dev.clone(),
+            sg,
+            nents,
+            dma_dir,
+        };
+
+        if tag >= inner.ucdl.len() {
+            return Err(EINVAL);
+        }
+
+        let mut sgp = mapping.sg.as_mut_ptr();
+        for i in 0..mapped as usize {
+            if sgp.is_null() {
+                return Err(EIO);
+            }
+
+            // SAFETY: `sgp` is a valid mapped scatterlist entry.
+            let addr = unsafe { bindings::sg_dma_address(sgp) };
+            // SAFETY: `sgp` is a valid mapped scatterlist entry.
+            let len = unsafe { bindings::sg_dma_len(sgp) };
+            if len == 0 || len > PRDT_DATA_BYTE_COUNT_MAX {
+                return Err(EINVAL);
+            }
+
+            let entry = PrdEntry {
+                addr: addr.to_le(),
+                reserved: 0,
+                size: (len - 1).to_le(),
+            };
+
+            // SAFETY: `tag` is checked against the UCD allocation above, `i`
+            // is limited by `mapped <= nr_segments <= MAX_PRD_ENTRIES`, and
+            // PRDT lives in a packed UCD so unaligned writes are required.
+            unsafe {
+                let ucd = inner.ucdl.as_mut_ptr().cast::<Ucd>().add(tag);
+                let prdt = core::ptr::addr_of_mut!((*ucd).prdt).cast::<PrdEntry>();
+                core::ptr::write_unaligned(prdt.add(i), entry);
+            }
+
+            // SAFETY: `sgp` is a valid scatterlist entry.
+            sgp = unsafe { bindings::sg_next(sgp) };
+        }
+
+        let mut utrd = dma_read!(inner.utrdl, [tag]?);
+        utrd.prd_table_length = (mapped as u16).to_le();
+        dma_write!(inner.utrdl, [tag]?, utrd);
+
+        Ok(Some(mapping))
     }
 
     pub(crate) fn fetch_devman_upiu(

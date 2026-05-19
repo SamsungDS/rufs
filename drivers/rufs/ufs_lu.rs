@@ -206,9 +206,14 @@ impl UfsLu {
         }
     }
 
-    fn compose_request(&self, tag: usize, cmd: UfsSCSICmd) -> Result<()> {
+    fn compose_request(
+        &self,
+        tag: usize,
+        cmd: UfsSCSICmd,
+        rq: &IdleRequest<UfsLuBlockOps>,
+    ) -> Result<()> {
         let request = self.queue.acquire(tag)?;
-        request.compose(UfsCmd::SCSI(cmd))?;
+        request.compose(UfsCmd::SCSI(cmd.with_request(rq.as_raw())))?;
         request.clear();
         Ok(())
     }
@@ -283,18 +288,18 @@ impl Operations for UfsLuBlockOps {
                     blocks,
                 );
 
-                lu.compose_request(tag, cmd)?;
+                lu.compose_request(tag, cmd, &rq)?;
             }
             bindings::req_op_REQ_OP_FLUSH => {
                 let cmd = lu.build_scsi_cmd(op, 0, 0)?;
-                lu.compose_request(tag, cmd)?;
+                lu.compose_request(tag, cmd, &rq)?;
                 pr_debug!("[RUFS] ufs_lu: flush request on LU {}\n", lu.lun());
             }
             bindings::req_op_REQ_OP_DISCARD => {
                 let lba = geometry.sectors_to_logical(sector);
                 let blocks = geometry.sectors_to_logical(u64::from(sectors));
                 let cmd = lu.build_scsi_cmd(op, lba, blocks)?;
-                lu.compose_request(tag, cmd)?;
+                lu.compose_request(tag, cmd, &rq)?;
                 pr_debug!(
                     "[RUFS] ufs_lu: discard request on LU {} sector={} sectors={}\n",
                     lu.lun(),
