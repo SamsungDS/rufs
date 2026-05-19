@@ -5,7 +5,8 @@
 #![allow(unused_variables)]
 
 use kernel::time::{Delta, delay};
-use kernel::{prelude::*, new_mutex};
+use kernel::{bindings, kvec, new_mutex, prelude::*};
+use kernel::error::{from_err_ptr, to_result};
 use kernel::sync::{Arc, Mutex};
 use crate::ufs_dma::DescBuffer;
 use crate::ufs_queue::*;
@@ -18,6 +19,121 @@ const FDEVICE_COMPL_TIMEOUT_MS: i64 = 1500;
 const FDEVICE_COMPL_TICK_US: i64 = 500;
 
 pub(crate) const QUERY_DESC_MAX_SIZE: usize = 255;
+
+const REQ_OP_DRV_OUT: bindings::blk_opf_t = bindings::req_op_REQ_OP_DRV_OUT;
+const BLK_STS_NOTSUPP: bindings::blk_status_t = 1;
+
+unsafe extern "C" fn queue_tmf(
+    _hctx: *mut bindings::blk_mq_hw_ctx,
+    _data: *const bindings::blk_mq_queue_data,
+) -> bindings::blk_status_t {
+    pr_warn!("rufs: unexpected TMF queue_rq callback");
+    BLK_STS_NOTSUPP
+}
+
+const TMF_OPS: bindings::blk_mq_ops = bindings::blk_mq_ops {
+    queue_rq: Some(queue_tmf),
+    queue_rqs: None,
+    commit_rqs: None,
+    get_budget: None,
+    put_budget: None,
+    set_rq_budget_token: None,
+    get_rq_budget_token: None,
+    timeout: None,
+    poll: None,
+    complete: None,
+    init_hctx: None,
+    exit_hctx: None,
+    init_request: None,
+    exit_request: None,
+    cleanup_rq: None,
+    busy: None,
+    map_queues: None,
+    #[cfg(CONFIG_BLK_DEBUG_FS)]
+    show_rq: None,
+};
+
+struct TmfQueue {
+    tag_set: bindings::blk_mq_tag_set,
+    queue: *mut bindings::request_queue,
+    rqs: KVec<*mut bindings::request>,
+    tag_set_allocated: bool,
+}
+
+// SAFETY: `TmfQueue` owns the blk-mq tag set, request queue, and request pointer
+// table. Access to it is serialized by `UfsDev::tmf_queue`.
+unsafe impl Send for TmfQueue {}
+
+impl TmfQueue {
+    fn new(depth: usize) -> Result<KBox<Self>> {
+        let rqs = kvec![core::ptr::null_mut(); depth]?;
+        let mut tmf = KBox::new(
+            Self {
+                // SAFETY: `blk_mq_tag_set` is initialized field-by-field before use.
+                tag_set: unsafe { core::mem::zeroed() },
+                queue: core::ptr::null_mut(),
+                rqs,
+                tag_set_allocated: false,
+            },
+            GFP_KERNEL,
+        )?;
+
+        tmf.tag_set.nr_hw_queues = 1;
+        tmf.tag_set.queue_depth = depth as u32;
+        tmf.tag_set.ops = &TMF_OPS;
+
+        to_result(unsafe { bindings::blk_mq_alloc_tag_set(&mut tmf.tag_set) })?;
+        tmf.tag_set_allocated = true;
+
+        tmf.queue = from_err_ptr(unsafe {
+            bindings::blk_mq_alloc_queue(
+                &mut tmf.tag_set,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        })?;
+
+        Ok(tmf)
+    }
+
+    fn alloc_request(&mut self) -> Result<*mut bindings::request> {
+        let req = from_err_ptr(unsafe {
+            bindings::blk_mq_alloc_request(self.queue, REQ_OP_DRV_OUT, 0)
+        })?;
+        let tag = unsafe { (*req).tag };
+        if tag < 0 || tag as usize >= self.rqs.len() {
+            unsafe { bindings::blk_mq_free_request(req) };
+            return Err(EINVAL);
+        }
+
+        self.rqs[tag as usize] = req;
+        Ok(req)
+    }
+
+    fn free_request(&mut self, req: *mut bindings::request) {
+        let tag = unsafe { (*req).tag };
+        if tag >= 0 && (tag as usize) < self.rqs.len() {
+            self.rqs[tag as usize] = core::ptr::null_mut();
+        }
+
+        unsafe { bindings::blk_mq_free_request(req) };
+    }
+}
+
+impl Drop for TmfQueue {
+    fn drop(&mut self) {
+        if !self.queue.is_null() {
+            unsafe {
+                bindings::blk_mq_destroy_queue(self.queue);
+                bindings::blk_put_queue(self.queue);
+            }
+        }
+
+        if self.tag_set_allocated {
+            unsafe { bindings::blk_mq_free_tag_set(&mut self.tag_set) };
+        }
+    }
+}
 
 #[derive(Copy, Clone)]
 pub(crate) enum DescIdn {
@@ -556,6 +672,9 @@ pub(crate) struct UfsDev {
 
     #[pin]
     request: Mutex<Arc<UfsRequest>>,
+
+    #[pin]
+    tmf_queue: Mutex<Option<KBox<TmfQueue>>>,
 }
 
 impl UfsDev{
@@ -565,9 +684,21 @@ impl UfsDev{
             try_pin_init!(Self {
                 info <- new_mutex!(UfsDevInfo::default()),
                 request <- new_mutex!(request),
+                tmf_queue <- new_mutex!(None),
             }),
             GFP_KERNEL,
         )
+    }
+
+    pub(crate) fn alloc_tmf_queue(&self, depth: usize) -> Result<()> {
+        let mut tmf_queue = self.tmf_queue.lock();
+        if tmf_queue.is_some() {
+            return Err(EBUSY);
+        }
+
+        tmf_queue.replace(TmfQueue::new(depth)?);
+        pr_info!("[RUFS] ufs_dev: allocated TMF queue depth {}", depth);
+        Ok(())
     }
 
     fn nop(&self) -> Result<()> {

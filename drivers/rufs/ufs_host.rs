@@ -99,6 +99,7 @@ impl UfsHost {
         host.dev.verify_dev_init()?;
         host.dev.complete_dev_init()?;
         host.dev.device_params_init()?;
+        host.dev.alloc_tmf_queue(host.reg.nutmrs())?;
 
         Ok(host)
     }
