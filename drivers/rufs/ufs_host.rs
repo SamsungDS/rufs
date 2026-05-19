@@ -9,6 +9,7 @@ use kernel::sync::{Arc, SpinLock};
 
 use crate::ufs_reg::*;
 use crate::ufs_dma::*;
+use crate::ufs_irq::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostState {
@@ -23,6 +24,7 @@ pub(crate) enum HostState {
 pub(crate) struct UfsHost {
     reg: Arc<UfsReg>,
     dma: Arc<UfsDma>,
+    irq: Arc<UfsIrq>,
 
     max_hw_queues: u16,
     max_prdt_entries: u16,
@@ -39,10 +41,12 @@ impl UfsHost {
         reg.clear_all_interrupts();
         reg.disable_interrupts();
 
+        let irq = UfsIrq::new()?;
         let host = Arc::pin_init(
             pin_init!(Self {
                 reg,
                 dma,
+                irq,
                 state <- new_spinlock!(HostState::Reset),
                 max_hw_queues: 1,
                 max_prdt_entries: 256,

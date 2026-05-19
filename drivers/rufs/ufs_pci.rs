@@ -9,6 +9,7 @@ use kernel::{device::Core, pci, prelude::*, sync::aref::ARef, sync::Arc};
 mod ufs_host;
 mod ufs_reg;
 mod ufs_dma;
+mod ufs_irq;
 
 use ufs_host::UfsHost;
 
