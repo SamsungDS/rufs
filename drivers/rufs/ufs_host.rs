@@ -4,9 +4,16 @@
 
 #![allow(dead_code)]
 
-use kernel::{device::Core, pci, prelude::*, new_spinlock};
+use kernel::{
+    block::mq::TagSet,
+    device::Core,
+    pci,
+    prelude::*,
+    new_mutex,
+    new_spinlock,
+};
 use kernel::time::{Delta, delay::*};
-use kernel::sync::{Arc, SpinLock};
+use kernel::sync::{Arc, Mutex, SpinLock};
 
 use crate::ufs_reg::*;
 use crate::ufs_dma::*;
@@ -14,6 +21,7 @@ use crate::ufs_irq::*;
 use crate::ufs_uic::*;
 use crate::ufs_queue::*;
 use crate::ufs_dev::*;
+use crate::ufs_lu::*;
 
 const HBA_ENABLE_DELAY_US: i64 = 1000;
 
@@ -34,6 +42,9 @@ pub(crate) struct UfsHost {
     uic: Arc<UfsUic>,
     queue: Arc<UfsQueue>,
     dev: Arc<UfsDev>,
+
+    #[pin]
+    luns: Mutex<KVec<Arc<UfsLu>>>,
 
     max_hw_queues: u16,
     max_prdt_entries: u16,
@@ -66,6 +77,7 @@ impl UfsHost {
                 uic,
                 queue,
                 dev,
+                luns <- new_mutex!(KVec::new()),
                 state <- new_spinlock!(HostState::Reset),
                 max_hw_queues: 1,
                 max_prdt_entries: 256,
@@ -99,9 +111,52 @@ impl UfsHost {
         host.dev.verify_dev_init()?;
         host.dev.complete_dev_init()?;
         host.dev.device_params_init()?;
+        host.alloc_luns()?;
         host.dev.alloc_tmf_queue(host.reg.nutmrs())?;
 
         Ok(host)
+    }
+
+    fn alloc_luns(&self) -> Result<()> {
+        let num_lu = self.dev.num_lu();
+        let tagset = Arc::pin_init(
+            TagSet::<UfsLuBlockOps>::new(
+                1,
+                (),
+                self.reg.nutrs() as u32,
+                1,
+                kernel::alloc::NumaNode::NO_NODE,
+                kernel::block::mq::tag_set::Flags::default(),
+            ),
+            GFP_KERNEL,
+        )?;
+        let mut luns = self.luns.lock();
+
+        for lun in 0..num_lu {
+            let desc = self.dev.read_unit_desc(lun as u8)?;
+
+            if !desc.enabled() {
+                continue;
+            }
+
+            let geometry = UfsLuGeometry::from_logical_block_shift(
+                desc.logical_block_shift(),
+                desc.logical_block_count(),
+            )?;
+            let lu = UfsLu::new(lun as u8, geometry)?;
+            lu.init_disk(tagset.clone())?;
+
+            pr_info!(
+                "[RUFS] ufs_host: allocated LU {} capacity={} logical_block_size={}",
+                lun,
+                geometry.capacity_blocks(),
+                geometry.logical_block_size(),
+            );
+
+            luns.push(lu, GFP_KERNEL)?;
+        }
+
+        Ok(())
     }
 
     // getter

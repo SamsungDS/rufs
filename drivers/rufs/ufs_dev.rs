@@ -304,6 +304,22 @@ impl UnitDesc {
     fn from_buffer(buffer: DescBuffer) -> Self {
         unsafe { core::ptr::read_unaligned(buffer.data.as_ptr().cast::<Self>()) }
     }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.lu_enable != 0
+    }
+
+    pub(crate) fn logical_block_shift(&self) -> u8 {
+        self.logical_block_size
+    }
+
+    pub(crate) fn logical_block_count(&self) -> u64 {
+        let ptr = core::ptr::addr_of!(self.logical_block_count);
+
+        // SAFETY: `UnitDesc` is packed, so integer fields may be unaligned.
+        // The descriptor stores multi-byte values in big-endian byte order.
+        unsafe { u64::from_be(core::ptr::read_unaligned(ptr)) }
+    }
 }
 
 pub(crate) type DefaultDesc = DescBuffer;
@@ -334,6 +350,13 @@ impl Desc {
     fn get_geometry(&self) -> Result<GeometryDesc> {
         match *self {
             Self::Geometry(desc) => Ok(desc),
+            _ => Err(EINVAL),
+        }
+    }
+
+    fn get_unit(&self) -> Result<UnitDesc> {
+        match *self {
+            Self::Unit(desc) => Ok(desc),
             _ => Err(EINVAL),
         }
     }
@@ -658,6 +681,8 @@ impl UfsDevCmd {
 #[derive(Default)]
 pub(crate) struct UfsDevInfo {
     max_lu: usize,
+    num_lu: usize,
+    num_wlu: usize,
     manufacturer_id: u16,
     spec_version: u16,
     queue_depth: usize,
@@ -723,6 +748,14 @@ impl UfsDev{
         let cmd = self.request.lock().issue(
             UfsDevCmd::query().read_attr(idn, index, selector))?;
         Ok(cmd.get_device()?.get_query()?.get_attr_value()?)
+    }
+
+    pub(crate) fn read_unit_desc(&self, lun: u8) -> Result<UnitDesc> {
+        self.read_desc(DescIdn::Unit, lun, 0)?.get_unit()
+    }
+
+    pub(crate) fn num_lu(&self) -> usize {
+        self.info.lock().num_lu
     }
 
     fn write_attr(
@@ -816,6 +849,8 @@ impl UfsDev{
         self.info.lock().spec_version = u16::from_be(desc.spec_version);
         self.info.lock().queue_depth = desc.queue_depth as usize;
         self.info.lock().rtt_cap = desc.device_rtt_cap;
+        self.info.lock().num_lu = desc.number_lu as usize;
+        self.info.lock().num_wlu = desc.number_wlu as usize;
         self.info.lock().luns_avail = (desc.number_lu + desc.number_wlu) as usize;
 
         Ok(())
