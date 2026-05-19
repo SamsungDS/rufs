@@ -69,6 +69,7 @@ impl UfsIrq {
     pub(crate) fn request_uic_irq(
         &self,
         pdev: &pci::Device<Core>,
+        vector: pci::IrqVector<'_>,
         reg: Arc<UfsReg>,
         uic: Arc<UfsUic>,
     ) -> Result<()> {
@@ -78,10 +79,8 @@ impl UfsIrq {
             placeholder <- new_spinlock!(0),
         });
 
-        let irq_vectors = pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?;
-        let irq_vector = *irq_vectors.start();
         let irq = pdev.request_irq(
-            irq_vector,
+            vector,
             Flags::SHARED,
             c_str!("ufshcd-uic"),
             handler,

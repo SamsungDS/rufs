@@ -122,6 +122,36 @@ impl UpiuHeader {
             ..Default::default()
         }
     }
+
+    fn query_read(tag: usize) -> Self {
+        Self {
+            transaction_code: UpiuTransaction::QueryReq as u8,
+            task_tag: tag as u8,
+            query_func: UpiuQueryFunction::StandardRead as u8,
+            ..Default::default()
+        }
+    }
+
+    fn query_write(tag: usize) -> Self {
+        Self {
+            transaction_code: UpiuTransaction::QueryReq as u8,
+            task_tag: tag as u8,
+            query_func: UpiuQueryFunction::StandardWrite as u8,
+            ..Default::default()
+        }
+    }
+
+    fn query_write_data(tag: usize, length: usize) -> Self {
+        Self {
+            transaction_code: UpiuTransaction::QueryReq as u8,
+            task_tag: tag as u8,
+            query_func: UpiuQueryFunction::StandardWrite as u8,
+            data_seg_len: (length as u16).to_be(),
+            ..Default::default()
+        }
+    }
+
+
 }
 
 #[repr(C, packed)]
@@ -199,25 +229,10 @@ enum QueryOpcode {
     ToggleFlag  = 0x8,
 }
 
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy)]
-pub(crate) struct DefaultDesc {
-    _padding: [u8; 255],
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub(crate) union DescBuffer {
-    pub(crate) device: DefaultDesc,
-    pub(crate) config: DefaultDesc,
-    pub(crate) unit: DefaultDesc,
-    pub(crate) rfu0: DefaultDesc,
-    pub(crate) interconn: DefaultDesc,
-    pub(crate) string: DefaultDesc,
-    pub(crate) rfu1: DefaultDesc,
-    pub(crate) geometry: DefaultDesc,
-    pub(crate) power: DefaultDesc,
-    pub(crate) health: DefaultDesc,
+pub(crate) struct DescBuffer {
+    pub(crate) data: [u8; QUERY_DESC_MAX_SIZE],
 }
 
 #[repr(C, packed)]
@@ -231,6 +246,21 @@ struct UpiuReadDescReq {
     length: u16, // (BE)
     _reserved2: [u32; 3],
     _padding: [u8; 480],
+}
+
+impl UpiuReadDescReq {
+    fn build(cmd: UfsDescCmd) -> Self {
+        Self {
+            opcode: QueryOpcode::ReadDesc as u8,
+            idn: cmd.idn as u8,
+            index: cmd.index,
+            selector: cmd.selector,
+            _reserved: 0,
+            length: cmd.length.to_be(),
+            _reserved2: [0; 3],
+            _padding: [0; 480],
+        }
+    }
 }
 
 #[repr(C, packed)]
@@ -258,6 +288,19 @@ struct UpiuReadAttrReq {
     _padding: [u8; 480],
 }
 
+impl UpiuReadAttrReq {
+    fn build(cmd: UfsAttrCmd) -> Self {
+        Self {
+            opcode: QueryOpcode::ReadAttr as u8,
+            idn: cmd.idn as u8,
+            index: cmd.index,
+            selector: cmd.selector,
+            _reserved: [0; 4],
+            _padding: [0; 480],
+        }
+    }
+}
+
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct UpiuWriteAttrReq {
@@ -268,6 +311,20 @@ struct UpiuWriteAttrReq {
     value: u64, // (BE)
     _reserved: [u32; 2],
     _padding: [u8; 480],
+}
+
+impl UpiuWriteAttrReq {
+    fn build(cmd: UfsAttrCmd) -> Self {
+        Self {
+            opcode: QueryOpcode::WriteAttr as u8,
+            idn: cmd.idn as u8,
+            index: cmd.index,
+            selector: cmd.selector,
+            value: cmd.value.to_be(),
+            _reserved: [0; 2],
+            _padding: [0; 480],
+        }
+    }
 }
 
 #[repr(C, packed)]
@@ -281,6 +338,19 @@ struct UpiuFlagReq {
     _padding: [u8; 480],
 }
 
+impl UpiuFlagReq {
+    fn build(cmd: UfsFlagCmd, opcode: QueryOpcode) -> Self {
+        Self {
+            opcode: opcode as u8,
+            idn: cmd.idn as u8,
+            index: cmd.index,
+            selector: cmd.selector,
+            _reserved: [0; 4],
+            _padding: [0; 480],
+        }
+    }
+}
+
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 union UpiuQueryReq {
@@ -292,6 +362,36 @@ union UpiuQueryReq {
     set_flag: UpiuFlagReq,
     clear_flag: UpiuFlagReq,
     toggle_flag: UpiuFlagReq,
+}
+
+impl UpiuQueryReq {
+    fn read_desc(cmd: UfsDescCmd) -> Self {
+        Self { read_desc: UpiuReadDescReq::build(cmd) }
+    }
+
+    fn read_attr(cmd: UfsAttrCmd) -> Self {
+        Self { read_attr: UpiuReadAttrReq::build(cmd) }
+    }
+
+    fn write_attr(cmd: UfsAttrCmd) -> Self {
+        Self { write_attr: UpiuWriteAttrReq::build(cmd) }
+    }
+
+    fn read_flag(cmd: UfsFlagCmd) -> Self {
+        Self { read_flag: UpiuFlagReq::build(cmd, QueryOpcode::ReadFlag) }
+    }
+
+    fn set_flag(cmd: UfsFlagCmd) -> Self {
+        Self { set_flag: UpiuFlagReq::build(cmd, QueryOpcode::SetFlag) }
+    }
+
+    fn clear_flag(cmd: UfsFlagCmd) -> Self {
+        Self { clear_flag: UpiuFlagReq::build(cmd, QueryOpcode::ClearFlag) }
+    }
+
+    fn toggle_flag(cmd: UfsFlagCmd) -> Self {
+        Self { toggle_flag: UpiuFlagReq::build(cmd, QueryOpcode::ToggleFlag) }
+    }
 }
 
 #[repr(C, packed)]
@@ -323,24 +423,13 @@ struct UpiuWriteDescRsp {
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
-struct UpiuReadAttrRsp {
+struct UpiuAttrRsp {
     opcode: u8,
     idn: u8,
     index: u8,
     selector: u8,
     value: u64, // (BE)
     _reserved: [u32; 2],
-    _padding: [u8; 480],
-}
-
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct UpiuWriteAttrRsp {
-    opcode: u8,
-    idn: u8,
-    index: u8,
-    selector: u8,
-    _reserved: [u32; 4],
     _padding: [u8; 480],
 }
 
@@ -362,12 +451,8 @@ struct UpiuFlagRsp {
 union UpiuQueryRsp {
     read_desc: UpiuReadDescRsp,
     write_desc: UpiuWriteDescRsp,
-    read_attr: UpiuReadAttrRsp,
-    write_attr: UpiuWriteAttrRsp,
-    read_flag: UpiuFlagRsp,
-    set_flag: UpiuFlagRsp,
-    clear_flag: UpiuFlagRsp,
-    toggle_flag: UpiuFlagRsp,
+    attr: UpiuAttrRsp,
+    flag: UpiuFlagRsp,
 }
 
 #[repr(C, packed)]
@@ -406,6 +491,35 @@ impl UpiuBody {
     fn nop_out() -> Self {
         Self { nop_out: UpiuNop::build() }
     }
+
+    fn read_desc(cmd: UfsDescCmd) -> Self {
+        Self { query_req: UpiuQueryReq::read_desc(cmd) }
+    }
+
+    fn read_attr(cmd: UfsAttrCmd) -> Self {
+        Self { query_req: UpiuQueryReq::read_attr(cmd) }
+    }
+
+    fn write_attr(cmd: UfsAttrCmd) -> Self {
+        Self { query_req: UpiuQueryReq::write_attr(cmd) }
+    }
+
+    fn read_flag(cmd: UfsFlagCmd) -> Self {
+        Self { query_req: UpiuQueryReq::read_flag(cmd) }
+    }
+
+    fn set_flag(cmd: UfsFlagCmd) -> Self {
+        Self { query_req: UpiuQueryReq::set_flag(cmd) }
+    }
+
+    fn clear_flag(cmd: UfsFlagCmd) -> Self {
+        Self { query_req: UpiuQueryReq::clear_flag(cmd) }
+    }
+
+    fn toggle_flag(cmd: UfsFlagCmd) -> Self {
+        Self { query_req: UpiuQueryReq::toggle_flag(cmd) }
+    }
+
 }
 
 #[repr(C, packed)]
@@ -432,12 +546,188 @@ impl Upiu {
         }
     }
 
+    fn read_desc(cmd: UfsDescCmd, tag: usize) -> Self {
+        Self {
+            header: UpiuHeader::query_read(tag),
+            body: UpiuBody::read_desc(cmd),
+        }
+    }
+
+    fn read_attr(cmd: UfsAttrCmd, tag: usize) -> Self {
+        Self {
+            header: UpiuHeader::query_read(tag),
+            body: UpiuBody::read_attr(cmd),
+        }
+    }
+
+    fn write_attr(cmd: UfsAttrCmd, tag: usize) -> Self {
+        Self {
+            header: UpiuHeader::query_write(tag),
+            body: UpiuBody::write_attr(cmd),
+        }
+    }
+
+    fn read_flag(cmd: UfsFlagCmd, tag: usize) -> Self {
+        Self {
+            header: UpiuHeader::query_read(tag),
+            body: UpiuBody::read_flag(cmd),
+        }
+    }
+
+    fn set_flag(cmd: UfsFlagCmd, tag: usize) -> Self {
+        Self {
+            header: UpiuHeader::query_write(tag),
+            body: UpiuBody::set_flag(cmd),
+        }
+    }
+
+    fn clear_flag(cmd: UfsFlagCmd, tag: usize) -> Self {
+        Self {
+            header: UpiuHeader::query_write(tag),
+            body: UpiuBody::clear_flag(cmd),
+        }
+    }
+
+    fn toggle_flag(cmd: UfsFlagCmd, tag: usize) -> Self {
+        Self {
+            header: UpiuHeader::query_write(tag),
+            body: UpiuBody::toggle_flag(cmd),
+        }
+    }
+
+    fn device(cmd: UfsDevCmd, tag: usize) -> Self {
+        match cmd {
+            UfsDevCmd::Nop => Self::nop_out(tag),
+            UfsDevCmd::Query(cmd) => Self::query(cmd, tag),
+            UfsDevCmd::RPMB(_) => Self::nop_out(tag),
+        }
+    }
+
+    fn query(cmd: UfsQueryCmd, tag: usize) -> Self {
+        match cmd {
+            UfsQueryCmd::Nop => Self::nop_out(tag),
+            UfsQueryCmd::ReadDesc(cmd) => Self::read_desc(cmd, tag),
+            UfsQueryCmd::WriteDesc(cmd) => Self::nop_out(tag),
+            UfsQueryCmd::ReadAttr(cmd) => Self::read_attr(cmd, tag),
+            UfsQueryCmd::WriteAttr(cmd) => Self::write_attr(cmd, tag),
+            UfsQueryCmd::ReadFlag(cmd) => Self::read_flag(cmd, tag),
+            UfsQueryCmd::SetFlag(cmd) => Self::set_flag(cmd, tag),
+            UfsQueryCmd::ClearFlag(cmd) => Self::clear_flag(cmd, tag),
+            UfsQueryCmd::ToggleFlag(cmd) => Self::toggle_flag(cmd, tag),
+        }
+    }
+
     fn transaction(&self) -> UpiuTransaction {
         self.header.transaction_code.into()
     }
 
     fn response(&self) -> UpiuResponse {
         self.header.response.into()
+    }
+
+    fn fetch_dev(&self, cmd: UfsDevCmd) -> Result<UfsDevCmd> {
+        match cmd {
+            UfsDevCmd::Nop => {
+                match self.transaction() {
+                    UpiuTransaction::NopIn => Ok(cmd),
+                    _ => Err(EIO),
+                }
+            },
+            UfsDevCmd::Query(cmd) => {
+                match self.transaction() {
+                    UpiuTransaction::QueryRsp => {
+                        match self.response() {
+                            UpiuResponse::Success => self.fetch_query(cmd),
+                            _ => Err(EIO),
+                        }
+                    },
+                    _ => Err(EIO),
+                }
+            },
+            UfsDevCmd::RPMB(cmd) => {
+                match self.transaction() {
+                    UpiuTransaction::Response => Ok(UfsDevCmd::RPMB(cmd)),
+                    _ => Err(EIO),
+                }
+            },
+        }
+    }
+
+    fn fetch_query(&self, cmd: UfsQueryCmd) -> Result<UfsDevCmd> {
+        match cmd {
+            UfsQueryCmd::ReadDesc(cmd) => {
+                let upiu = self.body;
+                let upiu = unsafe { upiu.query_rsp.read_desc };
+                Ok(UfsDevCmd::Query(UfsQueryCmd::ReadDesc(UfsDescCmd {
+                    idn: upiu.idn.into(),
+                    index: upiu.index,
+                    selector: upiu.selector,
+                    length: u16::from_be(upiu.length),
+                    desc: Desc::from_buffer(upiu.idn, upiu.buffer),
+                })))
+            },
+            UfsQueryCmd::ReadAttr(cmd) => {
+                let upiu = self.body;
+                let upiu = unsafe { upiu.query_rsp.attr };
+                Ok(UfsDevCmd::Query(UfsQueryCmd::ReadAttr(UfsAttrCmd {
+                    idn: upiu.idn.into(),
+                    index: upiu.index,
+                    selector: upiu.selector,
+                    value: u64::from_be(upiu.value),
+                })))
+            },
+            UfsQueryCmd::WriteAttr(cmd) => {
+                let upiu = self.body;
+                let upiu = unsafe { upiu.query_rsp.attr };
+                Ok(UfsDevCmd::Query(UfsQueryCmd::WriteAttr(UfsAttrCmd {
+                    idn: upiu.idn.into(),
+                    index: upiu.index,
+                    selector: upiu.selector,
+                    value: u64::from_be(upiu.value),
+                })))
+            },
+            UfsQueryCmd::ReadFlag(cmd) => {
+                let upiu = self.body;
+                let upiu = unsafe { upiu.query_rsp.flag };
+                Ok(UfsDevCmd::Query(UfsQueryCmd::ReadFlag(UfsFlagCmd {
+                    idn: upiu.idn.into(),
+                    index: upiu.index,
+                    selector: upiu.selector,
+                    value: upiu.value,
+                })))
+            },
+            UfsQueryCmd::SetFlag(cmd) => {
+                let upiu = self.body;
+                let upiu = unsafe { upiu.query_rsp.flag };
+                Ok(UfsDevCmd::Query(UfsQueryCmd::SetFlag(UfsFlagCmd {
+                    idn: upiu.idn.into(),
+                    index: upiu.index,
+                    selector: upiu.selector,
+                    value: upiu.value,
+                })))
+            },
+            UfsQueryCmd::ClearFlag(cmd) => {
+                let upiu = self.body;
+                let upiu = unsafe { upiu.query_rsp.flag };
+                Ok(UfsDevCmd::Query(UfsQueryCmd::ClearFlag(UfsFlagCmd {
+                    idn: upiu.idn.into(),
+                    index: upiu.index,
+                    selector: upiu.selector,
+                    value: upiu.value,
+                })))
+            },
+            UfsQueryCmd::ToggleFlag(cmd) => {
+                let upiu = self.body;
+                let upiu = unsafe { upiu.query_rsp.flag };
+                Ok(UfsDevCmd::Query(UfsQueryCmd::ToggleFlag(UfsFlagCmd {
+                    idn: upiu.idn.into(),
+                    index: upiu.index,
+                    selector: upiu.selector,
+                    value: upiu.value,
+                })))
+            },
+            _ => Ok(UfsDevCmd::Query(cmd)),
+        }
     }
 }
 
@@ -488,7 +778,11 @@ impl Ucd {
     }
 
     fn device(&self, cmd: UfsDevCmd, tag: usize) -> Self {
-        self.nop(tag)
+        match cmd {
+            UfsDevCmd::Nop => self.nop(tag),
+            UfsDevCmd::Query(cmd) => self.query(cmd, tag),
+            UfsDevCmd::RPMB(_) => self.nop(tag),
+        }
     }
 
     fn nop(&self, tag: usize) -> Self {
@@ -499,11 +793,183 @@ impl Ucd {
         }
     }
 
-    fn fetch_dev(&self, cmd: UfsDevCmd) -> Result<UfsDevCmd> {
-        match self.rsp_upiu.transaction() {
-            UpiuTransaction::NopIn => Ok(cmd),
-            _ => Err(EIO),
+    fn query(&self, cmd: UfsQueryCmd, tag: usize) -> Self {
+        match cmd {
+            UfsQueryCmd::Nop => self.nop(tag),
+            UfsQueryCmd::ReadDesc(cmd) => self.read_desc(cmd, tag),
+            UfsQueryCmd::WriteDesc(cmd) => self.nop(tag),
+            UfsQueryCmd::ReadAttr(cmd) => self.read_attr(cmd, tag),
+            UfsQueryCmd::WriteAttr(cmd) => self.write_attr(cmd, tag),
+            UfsQueryCmd::ReadFlag(cmd) => self.read_flag(cmd, tag),
+            UfsQueryCmd::SetFlag(cmd) => self.set_flag(cmd, tag),
+            UfsQueryCmd::ClearFlag(cmd) => self.clear_flag(cmd, tag),
+            UfsQueryCmd::ToggleFlag(cmd) => self.toggle_flag(cmd, tag),
         }
+    }
+
+    fn read_desc(&self, cmd: UfsDescCmd, tag: usize) -> Self {
+        Self {
+            cmd_upiu: Upiu::read_desc(cmd, tag),
+            rsp_upiu: Upiu::default(),
+            prdt: self.prdt,
+        }
+    }
+
+    fn read_attr(&self, cmd: UfsAttrCmd, tag: usize) -> Self {
+        Self {
+            cmd_upiu: Upiu::read_attr(cmd, tag),
+            rsp_upiu: Upiu::default(),
+            prdt: self.prdt,
+        }
+    }
+
+    fn write_attr(&self, cmd: UfsAttrCmd, tag: usize) -> Self {
+        Self {
+            cmd_upiu: Upiu::write_attr(cmd, tag),
+            rsp_upiu: Upiu::default(),
+            prdt: self.prdt,
+        }
+    }
+
+    fn read_flag(&self, cmd: UfsFlagCmd, tag: usize) -> Self {
+        Self {
+            cmd_upiu: Upiu::read_flag(cmd, tag),
+            rsp_upiu: Upiu::default(),
+            prdt: self.prdt,
+        }
+    }
+
+    fn set_flag(&self, cmd: UfsFlagCmd, tag: usize) -> Self {
+        Self {
+            cmd_upiu: Upiu::set_flag(cmd, tag),
+            rsp_upiu: Upiu::default(),
+            prdt: self.prdt,
+        }
+    }
+
+    fn clear_flag(&self, cmd: UfsFlagCmd, tag: usize) -> Self {
+        Self {
+            cmd_upiu: Upiu::clear_flag(cmd, tag),
+            rsp_upiu: Upiu::default(),
+            prdt: self.prdt,
+        }
+    }
+
+    fn toggle_flag(&self, cmd: UfsFlagCmd, tag: usize) -> Self {
+        Self {
+            cmd_upiu: Upiu::toggle_flag(cmd, tag),
+            rsp_upiu: Upiu::default(),
+            prdt: self.prdt,
+        }
+    }
+
+    fn fetch_dev(&self, cmd: UfsDevCmd) -> Result<UfsDevCmd> {
+        match cmd {
+            UfsDevCmd::Nop => {
+                match self.rsp_upiu.transaction() {
+                    UpiuTransaction::NopIn => Ok(cmd),
+                    _ => Err(EIO),
+                }
+            },
+            UfsDevCmd::Query(cmd) => {
+                match self.rsp_upiu.transaction() {
+                    UpiuTransaction::QueryRsp => {
+                        match self.rsp_upiu.response() {
+                            UpiuResponse::Success => self.fetch_query(cmd),
+                            _ => Err(EIO),
+                        }
+                    },
+                    _ => Err(EIO),
+                }
+            },
+            UfsDevCmd::RPMB(cmd) => {
+                match self.rsp_upiu.transaction() {
+                    UpiuTransaction::Response => self.fetch_rpmb(cmd),
+                    _ => Err(EIO),
+                }
+            },
+        }
+    }
+
+    fn fetch_query(&self, cmd: UfsQueryCmd) -> Result<UfsDevCmd> {
+        match cmd {
+            UfsQueryCmd::ReadDesc(cmd) => {
+                let upiu = self.rsp_upiu.body;
+                let upiu = unsafe { upiu.query_rsp.read_desc };
+                Ok(UfsDevCmd::Query(UfsQueryCmd::ReadDesc(UfsDescCmd {
+                    idn: upiu.idn.into(),
+                    index: upiu.index,
+                    selector: upiu.selector,
+                    length: u16::from_be(upiu.length),
+                    desc: Desc::from_buffer(upiu.idn, upiu.buffer),
+                })))
+            },
+            UfsQueryCmd::ReadAttr(cmd) => {
+                let upiu = self.rsp_upiu.body;
+                let upiu = unsafe { upiu.query_rsp.attr };
+                Ok(UfsDevCmd::Query(UfsQueryCmd::ReadAttr(UfsAttrCmd {
+                    idn: upiu.idn.into(),
+                    index: upiu.index,
+                    selector: upiu.selector,
+                    value: u64::from_be(upiu.value),
+                })))
+            },
+            UfsQueryCmd::WriteAttr(cmd) => {
+                let upiu = self.rsp_upiu.body;
+                let upiu = unsafe { upiu.query_rsp.attr };
+                Ok(UfsDevCmd::Query(UfsQueryCmd::WriteAttr(UfsAttrCmd {
+                    idn: upiu.idn.into(),
+                    index: upiu.index,
+                    selector: upiu.selector,
+                    value: u64::from_be(upiu.value),
+                })))
+            },
+            UfsQueryCmd::ReadFlag(cmd) => {
+                let upiu = self.rsp_upiu.body;
+                let upiu = unsafe { upiu.query_rsp.flag };
+                Ok(UfsDevCmd::Query(UfsQueryCmd::ReadFlag(UfsFlagCmd {
+                    idn: upiu.idn.into(),
+                    index: upiu.index,
+                    selector: upiu.selector,
+                    value: upiu.value,
+                })))
+            },
+            UfsQueryCmd::SetFlag(cmd) => {
+                let upiu = self.rsp_upiu.body;
+                let upiu = unsafe { upiu.query_rsp.flag };
+                Ok(UfsDevCmd::Query(UfsQueryCmd::SetFlag(UfsFlagCmd {
+                    idn: upiu.idn.into(),
+                    index: upiu.index,
+                    selector: upiu.selector,
+                    value: upiu.value,
+                })))
+            },
+            UfsQueryCmd::ClearFlag(cmd) => {
+                let upiu = self.rsp_upiu.body;
+                let upiu = unsafe { upiu.query_rsp.flag };
+                Ok(UfsDevCmd::Query(UfsQueryCmd::ClearFlag(UfsFlagCmd {
+                    idn: upiu.idn.into(),
+                    index: upiu.index,
+                    selector: upiu.selector,
+                    value: upiu.value,
+                })))
+            },
+            UfsQueryCmd::ToggleFlag(cmd) => {
+                let upiu = self.rsp_upiu.body;
+                let upiu = unsafe { upiu.query_rsp.flag };
+                Ok(UfsDevCmd::Query(UfsQueryCmd::ToggleFlag(UfsFlagCmd {
+                    idn: upiu.idn.into(),
+                    index: upiu.index,
+                    selector: upiu.selector,
+                    value: upiu.value,
+                })))
+            },
+            _ => Ok(UfsDevCmd::Query(cmd)),
+        }
+    }
+
+    fn fetch_rpmb(&self, cmd: UfsRPMBCmd) -> Result<UfsDevCmd> {
+        Ok(UfsDevCmd::RPMB(cmd))
     }
 }
 
@@ -730,8 +1196,8 @@ impl UfsDma {
         let utrd = dma_read!(inner.utrdl, [tag]?);
         dma_write!(inner.utrdl, [tag]?, utrd.build(UfsCmd::Device(cmd)));
 
-        let ucd = dma_read!(inner.ucdl, [tag]?);
-        dma_write!(inner.ucdl, [tag]?, ucd.build(UfsCmd::Device(cmd), tag));
+        dma_write!(inner.ucdl, [tag]?.cmd_upiu, Upiu::device(cmd, tag));
+        dma_write!(inner.ucdl, [tag]?.rsp_upiu, Upiu::default());
         Ok(())
     }
 
@@ -745,8 +1211,8 @@ impl UfsDma {
         let utrd = dma_read!(inner.utrdl, [tag]?);
         utrd.check_response()?;
 
-        let ucd = dma_read!(inner.ucdl, [tag]?);
-        let cmd = ucd.fetch_dev(cmd)?;
+        let rsp_upiu = dma_read!(inner.ucdl, [tag]?.rsp_upiu);
+        let cmd = rsp_upiu.fetch_dev(cmd)?;
 
         Ok(UfsCmd::Device(cmd))
     }
@@ -757,6 +1223,7 @@ const _: () = { assert!(size_of::<UpiuCmd>() == 500); };
 const _: () = { assert!(size_of::<UpiuRsp>() == 500); };
 const _: () = { assert!(size_of::<UpiuTmReq>() == 32); };
 const _: () = { assert!(size_of::<UpiuTmRsp>() == 32); };
+const _: () = { assert!(size_of::<DescBuffer>() == QUERY_DESC_MAX_SIZE); };
 const _: () = { assert!(size_of::<UpiuReadDescReq>() == 500); };
 const _: () = { assert!(size_of::<UpiuWriteDescReq>() == 500); };
 const _: () = { assert!(size_of::<UpiuReadAttrReq>() == 500); };
@@ -765,8 +1232,7 @@ const _: () = { assert!(size_of::<UpiuFlagReq>() == 500); };
 const _: () = { assert!(size_of::<UpiuQueryReq>() == 500); };
 const _: () = { assert!(size_of::<UpiuReadDescRsp>() == 500); };
 const _: () = { assert!(size_of::<UpiuWriteDescRsp>() == 500); };
-const _: () = { assert!(size_of::<UpiuReadAttrRsp>() == 500); };
-const _: () = { assert!(size_of::<UpiuWriteAttrRsp>() == 500); };
+const _: () = { assert!(size_of::<UpiuAttrRsp>() == 500); };
 const _: () = { assert!(size_of::<UpiuFlagRsp>() == 500); };
 const _: () = { assert!(size_of::<UpiuQueryRsp>() == 500); };
 const _: () = { assert!(size_of::<UpiuNop>() == 500); };
@@ -780,6 +1246,8 @@ const _: () = { assert!(size_of::<Utmrd>() == 80); };
 
 unsafe impl kernel::transmute::AsBytes for Ucd {}
 unsafe impl kernel::transmute::FromBytes for Ucd {}
+unsafe impl kernel::transmute::AsBytes for Upiu {}
+unsafe impl kernel::transmute::FromBytes for Upiu {}
 unsafe impl kernel::transmute::AsBytes for Utrd {}
 unsafe impl kernel::transmute::FromBytes for Utrd {}
 unsafe impl kernel::transmute::AsBytes for Utmrd {}

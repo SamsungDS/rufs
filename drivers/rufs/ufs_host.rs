@@ -82,6 +82,7 @@ impl UfsHost {
         /* ufshcd_link_startup() */
         host.irq.request_uic_irq(
             pdev,
+            irq_vector,
             host.reg.clone(),
             host.uic.clone(),
         )?;
@@ -96,6 +97,8 @@ impl UfsHost {
             host.queue.clone(),
         )?;
         host.dev.verify_dev_init()?;
+        host.dev.complete_dev_init()?;
+        host.dev.device_params_init()?;
 
         Ok(host)
     }

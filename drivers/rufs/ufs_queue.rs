@@ -73,7 +73,7 @@ impl UfsRequest {
         self.fetch()
     }
 
-    fn compose(&self, cmd: UfsCmd) -> Result<()> {
+    pub(crate) fn compose(&self, cmd: UfsCmd) -> Result<()> {
         if self.cmd.lock().is_some() {
             pr_err!("command already exist in UfsRequest");
             return Err(EIO);
@@ -90,7 +90,7 @@ impl UfsRequest {
         }
     }
 
-    fn submit(&self) -> Result<()> {
+    pub(crate) fn submit(&self) -> Result<()> {
         let cmd = match *self.cmd.lock() {
             Some(cmd) => cmd,
             None => {
@@ -99,18 +99,25 @@ impl UfsRequest {
             },
         };
 
+        self.queue.prepare_dev_wait();
+        *self.state.lock() = RequestState::Submitted;
+
         let result = match cmd {
             UfsCmd::Device(cmd) => self.queue.submit_dev(cmd, self.tag),
             UfsCmd::SCSI(_) => Err(ENOTSUPP),
         };
 
         match result {
-            Err(e) => { *self.cmd.lock() = None; Err(e) },
-            Ok(()) => { *self.state.lock() = RequestState::Submitted; Ok(()) }
+            Err(e) => {
+                *self.state.lock() = RequestState::Idle;
+                *self.cmd.lock() = None;
+                Err(e)
+            },
+            Ok(()) => Ok(())
         }
     }
 
-    fn wait(&self) -> Result<()> {
+    pub(crate) fn wait(&self) -> Result<()> {
         let cmd = match *self.cmd.lock() {
             Some(cmd) => cmd,
             None => {
@@ -130,12 +137,16 @@ impl UfsRequest {
         };
 
         match result {
-            Err(e) => { *self.cmd.lock() = None; Err(e) },
+            Err(e) => {
+                *self.state.lock() = RequestState::Idle;
+                *self.cmd.lock() = None;
+                Err(e)
+            },
             Ok(()) => Ok(()),
         }
     }
 
-    fn fetch(&self) -> Result<UfsCmd> {
+    pub(crate) fn fetch(&self) -> Result<UfsCmd> {
         let cmd = match *self.cmd.lock() {
             Some(cmd) => cmd,
             None => {
@@ -155,8 +166,16 @@ impl UfsRequest {
         };
 
         match result {
-            Err(e) => { *self.cmd.lock() = None; Err(e) },
-            Ok(cmd) => { *self.cmd.lock() = None; Ok(cmd) },
+            Err(e) => {
+                *self.state.lock() = RequestState::Idle;
+                *self.cmd.lock() = None;
+                Err(e)
+            },
+            Ok(cmd) => {
+                *self.state.lock() = RequestState::Idle;
+                *self.cmd.lock() = None;
+                Ok(cmd)
+            },
         }
     }
 
@@ -170,12 +189,12 @@ impl UfsRequest {
             },
         };
 
+        *self.state.lock() = RequestState::Completed;
+
         match cmd {
             UfsCmd::Device(cmd) => self.queue.complete_dev(cmd, self.tag),
             UfsCmd::SCSI(cmd) => {},
         };
-
-        *self.state.lock() = RequestState::Completed;
     }
 }
 
@@ -263,6 +282,10 @@ impl UfsQueue {
         Ok(())
     }
 
+    fn prepare_dev_wait(&self) {
+        self.completion.reinit();
+    }
+
     fn wait_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
         match self.completion.wait_for_completion_timeout(cmd.timeout()) {
             0 => Err(ETIMEDOUT),
@@ -299,10 +322,11 @@ impl UfsQueue {
         let doorbell = self.reg.read_utrl_doorbell();
         let mut tag = 0 as usize;
         while let Some(request) = self.next_submitted_request(tag) {
-            if (doorbell & (1 << tag)) == 0 {
+            let request_tag = request.tag;
+            if (doorbell & (1 << request_tag)) == 0 {
                 request.complete();
             }
-            tag += 1;
+            tag = request_tag + 1;
         }
     }
 
