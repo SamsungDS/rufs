@@ -4,8 +4,8 @@
 
 pub mod mq;
 
-/// Bit mask for masking out [`SECTOR_SIZE`].
-pub const SECTOR_MASK: u32 = bindings::SECTOR_MASK;
+/// Bit mask for masking out the sector index in a page.
+pub const PAGE_SECTOR_MASK: u32 = bindings::SECTOR_MASK;
 
 /// Sectors are size `1 << SECTOR_SHIFT`.
 pub const SECTOR_SHIFT: u32 = bindings::SECTOR_SHIFT;
