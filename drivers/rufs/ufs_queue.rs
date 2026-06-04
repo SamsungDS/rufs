@@ -257,6 +257,119 @@ struct UfsRequestInner {
     state: RequestState,
 }
 
+struct SdbTransferBackend {
+    reg: Arc<UfsReg>,
+    dma: Arc<UfsDma>,
+}
+
+enum UfsTransferBackend {
+    Sdb(SdbTransferBackend),
+}
+
+impl SdbTransferBackend {
+    fn new(reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Self {
+        Self { reg, dma }
+    }
+
+    fn queue_depth(&self) -> usize {
+        self.reg.nutrs()
+    }
+
+    fn compose_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
+        self.dma.compose_devman_upiu(cmd, tag)
+    }
+
+    fn compose_scsi(
+        &self,
+        cmd: UfsSCSICmd,
+        tag: usize,
+        rq: &mq::Request<UfsLuBlockOps>,
+    ) -> Result<Option<UfsPrdtMapping>> {
+        self.dma.compose_scsi_upiu(cmd, tag, rq.as_raw())
+    }
+
+    fn submit_dev(&self, _cmd: UfsDevCmd, tag: usize) -> Result<()> {
+        self.reg.ring_utrl_doorbell(tag);
+        Ok(())
+    }
+
+    fn submit_scsi(&self, _cmd: UfsSCSICmd, tag: usize) -> Result<()> {
+        self.reg.ring_utrl_doorbell(tag);
+        Ok(())
+    }
+
+    fn request_completed(&self, tag: usize) -> bool {
+        (self.reg.read_utrl_doorbell() & (1 << tag)) == 0
+    }
+
+    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
+        self.dma.fetch_devman_upiu(cmd, tag)
+    }
+
+    fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult {
+        self.dma.fetch_scsi_completion(tag)
+    }
+}
+
+impl UfsTransferBackend {
+    fn sdb(reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Self {
+        Self::Sdb(SdbTransferBackend::new(reg, dma))
+    }
+
+    fn queue_depth(&self) -> usize {
+        match self {
+            Self::Sdb(backend) => backend.queue_depth(),
+        }
+    }
+
+    fn compose_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
+        match self {
+            Self::Sdb(backend) => backend.compose_dev(cmd, tag),
+        }
+    }
+
+    fn compose_scsi(
+        &self,
+        cmd: UfsSCSICmd,
+        tag: usize,
+        rq: &mq::Request<UfsLuBlockOps>,
+    ) -> Result<Option<UfsPrdtMapping>> {
+        match self {
+            Self::Sdb(backend) => backend.compose_scsi(cmd, tag, rq),
+        }
+    }
+
+    fn submit_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
+        match self {
+            Self::Sdb(backend) => backend.submit_dev(cmd, tag),
+        }
+    }
+
+    fn submit_scsi(&self, cmd: UfsSCSICmd, tag: usize) -> Result<()> {
+        match self {
+            Self::Sdb(backend) => backend.submit_scsi(cmd, tag),
+        }
+    }
+
+    fn request_completed(&self, tag: usize) -> bool {
+        match self {
+            Self::Sdb(backend) => backend.request_completed(tag),
+        }
+    }
+
+    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
+        match self {
+            Self::Sdb(backend) => backend.fetch_dev(cmd, tag),
+        }
+    }
+
+    fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult {
+        match self {
+            Self::Sdb(backend) => backend.fetch_scsi_completion(tag),
+        }
+    }
+}
+
 #[pin_data]
 pub(crate) struct UfsRequest {
     queue: Arc<UfsQueue>,
@@ -389,7 +502,7 @@ impl UfsRequest {
             },
             Ok(()) => {
                 self.inner.lock().state = RequestState::Submitted;
-                if (self.queue.reg.read_utrl_doorbell() & (1 << self.tag)) == 0 {
+                if self.queue.request_completed(self.tag) {
                     self.queue.wake_completion_thread();
                 }
                 Ok(())
@@ -513,9 +626,8 @@ impl UfsRequest {
 
 #[pin_data]
 pub(crate) struct UfsQueue {
-    reg: Arc<UfsReg>,
     irq: Arc<UfsIrq>,
-    dma: Arc<UfsDma>,
+    backend: UfsTransferBackend,
 
     #[pin]
     slot: SpinLock<KVec<Option<Arc<UfsRequest>>>>,
@@ -530,13 +642,13 @@ impl UfsQueue {
         irq: Arc<UfsIrq>,
         dma: Arc<UfsDma>,
     ) -> Result<Arc<Self>> {
-        let slot = kvec![None; reg.nutrs()]?;
+        let backend = UfsTransferBackend::sdb(reg, dma);
+        let slot = kvec![None; backend.queue_depth()]?;
 
         Arc::pin_init(
             try_pin_init!(Self {
-                reg,
                 irq,
-                dma,
+                backend,
                 slot <- new_spinlock!(slot),
                 completion <- Completion::new(),
             }),
@@ -592,7 +704,7 @@ impl UfsQueue {
 
     // Issuing
     fn compose_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
-        self.dma.compose_devman_upiu(cmd, tag)
+        self.backend.compose_dev(cmd, tag)
     }
 
     fn compose_scsi(
@@ -601,18 +713,15 @@ impl UfsQueue {
         tag: usize,
         rq: &mq::Request<UfsLuBlockOps>,
     ) -> Result<Option<UfsPrdtMapping>> {
-        self.dma.compose_scsi_upiu(cmd, tag, rq.as_raw())
+        self.backend.compose_scsi(cmd, tag, rq)
     }
 
     fn submit_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
-        //self.outstanding_slots.set_bit_atomic(tag);
-        self.reg.ring_utrl_doorbell(tag);
-        Ok(())
+        self.backend.submit_dev(cmd, tag)
     }
 
     fn submit_scsi(&self, cmd: UfsSCSICmd, tag: usize) -> Result<()> {
-        self.reg.ring_utrl_doorbell(tag);
-        Ok(())
+        self.backend.submit_scsi(cmd, tag)
     }
 
     fn prepare_dev_wait(&self) {
@@ -627,7 +736,15 @@ impl UfsQueue {
     }
 
     fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
-        self.dma.fetch_devman_upiu(cmd, tag)
+        self.backend.fetch_dev(cmd, tag)
+    }
+
+    fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult {
+        self.backend.fetch_scsi_completion(tag)
+    }
+
+    fn request_completed(&self, tag: usize) -> bool {
+        self.backend.request_completed(tag)
     }
 
     // Completion
@@ -671,8 +788,7 @@ impl UfsQueue {
         let mut retry = false;
         while let Some(request) = self.next_submitted_request(tag) {
             let request_tag = request.tag;
-            let doorbell = self.reg.read_utrl_doorbell();
-            if (doorbell & (1 << request_tag)) == 0 {
+            if self.request_completed(request_tag) {
                 if !request.complete() {
                     retry = true;
                 }
@@ -695,7 +811,7 @@ impl UfsQueue {
         tag: usize,
         rq: ARef<mq::Request<UfsLuBlockOps>>,
     ) -> Result<(), ARef<mq::Request<UfsLuBlockOps>>> {
-        let result = self.dma.fetch_scsi_completion(tag);
+        let result = self.fetch_scsi_completion(tag);
         let sense_len = result.sense_data_len.min(result.sense_data.len());
         let sense = parse_scsi_sense(&result.sense_data, sense_len);
         let suppress_log = matches!(result.completion, UfsScsiCompletion::CheckCondition)
