@@ -262,8 +262,18 @@ struct SdbTransferBackend {
     dma: Arc<UfsDma>,
 }
 
+struct McqTransferBackend {
+    reg: Arc<UfsReg>,
+    dma: Arc<UfsDma>,
+    max_queues: usize,
+    nr_queues: usize,
+    queue_depth: usize,
+    oprs: UfsMcqOprSet,
+}
+
 enum UfsTransferBackend {
     Sdb(SdbTransferBackend),
+    Mcq(McqTransferBackend),
 }
 
 impl SdbTransferBackend {
@@ -311,20 +321,95 @@ impl SdbTransferBackend {
     }
 }
 
+impl McqTransferBackend {
+    fn new(reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Result<Self> {
+        if !reg.mcq_supported() {
+            return Err(ENOTSUPP);
+        }
+
+        let max_queues = reg.mcq_max_queues();
+        let queue_depth = reg.nutrs_mcq();
+        let oprs = reg.mcq_default_opr_set()?;
+        Ok(Self {
+            reg,
+            dma,
+            max_queues,
+            nr_queues: 0,
+            queue_depth,
+            oprs,
+        })
+    }
+
+    fn max_queues(&self) -> usize {
+        self.max_queues
+    }
+
+    fn nr_queues(&self) -> usize {
+        self.nr_queues
+    }
+
+    fn queue_depth(&self) -> usize {
+        self.queue_depth
+    }
+
+    fn oprs(&self) -> &UfsMcqOprSet {
+        &self.oprs
+    }
+
+    fn compose_dev(&self, _cmd: UfsDevCmd, _tag: usize) -> Result<()> {
+        Err(ENOTSUPP)
+    }
+
+    fn compose_scsi(
+        &self,
+        _cmd: UfsSCSICmd,
+        _tag: usize,
+        _rq: &mq::Request<UfsLuBlockOps>,
+    ) -> Result<Option<UfsPrdtMapping>> {
+        Err(ENOTSUPP)
+    }
+
+    fn submit_dev(&self, _cmd: UfsDevCmd, _tag: usize) -> Result<()> {
+        Err(ENOTSUPP)
+    }
+
+    fn submit_scsi(&self, _cmd: UfsSCSICmd, _tag: usize) -> Result<()> {
+        Err(ENOTSUPP)
+    }
+
+    fn request_completed(&self, _tag: usize) -> bool {
+        false
+    }
+
+    fn fetch_dev(&self, _cmd: UfsDevCmd, _tag: usize) -> Result<UfsCmd> {
+        Err(ENOTSUPP)
+    }
+
+    fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult {
+        self.dma.fetch_scsi_completion(tag)
+    }
+}
+
 impl UfsTransferBackend {
     fn sdb(reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Self {
         Self::Sdb(SdbTransferBackend::new(reg, dma))
     }
 
+    fn mcq(reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Result<Self> {
+        Ok(Self::Mcq(McqTransferBackend::new(reg, dma)?))
+    }
+
     fn queue_depth(&self) -> usize {
         match self {
             Self::Sdb(backend) => backend.queue_depth(),
+            Self::Mcq(backend) => backend.queue_depth(),
         }
     }
 
     fn compose_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
         match self {
             Self::Sdb(backend) => backend.compose_dev(cmd, tag),
+            Self::Mcq(backend) => backend.compose_dev(cmd, tag),
         }
     }
 
@@ -336,36 +421,42 @@ impl UfsTransferBackend {
     ) -> Result<Option<UfsPrdtMapping>> {
         match self {
             Self::Sdb(backend) => backend.compose_scsi(cmd, tag, rq),
+            Self::Mcq(backend) => backend.compose_scsi(cmd, tag, rq),
         }
     }
 
     fn submit_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
         match self {
             Self::Sdb(backend) => backend.submit_dev(cmd, tag),
+            Self::Mcq(backend) => backend.submit_dev(cmd, tag),
         }
     }
 
     fn submit_scsi(&self, cmd: UfsSCSICmd, tag: usize) -> Result<()> {
         match self {
             Self::Sdb(backend) => backend.submit_scsi(cmd, tag),
+            Self::Mcq(backend) => backend.submit_scsi(cmd, tag),
         }
     }
 
     fn request_completed(&self, tag: usize) -> bool {
         match self {
             Self::Sdb(backend) => backend.request_completed(tag),
+            Self::Mcq(backend) => backend.request_completed(tag),
         }
     }
 
     fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
         match self {
             Self::Sdb(backend) => backend.fetch_dev(cmd, tag),
+            Self::Mcq(backend) => backend.fetch_dev(cmd, tag),
         }
     }
 
     fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult {
         match self {
             Self::Sdb(backend) => backend.fetch_scsi_completion(tag),
+            Self::Mcq(backend) => backend.fetch_scsi_completion(tag),
         }
     }
 }
@@ -642,6 +733,13 @@ impl UfsQueue {
         irq: Arc<UfsIrq>,
         dma: Arc<UfsDma>,
     ) -> Result<Arc<Self>> {
+        if reg.mcq_supported() {
+            pr_info!(
+                "[RUFS] ufs_queue: MCQ supported by controller, baseline keeps SDB backend active mcq_depth={}\n",
+                reg.nutrs_mcq(),
+            );
+        }
+
         let backend = UfsTransferBackend::sdb(reg, dma);
         let slot = kvec![None; backend.queue_depth()]?;
 
