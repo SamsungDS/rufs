@@ -77,6 +77,17 @@
 /// // representation — useful for passing the value to a C API.
 /// let raw: u32 = read_only.bits();
 /// assert_eq!(raw, Permission::Read as u32);
+///
+/// // Convert a single flag value to its underlying integer representation.
+/// let raw_read: u32 = Permission::Read.into();
+/// assert_eq!(raw_read, Permission::Read as u32);
+///
+/// // Construct a `Permissions` value from a raw integer. `TryFrom` rejects
+/// // integers whose set bits do not all correspond to declared flags.
+/// let parsed = Permissions::try_from(raw_read | Permission::Write as u32).unwrap();
+/// assert!(parsed.contains(Permission::Read));
+/// assert!(parsed.contains(Permission::Write));
+/// assert!(Permissions::try_from(1 << 7).is_err());
 /// ```
 #[macro_export]
 macro_rules! impl_flags {
@@ -116,6 +127,26 @@ macro_rules! impl_flags {
             #[inline]
             fn from(value: $flags) -> Self {
                 value.0
+            }
+        }
+
+        impl ::core::convert::From<$flag> for $ty {
+            #[inline]
+            fn from(value: $flag) -> Self {
+                value as Self
+            }
+        }
+
+        impl ::core::convert::TryFrom<$ty> for $flags {
+            type Error = ::kernel::error::Error;
+
+            #[inline]
+            fn try_from(value: $ty) -> Result<Self, Self::Error> {
+                if value & !$flags::all_bits() != 0 {
+                    return Err(::kernel::error::code::EINVAL);
+                }
+
+                Ok(Self(value))
             }
         }
 
