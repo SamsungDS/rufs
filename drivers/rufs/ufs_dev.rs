@@ -323,6 +323,10 @@ impl UnitDesc {
         // The descriptor stores multi-byte values in big-endian byte order.
         unsafe { u64::from_be(core::ptr::read_unaligned(ptr)) }
     }
+
+    pub(crate) fn lu_queue_depth(&self) -> usize {
+        self.lu_queue_depth as usize
+    }
 }
 
 pub(crate) type DefaultDesc = DescBuffer;

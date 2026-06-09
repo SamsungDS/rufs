@@ -213,14 +213,25 @@ impl UfsHost {
                 desc.logical_block_shift(),
                 desc.logical_block_count(),
             )?;
-            let lu = UfsLu::new(self.queue.clone(), lun as u8, geometry, hw_queue_depth)?;
+            let lu_queue_depth = match desc.lu_queue_depth() {
+                0 => total_block_tags,
+                depth => core::cmp::min(depth, total_block_tags),
+            };
+            let lu = UfsLu::new(
+                self.queue.clone(),
+                lun as u8,
+                geometry,
+                hw_queue_depth,
+                lu_queue_depth,
+            )?;
             lu.init_disk(tagset.clone())?;
 
             pr_info!(
-                "[RUFS] ufs_host: allocated LU {} capacity={} logical_block_size={}",
+                "[RUFS] ufs_host: allocated LU {} capacity={} logical_block_size={} queue_depth={}",
                 lun,
                 geometry.capacity_blocks(),
                 geometry.logical_block_size(),
+                lu_queue_depth,
             );
 
             luns.push(lu, GFP_KERNEL)?;

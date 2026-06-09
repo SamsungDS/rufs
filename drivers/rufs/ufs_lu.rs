@@ -130,6 +130,7 @@ pub(crate) struct UfsLu {
     lun: u8,
     geometry: UfsLuGeometry,
     hw_queue_depth: usize,
+    queue_depth: usize,
 
     #[pin]
     state: SpinLock<UfsLuState>,
@@ -144,6 +145,7 @@ impl UfsLu {
         lun: u8,
         geometry: UfsLuGeometry,
         hw_queue_depth: usize,
+        queue_depth: usize,
     ) -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(Self {
@@ -151,6 +153,7 @@ impl UfsLu {
                 lun,
                 geometry,
                 hw_queue_depth,
+                queue_depth,
                 state <- new_spinlock!(UfsLuState::Reset),
                 disk <- new_mutex!(None),
             }),
@@ -166,6 +169,7 @@ impl UfsLu {
             .max_hw_discard_sectors(self.geometry.max_discard_sectors())
             .discard_granularity(self.geometry.logical_block_size())
             .max_discard_segments(MAX_DISCARD_SEGMENTS)
+            .queue_depth(u32::try_from(self.queue_depth).map_err(|_| EOVERFLOW)?)?
             .capacity_sectors(capacity_sectors)
             .build(fmt!("ufs{}", self.lun), tagset, self.clone())?;
 
