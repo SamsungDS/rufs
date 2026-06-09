@@ -6,10 +6,19 @@
 
 use crate::{
     bindings,
-    block::mq::{request::RequestDataWrapper, Request},
-    error::{from_result, Result},
+    block::mq::{
+        request::RequestDataWrapper,
+        Request, //
+    },
+    error::{
+        from_result,
+        Result, //
+    },
     prelude::*,
-    sync::{aref::ARef, Refcount},
+    sync::{
+        aref::ARef,
+        Refcount, //
+    },
     types::ForeignOwnable,
 };
 use core::marker::PhantomData;
@@ -124,7 +133,7 @@ impl<T: Operations> OperationsVTable<T> {
         if let Err(e) = ret {
             e.to_blk_status()
         } else {
-            bindings::BLK_STS_OK as bindings::blk_status_t
+            bindings::BLK_STS_OK
         }
     }
 

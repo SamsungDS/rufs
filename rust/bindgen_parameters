@@ -5,6 +5,12 @@
 --blocklist-type __kernel_s?size_t
 --blocklist-type __kernel_ptrdiff_t
 
+# Bindgen cannot extract values from the `((__force blk_status_t)N)`
+# CPP-macro form used by most of these and emits the few it can extract
+# as `u32`. Block them entirely; the `RUST_CONST_HELPER_BLK_STS_*`
+# definitions in `bindings_helper.h` expose them as `blk_status_t`.
+--blocklist-item BLK_STS_.*
+
 --opaque-type xregs_state
 --opaque-type desc_struct
 --opaque-type arch_lbr_state
