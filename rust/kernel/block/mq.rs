@@ -137,6 +137,10 @@ mod request_queue;
 pub mod tag_set;
 
 pub use operations::Operations;
-pub use request::{IdleRequest, Request};
+pub use request::{
+    Command,
+    IdleRequest,
+    Request, //
+};
 pub use request_queue::RequestQueue;
 pub use tag_set::TagSet;
