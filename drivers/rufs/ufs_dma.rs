@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
-use kernel::{bindings, device, pci, device::Core, prelude::*, new_spinlock};
+use kernel::{bindings, device, pci, device::{Bound, Core}, prelude::*, new_spinlock};
 use kernel::{dma, dma_read, dma_write};
 use kernel::bits::genmask_u8;
 use kernel::sync::{Arc, SpinLock, aref::ARef};
@@ -38,6 +38,7 @@ pub(crate) enum UfsScsiCompletion {
     Error,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct UfsScsiResult {
     pub(crate) completion: UfsScsiCompletion,
     pub(crate) ocs: u8,
@@ -50,7 +51,7 @@ pub(crate) struct UfsScsiResult {
 }
 
 impl UfsScsiResult {
-    fn error(ocs: u8) -> Self {
+    pub(crate) fn error(ocs: u8) -> Self {
         Self {
             completion: UfsScsiCompletion::Error,
             ocs,
@@ -1199,13 +1200,77 @@ impl ReqDescHeader {
 
 #[repr(C, packed)]
 #[derive(Default)]
-struct Utrd {
+pub(crate) struct Utrd {
     header: ReqDescHeader,
     command_desc_base_addr: u64,
     rsp_upiu_length: u16,
     rsp_upiu_offset: u16,
     prd_table_length: u16,
     prd_table_offset: u16,
+}
+
+// UFSHCI MCQ uses the UTP Transfer Request Descriptor as each Submission Queue
+// Entry. Keep this alias explicit so MCQ code can talk in SQE/CQE terms while
+// sharing the descriptor layout with the SDB path.
+pub(crate) type SqEntry = Utrd;
+
+#[repr(C, packed)]
+#[derive(Default, Clone, Copy)]
+pub(crate) struct CqEntry {
+    command_desc_base_addr: u64,
+    rsp_upiu_length: u16,
+    rsp_upiu_offset: u16,
+    prd_table_length: u16,
+    prd_table_offset: u16,
+    overall_status: u8,
+    extended_error_code: u8,
+    reserved_1: u16,
+    task_tag: u8,
+    lun: u8,
+    iid_ext_iid: u8,
+    reserved_2: u8,
+    reserved_3: [u32; 2],
+}
+
+impl CqEntry {
+    pub(crate) fn command_desc_base_addr(&self) -> u64 {
+        let ptr = core::ptr::addr_of!(self.command_desc_base_addr);
+
+        // SAFETY: `CqEntry` is packed, so integer fields may be unaligned.
+        unsafe { u64::from_le(core::ptr::read_unaligned(ptr)) }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.command_desc_base_addr() == 0
+    }
+
+    pub(crate) fn task_tag(&self) -> u8 {
+        self.task_tag
+    }
+
+    pub(crate) fn lun(&self) -> u8 {
+        self.lun
+    }
+
+    pub(crate) fn overall_status(&self) -> u8 {
+        self.overall_status
+    }
+
+    pub(crate) fn extended_error_code(&self) -> u8 {
+        self.extended_error_code
+    }
+
+    pub(crate) fn iid(&self) -> u8 {
+        self.iid_ext_iid & 0x0f
+    }
+
+    pub(crate) fn ext_iid(&self) -> u8 {
+        self.iid_ext_iid >> 4
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.command_desc_base_addr = 0;
+    }
 }
 
 impl Utrd {
@@ -1258,10 +1323,200 @@ struct UfsDmaInner {
     utmrdl: dma::Coherent<[Utmrd]>,
 }
 
+pub(crate) struct UfsMcqQueue {
+    id: u32,
+    max_entries: u32,
+    sqe: dma::Coherent<[SqEntry]>,
+    cqe: dma::Coherent<[CqEntry]>,
+    sq_tail_slot: u32,
+    cq_tail_slot: u32,
+    cq_head_slot: u32,
+    oprs: UfsMcqOprSet,
+}
+
+impl UfsMcqQueue {
+    pub(crate) fn new(
+        dev: &device::Device<Bound>,
+        id: u32,
+        max_entries: u32,
+        oprs: UfsMcqOprSet,
+    ) -> Result<Self> {
+        if max_entries == 0 {
+            return Err(EINVAL);
+        }
+
+        let entries = max_entries as usize;
+        Ok(Self {
+            id,
+            max_entries,
+            sqe: dma::Coherent::<SqEntry>::zeroed_slice(dev, entries, GFP_KERNEL)?,
+            cqe: dma::Coherent::<CqEntry>::zeroed_slice(dev, entries, GFP_KERNEL)?,
+            sq_tail_slot: 0,
+            cq_tail_slot: 0,
+            cq_head_slot: 0,
+            oprs,
+        })
+    }
+
+    pub(crate) fn id(&self) -> u32 {
+        self.id
+    }
+
+    pub(crate) fn max_entries(&self) -> u32 {
+        self.max_entries
+    }
+
+    pub(crate) fn sqe_dma_addr(&self) -> dma::DmaAddress {
+        self.sqe.dma_handle()
+    }
+
+    pub(crate) fn cqe_dma_addr(&self) -> dma::DmaAddress {
+        self.cqe.dma_handle()
+    }
+
+    pub(crate) fn sq_tail_slot(&self) -> u32 {
+        self.sq_tail_slot
+    }
+
+    pub(crate) fn sq_tail_index(&self) -> Result<usize> {
+        let index = self.sq_tail_slot as usize;
+        if index >= self.max_entries as usize {
+            return Err(EINVAL);
+        }
+
+        Ok(index)
+    }
+
+    fn sq_slot_offset(slot: u32) -> u32 {
+        slot * core::mem::size_of::<SqEntry>() as u32
+    }
+
+    fn cq_slot_offset(slot: u32) -> u32 {
+        slot * core::mem::size_of::<CqEntry>() as u32
+    }
+
+    fn offset_to_slot(offset: u32, entry_size: u32, max_entries: u32) -> Result<u32> {
+        if offset % entry_size != 0 {
+            return Err(EINVAL);
+        }
+
+        let slot = offset / entry_size;
+        if slot >= max_entries {
+            return Err(EINVAL);
+        }
+
+        Ok(slot)
+    }
+
+    fn sq_offset_to_slot(&self, offset: u32) -> Result<u32> {
+        Self::offset_to_slot(
+            offset,
+            core::mem::size_of::<SqEntry>() as u32,
+            self.max_entries,
+        )
+    }
+
+    fn cq_offset_to_slot(&self, offset: u32) -> Result<u32> {
+        Self::offset_to_slot(
+            offset,
+            core::mem::size_of::<CqEntry>() as u32,
+            self.max_entries,
+        )
+    }
+
+    fn next_sq_tail_slot(&self) -> u32 {
+        let next = self.sq_tail_slot + 1;
+        if next == self.max_entries {
+            0
+        } else {
+            next
+        }
+    }
+
+    pub(crate) fn sq_is_full(&self, reg: &UfsReg) -> Result<bool> {
+        let head = self.sq_offset_to_slot(reg.read_mcq_sq_head(&self.oprs, self.id as usize)?)?;
+        Ok(self.next_sq_tail_slot() == head)
+    }
+
+    pub(crate) fn cq_tail_slot(&self) -> u32 {
+        self.cq_tail_slot
+    }
+
+    pub(crate) fn cq_head_slot(&self) -> u32 {
+        self.cq_head_slot
+    }
+
+    pub(crate) fn update_cq_tail_slot(&mut self, reg: &UfsReg) -> Result<()> {
+        self.cq_tail_slot =
+            self.cq_offset_to_slot(reg.read_mcq_cq_tail(&self.oprs, self.id as usize)?)?;
+        Ok(())
+    }
+
+    pub(crate) fn cq_is_empty(&self) -> bool {
+        self.cq_head_slot == self.cq_tail_slot
+    }
+
+    pub(crate) fn acknowledge_cq_events(&self, reg: &UfsReg) -> Result<()> {
+        let status = reg.read_mcq_cqis(&self.oprs, self.id as usize)?;
+        if status != 0 {
+            reg.write_mcq_cqis(&self.oprs, self.id as usize, status)?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn oprs(&self) -> &UfsMcqOprSet {
+        &self.oprs
+    }
+
+    pub(crate) fn reset_slots(&mut self) {
+        self.sq_tail_slot = 0;
+        self.cq_tail_slot = 0;
+        self.cq_head_slot = 0;
+    }
+
+    pub(crate) fn write_sq_entry(&mut self, entry: SqEntry) -> Result<u32> {
+        let index = self.sq_tail_index()?;
+        dma_write!(self.sqe, [index]?, entry);
+
+        self.sq_tail_slot = self.next_sq_tail_slot();
+
+        Ok(Self::sq_slot_offset(self.sq_tail_slot))
+    }
+
+    pub(crate) fn consume_cq_entry(&mut self, reg: &UfsReg) -> Result<Option<CqEntry>> {
+        let index = self.cq_head_slot as usize;
+        if index >= self.max_entries as usize {
+            return Err(EINVAL);
+        }
+
+        let cqe = dma_read!(self.cqe, [index]?);
+        dma_write!(self.cqe, [index]?, CqEntry::default());
+
+        self.cq_head_slot += 1;
+        if self.cq_head_slot == self.max_entries {
+            self.cq_head_slot = 0;
+        }
+
+        reg.write_mcq_cq_head(
+            &self.oprs,
+            self.id as usize,
+            Self::cq_slot_offset(self.cq_head_slot),
+        )?;
+
+        if cqe.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(cqe))
+        }
+    }
+}
+
 #[pin_data]
 pub(crate) struct UfsDma {
     reg: Arc<UfsReg>,
     dev: ARef<device::Device>,
+    transfer_slots: usize,
 
     #[pin]
     inner: SpinLock<UfsDmaInner>,
@@ -1331,20 +1586,34 @@ impl Drop for UfsUnmapMapping {
 }
 
 impl UfsDma {
+    fn transfer_slots_for(reg: &UfsReg) -> usize {
+        if reg.mcq_supported() {
+            core::cmp::max(reg.nutrs(), reg.nutrs_mcq())
+        } else {
+            reg.nutrs()
+        }
+    }
+
+    pub(crate) fn dev(&self) -> &device::Device<Bound> {
+        // SAFETY: `UfsDma` is owned by the bound RUFS driver instance. MCQ queue
+        // allocations only use this reference while the driver owns the device.
+        unsafe { self.dev.as_bound() }
+    }
+
     pub(crate) fn new(
         pdev: &pci::Device<Core>,
         reg: Arc<UfsReg>,
     ) -> Result<Arc<Self>> {
-        let nutrs = reg.nutrs();
+        let transfer_slots = Self::transfer_slots_for(&reg);
         let ucdl = dma::Coherent::<Ucd>::zeroed_slice(
-            pdev.as_ref(), nutrs, GFP_KERNEL,
+            pdev.as_ref(), transfer_slots, GFP_KERNEL,
         )?;
 
         let utrdl = dma::Coherent::<Utrd>::zeroed_slice(
-            pdev.as_ref(), nutrs, GFP_KERNEL,
+            pdev.as_ref(), transfer_slots, GFP_KERNEL,
         )?;
 
-        for tag in 0..nutrs {
+        for tag in 0..transfer_slots {
             let rsp_upiu_length = ((ALIGNED_UPIU_SIZE >> 2) as u16).to_le();
             let rsp_upiu_offset = ((ALIGNED_UPIU_SIZE >> 2) as u16).to_le();
             let prd_table_offset = ((ALIGNED_UPIU_SIZE >> 1) as u16).to_le();
@@ -1375,6 +1644,7 @@ impl UfsDma {
             pin_init!(Self {
                 reg,
                 dev: pdev.as_ref().into(),
+                transfer_slots,
                 inner <- new_spinlock!(UfsDmaInner {
                     ucdl,
                     utrdl,
@@ -1383,6 +1653,10 @@ impl UfsDma {
             }),
             GFP_KERNEL
         )
+    }
+
+    pub(crate) fn transfer_slots(&self) -> usize {
+        self.transfer_slots
     }
 
     pub(crate) fn make_hba_operational(&self) -> Result<()> {
@@ -1443,6 +1717,36 @@ impl UfsDma {
         Ok(prdt.mapping)
     }
 
+    pub(crate) fn transfer_request_desc(&self, tag: usize) -> Result<Utrd> {
+        let inner = self.inner.lock();
+        Ok(dma_read!(inner.utrdl, [tag]?))
+    }
+
+    pub(crate) fn tag_from_cq_entry(&self, cqe: &CqEntry) -> Result<usize> {
+        const CQE_UCD_BA_MASK: u64 = !0x7f;
+
+        let inner = self.inner.lock();
+        let base = inner.ucdl.dma_handle() as u64;
+        let addr = cqe.command_desc_base_addr() & CQE_UCD_BA_MASK;
+        let size = core::mem::size_of::<Ucd>() as u64;
+
+        if addr < base {
+            return Err(EINVAL);
+        }
+
+        let offset = addr - base;
+        if size == 0 || offset % size != 0 {
+            return Err(EINVAL);
+        }
+
+        let tag = (offset / size) as usize;
+        if tag >= self.transfer_slots {
+            return Err(EINVAL);
+        }
+
+        Ok(tag)
+    }
+
     fn map_request_prdt(
         &self,
         tag: usize,
@@ -1457,7 +1761,7 @@ impl UfsDma {
             });
         }
 
-        if tag >= self.reg.nutrs() {
+        if tag >= self.transfer_slots {
             return Err(EINVAL);
         }
 
@@ -1625,6 +1929,30 @@ impl UfsDma {
         Ok(UfsCmd::Device(cmd))
     }
 
+    pub(crate) fn fetch_mcq_devman_upiu(
+        &self,
+        cmd: UfsDevCmd,
+        tag: usize,
+        cqe: CqEntry,
+    ) -> Result<UfsCmd> {
+        match cqe.overall_status().into() {
+            UtpOcs::Success => {},
+            UtpOcs::InvalidCmdTableAttr => return Err(EINVAL),
+            UtpOcs::InvalidPrdtAttr => return Err(EINVAL),
+            UtpOcs::MismatchDataBufSize => return Err(EINVAL),
+            UtpOcs::MisMatchRespUpiuSize => return Err(EINVAL),
+            UtpOcs::InvalidCryptoConfig => return Err(EINVAL),
+            UtpOcs::GeneralCryptoError => return Err(EINVAL),
+            _ => return Err(EIO),
+        }
+
+        let inner = self.inner.lock();
+        let rsp_upiu = dma_read!(inner.ucdl, [tag]?.rsp_upiu);
+        let cmd = rsp_upiu.fetch_dev(cmd)?;
+
+        Ok(UfsCmd::Device(cmd))
+    }
+
     pub(crate) fn fetch_scsi_completion(
         &self,
         tag: usize,
@@ -1647,6 +1975,27 @@ impl UfsDma {
         match (|| -> Result<_> { Ok(dma_read!(inner.ucdl, [tag]?.rsp_upiu)) })() {
             Ok(rsp_upiu) => rsp_upiu.scsi_result(ocs),
             Err(_) => UfsScsiResult::error(ocs),
+        }
+    }
+
+    pub(crate) fn fetch_mcq_scsi_completion(
+        &self,
+        tag: usize,
+        cqe: CqEntry,
+    ) -> UfsScsiResult {
+        let ocs = cqe.overall_status();
+
+        if !matches!(ocs.into(), UtpOcs::Success) {
+            return match ocs.into() {
+                UtpOcs::Aborted | UtpOcs::InvalidCommandStatus => UfsScsiResult::requeue(ocs),
+                _ => UfsScsiResult::error(ocs),
+            };
+        }
+
+        let inner = self.inner.lock();
+        match (|| -> Result<_> { Ok(dma_read!(inner.ucdl, [tag]?.rsp_upiu)) })() {
+            Ok(rsp_upiu) => rsp_upiu.scsi_result(ocs),
+            Err(_) => UfsScsiResult::error(UtpOcs::InvalidCommandStatus as u8),
         }
     }
 }
@@ -1673,6 +2022,7 @@ const _: () = { assert!(size_of::<UpiuBody>() == 500); };
 const _: () = { assert!(size_of::<Upiu>() == 512); };
 const _: () = { assert!(size_of::<ReqDescHeader>() == 16); };
 const _: () = { assert!(size_of::<PrdEntry>() == 16); };
+const _: () = { assert!(size_of::<CqEntry>() == 32); };
 const _: () = { assert!(size_of::<Ucd>() == 5120); };
 const _: () = { assert!(size_of::<Utrd>() == 32); };
 const _: () = { assert!(size_of::<Utmrd>() == 80); };
@@ -1685,3 +2035,5 @@ unsafe impl kernel::transmute::AsBytes for Utrd {}
 unsafe impl kernel::transmute::FromBytes for Utrd {}
 unsafe impl kernel::transmute::AsBytes for Utmrd {}
 unsafe impl kernel::transmute::FromBytes for Utmrd {}
+unsafe impl kernel::transmute::AsBytes for CqEntry {}
+unsafe impl kernel::transmute::FromBytes for CqEntry {}
