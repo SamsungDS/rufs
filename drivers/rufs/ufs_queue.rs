@@ -288,16 +288,19 @@ impl UfsSCSICmd {
         };
         let flags = if fua { 0x8 } else { 0 };
 
-        if blocks > u16::MAX as u32 || lba > u32::MAX as u64 {
-            cdb[0] = if write { WRITE_16 } else { READ_16 };
-            cdb[1] = flags;
-            cdb[2..10].copy_from_slice(&lba.to_be_bytes());
-            cdb[10..14].copy_from_slice(&blocks.to_be_bytes());
-        } else {
-            cdb[0] = if write { WRITE_10 } else { READ_10 };
-            cdb[1] = flags;
-            cdb[2..6].copy_from_slice(&(lba as u32).to_be_bytes());
-            cdb[7..9].copy_from_slice(&(blocks as u16).to_be_bytes());
+        match (u32::try_from(lba), u16::try_from(blocks)) {
+            (Ok(lba), Ok(blocks)) => {
+                cdb[0] = if write { WRITE_10 } else { READ_10 };
+                cdb[1] = flags;
+                cdb[2..6].copy_from_slice(&lba.to_be_bytes());
+                cdb[7..9].copy_from_slice(&blocks.to_be_bytes());
+            },
+            _ => {
+                cdb[0] = if write { WRITE_16 } else { READ_16 };
+                cdb[1] = flags;
+                cdb[2..10].copy_from_slice(&lba.to_be_bytes());
+                cdb[10..14].copy_from_slice(&blocks.to_be_bytes());
+            },
         }
 
         Self {
@@ -1579,7 +1582,11 @@ impl UfsQueue {
         if !matches!(result.completion, UfsScsiCompletion::Good) && !suppress_log {
             let cdb = cmd.cdb();
             pr_err!(
-                "SCSI request completion error: tag={} lun={} opcode=0x{:02x} dir={:?} data_len={} completion={:?} ocs=0x{:x} transaction=0x{:02x} response=0x{:02x} status=0x{:02x} residual={} cdb={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}\n",
+                "[RUFS] ufs_queue: SCSI request completion error: tag={} lun={} \
+                 opcode=0x{:02x} dir={:?} data_len={} completion={:?} ocs=0x{:x} \
+                 transaction=0x{:02x} response=0x{:02x} status=0x{:02x} residual={} \
+                 cdb={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} \
+                 {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}\n",
                 tag,
                 cmd.lun(),
                 cdb[0],
@@ -1611,7 +1618,9 @@ impl UfsQueue {
 
             if let Some(sense) = sense.as_ref() {
                 pr_err!(
-                    "SCSI sense: tag={} response_code=0x{:02x} sense_key=0x{:x}({}) asc=0x{:02x} ascq=0x{:02x} additional_len={}\n",
+                    "[RUFS] ufs_queue: SCSI sense tag={} response_code=0x{:02x} \
+                     sense_key=0x{:x}({}) asc=0x{:02x} ascq=0x{:02x} \
+                     additional_len={}\n",
                     tag,
                     sense.response_code,
                     sense.sense_key,
@@ -1622,7 +1631,10 @@ impl UfsQueue {
                 );
             } else if sense_len > 0 {
                 pr_err!(
-                    "SCSI sense: tag={} unable to parse sense_len={} raw={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}\n",
+                    "[RUFS] ufs_queue: SCSI sense tag={} unable to parse \
+                     sense_len={} raw={:02x} {:02x} {:02x} {:02x} {:02x} \
+                     {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} \
+                     {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}\n",
                     tag,
                     sense_len,
                     result.sense_data[0],
@@ -1645,7 +1657,10 @@ impl UfsQueue {
                     result.sense_data[17],
                 );
             } else {
-                pr_err!("SCSI sense: tag={} no sense data reported\n", tag);
+                pr_err!(
+                    "[RUFS] ufs_queue: SCSI sense tag={} no sense data reported\n",
+                    tag,
+                );
             }
         }
 
