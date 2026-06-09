@@ -131,12 +131,17 @@
 //! # Ok::<(), kernel::error::Error>(())
 //! ```
 
+mod feature;
 pub mod gen_disk;
 mod operations;
 mod request;
 mod request_queue;
 pub mod tag_set;
 
+pub use feature::{
+    Feature,
+    Features, //
+};
 pub use operations::{
     IoCompletionBatch,
     Operations, //
