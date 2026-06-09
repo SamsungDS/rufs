@@ -575,6 +575,7 @@ impl McqQueueSet {
                 tag,
                 e.to_errno(),
             );
+            self.dump_state(reg, tag, "poll failed");
             return false;
         }
 
@@ -583,6 +584,45 @@ impl McqQueueSet {
 
     fn take_completion(&self, tag: usize) -> Option<CqEntry> {
         self.completed.lock().get_mut(tag).and_then(Option::take)
+    }
+
+    fn dump_state(&self, reg: &UfsReg, tag: usize, reason: &str) {
+        let mut guard = self.queues.lock();
+        // SAFETY: While holding the lock, this method only reads queue state in
+        // place and never moves queues out of the vector or grows it.
+        let Some(queues) = (unsafe { core::pin::Pin::get_unchecked_mut(guard.as_mut()) }).as_mut()
+        else {
+            pr_err!(
+                "[RUFS] ufs_queue: MCQ dump reason={} tag={} queues=unallocated\n",
+                reason,
+                tag,
+            );
+            return;
+        };
+
+        for queue in queues.iter() {
+            let id = queue.id() as usize;
+            let sq_head = reg.read_mcq_sq_head(queue.oprs(), id).unwrap_or(u32::MAX);
+            let sq_tail = reg.read_mcq_sq_tail(queue.oprs(), id).unwrap_or(u32::MAX);
+            let cq_head = reg.read_mcq_cq_head(queue.oprs(), id).unwrap_or(u32::MAX);
+            let cq_tail = reg.read_mcq_cq_tail(queue.oprs(), id).unwrap_or(u32::MAX);
+            let cqis = reg.read_mcq_cqis(queue.oprs(), id).unwrap_or(u32::MAX);
+
+            pr_err!(
+                "[RUFS] ufs_queue: MCQ state reason={} tag={} q={} sqhp={} sqtp={} cqhp={} cqtp={} cqis={:#x} sw_sq_tail={} sw_cq_head={} sw_cq_tail={}\n",
+                reason,
+                tag,
+                id,
+                sq_head,
+                sq_tail,
+                cq_head,
+                cq_tail,
+                cqis,
+                queue.sq_tail_slot(),
+                queue.cq_head_slot(),
+                queue.cq_tail_slot(),
+            );
+        }
     }
 
     fn configure_registers_with_interrupt_queues(
@@ -790,6 +830,10 @@ impl McqTransferBackend {
         self.queues.request_completed(&self.reg, &self.dma, tag)
     }
 
+    fn dump_state(&self, tag: usize, reason: &str) {
+        self.queues.dump_state(&self.reg, tag, reason);
+    }
+
     // MCQ completion is intentionally split into two phases. Reading a CQE is
     // destructive because the software CQ head advances, so the IRQ-thread
     // executor first snapshots all visible CQEs into `completed`. It then scans
@@ -900,6 +944,13 @@ impl UfsTransferBackend {
         match self {
             Self::Sdb(backend) => backend.request_completed(tag),
             Self::Mcq(backend) => backend.request_completed(tag),
+        }
+    }
+
+    fn dump_state(&self, tag: usize, reason: &str) {
+        match self {
+            Self::Sdb(_) => {},
+            Self::Mcq(backend) => backend.dump_state(tag, reason),
         }
     }
 
@@ -1404,7 +1455,10 @@ impl UfsQueue {
 
     fn wait_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
         match self.completion.wait_for_completion_timeout(cmd.timeout()) {
-            0 => Err(ETIMEDOUT),
+            0 => {
+                self.dump_backend_state(tag, "device request timeout");
+                Err(ETIMEDOUT)
+            },
             _ => Ok(()),
         }
     }
@@ -1423,6 +1477,10 @@ impl UfsQueue {
 
     fn refresh_backend_completions(&self) -> Result<()> {
         self.backend.lock().refresh_completions()
+    }
+
+    fn dump_backend_state(&self, tag: usize, reason: &str) {
+        self.backend.lock().dump_state(tag, reason);
     }
 
     fn poll_backend_queue(&self, queue: usize) -> Result<()> {
@@ -1513,6 +1571,7 @@ impl UfsQueue {
                 "[RUFS] ufs_queue: refresh completions failed errno={}\n",
                 e.to_errno(),
             );
+            self.dump_backend_state(0, "refresh completions failed");
             return false;
         }
 
