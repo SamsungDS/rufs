@@ -365,10 +365,22 @@ impl Operations for UfsLuBlockOps {
         let rq = OwnableRefCounted::into_shared(rq.start());
         let request = lu.compose_request(tag, cmd, &rq)?;
 
-        if request.submit().is_err() {
+        if let Err(e) = request.submit() {
             // `submit` dropped the request reference it stored, so we hold the
-            // only one and can complete it here.
-            if let Ok(rq) = OwnableRefCounted::try_from_shared(rq) {
+            // only one and can dispose of it here.
+            let rq = match OwnableRefCounted::try_from_shared(rq) {
+                Ok(rq) => rq,
+                Err(_) => return Ok(()),
+            };
+
+            if e == EBUSY {
+                // The hardware queue is full; requeue the request for a retry.
+                let ptr = rq.as_raw();
+                core::mem::forget(rq);
+                // SAFETY: `ptr` came from a request we owned exclusively, and
+                // forgetting the `Owned` transfers ownership to the requeue path.
+                unsafe { bindings::blk_mq_requeue_request(ptr, true) };
+            } else {
                 rq.end(bindings::BLK_STS_IOERR as u8);
             }
         }

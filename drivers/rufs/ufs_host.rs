@@ -108,6 +108,17 @@ impl UfsHost {
             host.reg.clone(),
             host.queue.clone(),
         )?;
+        if host.reg.mcq_supported() {
+            match host.queue.enable_mcq_backend(host.reg.clone(), host.dma.clone()) {
+                Ok(()) => {},
+                Err(e) => {
+                    pr_warn!(
+                        "[RUFS] ufs_host: MCQ setup failed errno={}, keep SDB backend\n",
+                        e.to_errno(),
+                    );
+                },
+            }
+        }
         host.dev.verify_dev_init()?;
         host.dev.complete_dev_init()?;
         host.dev.device_params_init()?;
@@ -119,11 +130,17 @@ impl UfsHost {
 
     fn alloc_luns(&self) -> Result<()> {
         let num_lu = self.dev.num_lu();
+        let nr_hw_queues = self.queue.nr_hw_queues().max(1);
+        let total_block_tags = self.queue.queue_depth().checked_sub(1).ok_or(EINVAL)?;
+        let hw_queue_depth = total_block_tags / nr_hw_queues;
+        if hw_queue_depth == 0 {
+            return Err(EINVAL);
+        }
         let tagset = Arc::pin_init(
             TagSet::<UfsLuBlockOps>::new(
-                1,
+                u32::try_from(nr_hw_queues).map_err(|_| EOVERFLOW)?,
                 (),
-                (self.reg.nutrs() - 1) as u32,
+                u32::try_from(hw_queue_depth).map_err(|_| EOVERFLOW)?,
                 1,
                 kernel::alloc::NumaNode::NO_NODE,
                 kernel::block::mq::tag_set::Flags::default(),
