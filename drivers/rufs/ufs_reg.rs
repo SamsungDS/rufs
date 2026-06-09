@@ -10,6 +10,7 @@ const UFS_BAR0_LEN: usize = 0x1000;
 type Bar0 = pci::Bar<UFS_BAR0_LEN>;
 
 const REG_CONTROLLER_CAPABILITIES:           usize = 0x00; // CAP[31:0]
+const REG_MCQCAP:                            usize = 0x04; // MCQCAP
 const REG_CONTROLLER_CAPABILITIES_H:         usize = 0x04; // CAP[63:32]
 const REG_UFS_VERSION:                       usize = 0x08; // VER
 const REG_INTERRUPT_STATUS:                  usize = 0x20; // IS
@@ -44,7 +45,66 @@ const REG_UIC_ARG1:                          usize = 0x94; // UICCMDARG1
 const REG_UIC_ARG2:                          usize = 0x98; // UICCMDARG2
 const REG_UIC_ARG3:                          usize = 0x9C; // UICCMDARG3
 
+// MCQ global registers
+const REG_UFS_MEM_CFG:                       usize = 0x300;
+const REG_UFS_MCQ_CFG:                       usize = 0x380;
+const REG_UFS_ESILBA:                        usize = 0x384;
+const REG_UFS_ESIUBA:                        usize = 0x388;
+
+// MCQ queue configuration registers. These offsets are relative to each
+// queue's 0x40-byte config block.
+const REG_MCQ_SQATTR:                        usize = 0x00;
+const REG_MCQ_SQLBA:                         usize = 0x04;
+const REG_MCQ_SQUBA:                         usize = 0x08;
+const REG_MCQ_SQDAO:                         usize = 0x0C;
+const REG_MCQ_SQISAO:                        usize = 0x10;
+const REG_MCQ_CQATTR:                        usize = 0x20;
+const REG_MCQ_CQLBA:                         usize = 0x24;
+const REG_MCQ_CQUBA:                         usize = 0x28;
+const REG_MCQ_CQDAO:                         usize = 0x2C;
+const REG_MCQ_CQISAO:                        usize = 0x30;
+
+// MCQ operation/runtime registers. These offsets are relative to each SQD,
+// SQIS, CQD, or CQIS operation region.
+const REG_MCQ_SQHP:                          usize = 0x00;
+const REG_MCQ_SQTP:                          usize = 0x04;
+const REG_MCQ_SQRTC:                         usize = 0x08;
+const REG_MCQ_SQCTI:                         usize = 0x0C;
+const REG_MCQ_SQRTS:                         usize = 0x10;
+const REG_MCQ_CQHP:                          usize = 0x00;
+const REG_MCQ_CQTP:                          usize = 0x04;
+const REG_MCQ_CQIS:                          usize = 0x00;
+const REG_MCQ_CQIE:                          usize = 0x04;
+
 const MASK_UIC_COMMAND_RESULT:                  u32 = 0xFF;
+
+// MCQ capability/configuration masks
+const MASK_MCQ_MAX_QUEUE_SUP:                   u32 = 0x000000FF;
+const MASK_MCQ_QCFGPTR:                         u32 = 0x00FF0000;
+const SHIFT_MCQ_QCFGPTR:                        u32 = 16;
+const MASK_MCQ_CFG_MAC:                         u32 = 0x0001FF00;
+const SHIFT_MCQ_CFG_MAC:                        u32 = 8;
+
+const MCQ_QCFG_STRIDE:                          usize = 0x40;
+const MCQ_QCFGPTR_UNIT:                         usize = 0x200;
+const MCQ_ENTRY_SIZE_IN_DWORD:                  u32 = 8;
+const MCQ_QUEUE_EN:                             u32 = 1 << 31;
+const MCQ_QUEUE_ID_SHIFT:                       u32 = 16;
+const MCQ_DEFAULT_OPR_STRIDE:                   usize = 48;
+const MCQ_POLL_INTERVAL_US:                     i64 = 20;
+const MCQ_POLL_TIMEOUT_US:                      i64 = 500000;
+
+const MCQ_MODE_SELECT:                          u32 = 1 << 0;
+const ESI_ENABLE:                               u32 = 1 << 1;
+const MCQ_CQIS_TAIL_ENT_PUSH_STS:               u32 = 0x1;
+
+const MCQ_SQ_START:                             u32 = 0x0;
+const MCQ_SQ_STOP:                              u32 = 0x1;
+const MCQ_SQ_ICU:                               u32 = 0x2;
+const MCQ_SQ_STS:                               u32 = 0x1;
+const MCQ_SQ_CUS:                               u32 = 0x2;
+const MASK_MCQ_SQ_ICU_ERR_CODE:                 u32 = 0xF0;
+const SHIFT_MCQ_SQ_ICU_ERR_CODE:                u32 = 4;
 
 // Controller capability masks
 const MASK_TRANSFER_REQUESTS_SLOTS_SDB:          u32 = 0x0000001F;
@@ -115,6 +175,62 @@ pub(crate) enum PowerMode {
     FatalError  = 0x05,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum UfsMcqOprRegion {
+    Sqd,
+    Sqis,
+    Cqd,
+    Cqis,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct UfsMcqOprInfo {
+    offset: usize,
+    stride: usize,
+}
+
+impl UfsMcqOprInfo {
+    pub(crate) fn new(offset: usize, stride: usize) -> Self {
+        Self { offset, stride }
+    }
+
+    pub(crate) fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub(crate) fn stride(&self) -> usize {
+        self.stride
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct UfsMcqOprSet {
+    sqd: UfsMcqOprInfo,
+    sqis: UfsMcqOprInfo,
+    cqd: UfsMcqOprInfo,
+    cqis: UfsMcqOprInfo,
+}
+
+impl UfsMcqOprSet {
+    pub(crate) fn new(
+        sqd: UfsMcqOprInfo,
+        sqis: UfsMcqOprInfo,
+        cqd: UfsMcqOprInfo,
+        cqis: UfsMcqOprInfo,
+    ) -> Self {
+        Self { sqd, sqis, cqd, cqis }
+    }
+
+    fn get(&self, region: UfsMcqOprRegion) -> UfsMcqOprInfo {
+        match region {
+            UfsMcqOprRegion::Sqd => self.sqd,
+            UfsMcqOprRegion::Sqis => self.sqis,
+            UfsMcqOprRegion::Cqd => self.cqd,
+            UfsMcqOprRegion::Cqis => self.cqis,
+        }
+    }
+}
+
 #[pin_data]
 pub(crate) struct UfsReg {
     #[pin]
@@ -140,6 +256,33 @@ impl UfsReg {
     fn write(&self, offset: usize, value: u32) {
         let access = self.bar.try_access().unwrap();
         access.write32(value, offset);
+    }
+
+    #[inline(always)]
+    fn try_read(&self, offset: usize) -> Result<u32> {
+        let access = self.bar.try_access().ok_or(ENODEV)?;
+        access.try_read32(offset)
+    }
+
+    #[inline(always)]
+    fn try_write(&self, offset: usize, value: u32) -> Result<()> {
+        let access = self.bar.try_access().ok_or(ENODEV)?;
+        access.try_write32(value, offset)
+    }
+
+    #[inline(always)]
+    fn update(&self, offset: usize, mask: u32, value: u32) {
+        self.write(offset, (self.read(offset) & !mask) | (value & mask));
+    }
+
+    #[inline(always)]
+    fn dma_addr_lo(dma_addr: u64) -> u32 {
+        dma_addr as u32
+    }
+
+    #[inline(always)]
+    fn dma_addr_hi(dma_addr: u64) -> u32 {
+        (dma_addr >> 32) as u32
     }
 
     // Basic Controller/Version/Interrupt
@@ -306,10 +449,402 @@ impl UfsReg {
         self.write(REG_UIC_ARG3, value)
     }
 
+    // MCQ global configuration
+    #[inline]
+    pub(crate) fn read_mcq_cap(&self) -> u32 {
+        self.read(REG_MCQCAP)
+    }
+
+    #[inline]
+    pub(crate) fn mcq_max_queues(&self) -> usize {
+        (self.read_mcq_cap() & MASK_MCQ_MAX_QUEUE_SUP) as usize + 1
+    }
+
+    #[inline]
+    pub(crate) fn mcq_queue_cfg_base(&self) -> usize {
+        (((self.read_mcq_cap() & MASK_MCQ_QCFGPTR) >> SHIFT_MCQ_QCFGPTR) as usize)
+            * MCQ_QCFGPTR_UNIT
+    }
+
+    #[inline]
+    pub(crate) fn read_ufs_mem_cfg(&self) -> u32 {
+        self.read(REG_UFS_MEM_CFG)
+    }
+
+    #[inline]
+    pub(crate) fn write_ufs_mem_cfg(&self, value: u32) {
+        self.write(REG_UFS_MEM_CFG, value)
+    }
+
+    #[inline]
+    pub(crate) fn enable_mcq_mode(&self) {
+        self.update(REG_UFS_MEM_CFG, MCQ_MODE_SELECT, MCQ_MODE_SELECT);
+    }
+
+    #[inline]
+    pub(crate) fn disable_mcq_mode(&self) {
+        self.update(REG_UFS_MEM_CFG, MCQ_MODE_SELECT, 0);
+    }
+
+    #[inline]
+    pub(crate) fn enable_mcq_esi(&self) {
+        self.update(REG_UFS_MEM_CFG, ESI_ENABLE, ESI_ENABLE);
+    }
+
+    #[inline]
+    pub(crate) fn config_mcq_esi(&self, addr: u64) {
+        self.write(REG_UFS_ESILBA, Self::dma_addr_lo(addr));
+        self.write(REG_UFS_ESIUBA, Self::dma_addr_hi(addr));
+    }
+
+    #[inline]
+    pub(crate) fn read_mcq_cfg(&self) -> u32 {
+        self.read(REG_UFS_MCQ_CFG)
+    }
+
+    #[inline]
+    pub(crate) fn write_mcq_cfg(&self, value: u32) {
+        self.write(REG_UFS_MCQ_CFG, value)
+    }
+
+    pub(crate) fn config_mcq_max_active_cmds(&self, max_active_cmds: u32) -> Result<()> {
+        if max_active_cmds == 0 {
+            return Err(EINVAL);
+        }
+
+        self.update(
+            REG_UFS_MCQ_CFG,
+            MASK_MCQ_CFG_MAC,
+            (max_active_cmds - 1) << SHIFT_MCQ_CFG_MAC,
+        );
+        Ok(())
+    }
+
+    // MCQ queue configuration registers
+    #[inline]
+    pub(crate) fn mcq_queue_cfg_offset(&self, queue: usize, reg: usize) -> usize {
+        self.mcq_queue_cfg_base() + MCQ_QCFG_STRIDE * queue + reg
+    }
+
+    #[inline]
+    pub(crate) fn read_mcq_queue_cfg(&self, queue: usize, reg: usize) -> Result<u32> {
+        self.try_read(self.mcq_queue_cfg_offset(queue, reg))
+    }
+
+    #[inline]
+    pub(crate) fn write_mcq_queue_cfg(&self, queue: usize, reg: usize, value: u32) -> Result<()> {
+        self.try_write(self.mcq_queue_cfg_offset(queue, reg), value)
+    }
+
+    #[inline]
+    fn write_mcq_queue_dma_addr(
+        &self,
+        queue: usize,
+        low_reg: usize,
+        high_reg: usize,
+        dma_addr: u64,
+    ) -> Result<()> {
+        self.write_mcq_queue_cfg(queue, low_reg, Self::dma_addr_lo(dma_addr))?;
+        self.write_mcq_queue_cfg(queue, high_reg, Self::dma_addr_hi(dma_addr))
+    }
+
+    fn mcq_queue_attr(max_entries: usize) -> Result<u32> {
+        let dwords = u32::try_from(max_entries)
+            .map_err(|_| EINVAL)?
+            .checked_mul(MCQ_ENTRY_SIZE_IN_DWORD)
+            .ok_or(EOVERFLOW)?;
+
+        Ok(MCQ_QUEUE_EN | dwords.checked_sub(1).ok_or(EINVAL)?)
+    }
+
+    #[inline]
+    pub(crate) fn write_mcq_sqlba(&self, queue: usize, dma_addr: u64) -> Result<()> {
+        self.write_mcq_queue_cfg(queue, REG_MCQ_SQLBA, Self::dma_addr_lo(dma_addr))
+    }
+
+    #[inline]
+    pub(crate) fn write_mcq_squba(&self, queue: usize, dma_addr: u64) -> Result<()> {
+        self.write_mcq_queue_cfg(queue, REG_MCQ_SQUBA, Self::dma_addr_hi(dma_addr))
+    }
+
+    #[inline]
+    pub(crate) fn set_mcq_sq_base_addr(&self, queue: usize, dma_addr: u64) -> Result<()> {
+        self.write_mcq_queue_dma_addr(queue, REG_MCQ_SQLBA, REG_MCQ_SQUBA, dma_addr)
+    }
+
+    #[inline]
+    pub(crate) fn write_mcq_sqdao(&self, queue: usize, offset: usize) -> Result<()> {
+        self.write_mcq_queue_cfg(queue, REG_MCQ_SQDAO, offset as u32)
+    }
+
+    #[inline]
+    pub(crate) fn write_mcq_sqisao(&self, queue: usize, offset: usize) -> Result<()> {
+        self.write_mcq_queue_cfg(queue, REG_MCQ_SQISAO, offset as u32)
+    }
+
+    #[inline]
+    pub(crate) fn write_mcq_cqlba(&self, queue: usize, dma_addr: u64) -> Result<()> {
+        self.write_mcq_queue_cfg(queue, REG_MCQ_CQLBA, Self::dma_addr_lo(dma_addr))
+    }
+
+    #[inline]
+    pub(crate) fn write_mcq_cquba(&self, queue: usize, dma_addr: u64) -> Result<()> {
+        self.write_mcq_queue_cfg(queue, REG_MCQ_CQUBA, Self::dma_addr_hi(dma_addr))
+    }
+
+    #[inline]
+    pub(crate) fn set_mcq_cq_base_addr(&self, queue: usize, dma_addr: u64) -> Result<()> {
+        self.write_mcq_queue_dma_addr(queue, REG_MCQ_CQLBA, REG_MCQ_CQUBA, dma_addr)
+    }
+
+    #[inline]
+    pub(crate) fn write_mcq_cqdao(&self, queue: usize, offset: usize) -> Result<()> {
+        self.write_mcq_queue_cfg(queue, REG_MCQ_CQDAO, offset as u32)
+    }
+
+    #[inline]
+    pub(crate) fn write_mcq_cqisao(&self, queue: usize, offset: usize) -> Result<()> {
+        self.write_mcq_queue_cfg(queue, REG_MCQ_CQISAO, offset as u32)
+    }
+
+    pub(crate) fn enable_mcq_sq(
+        &self,
+        queue: usize,
+        max_entries: usize,
+        cq_id: usize,
+    ) -> Result<()> {
+        let attr = Self::mcq_queue_attr(max_entries)?
+            | ((u32::try_from(cq_id).map_err(|_| EINVAL)?) << MCQ_QUEUE_ID_SHIFT);
+        self.write_mcq_queue_cfg(queue, REG_MCQ_SQATTR, attr)
+    }
+
+    pub(crate) fn enable_mcq_cq(&self, queue: usize, max_entries: usize) -> Result<()> {
+        self.write_mcq_queue_cfg(queue, REG_MCQ_CQATTR, Self::mcq_queue_attr(max_entries)?)
+    }
+
+    pub(crate) fn mcq_default_opr_set(&self) -> Result<UfsMcqOprSet> {
+        Ok(UfsMcqOprSet::new(
+            UfsMcqOprInfo::new(
+                self.read_mcq_queue_cfg(0, REG_MCQ_SQDAO)? as usize,
+                MCQ_DEFAULT_OPR_STRIDE,
+            ),
+            UfsMcqOprInfo::new(
+                self.read_mcq_queue_cfg(0, REG_MCQ_SQISAO)? as usize,
+                MCQ_DEFAULT_OPR_STRIDE,
+            ),
+            UfsMcqOprInfo::new(
+                self.read_mcq_queue_cfg(0, REG_MCQ_CQDAO)? as usize,
+                MCQ_DEFAULT_OPR_STRIDE,
+            ),
+            UfsMcqOprInfo::new(
+                self.read_mcq_queue_cfg(0, REG_MCQ_CQISAO)? as usize,
+                MCQ_DEFAULT_OPR_STRIDE,
+            ),
+        ))
+    }
+
+    // MCQ operation and runtime registers
+    #[inline]
+    pub(crate) fn mcq_opr_offset(
+        &self,
+        oprs: &UfsMcqOprSet,
+        region: UfsMcqOprRegion,
+        queue: usize,
+        reg: usize,
+    ) -> usize {
+        let info = oprs.get(region);
+        info.offset + info.stride * queue + reg
+    }
+
+    #[inline]
+    pub(crate) fn read_mcq_opr(
+        &self,
+        oprs: &UfsMcqOprSet,
+        region: UfsMcqOprRegion,
+        queue: usize,
+        reg: usize,
+    ) -> Result<u32> {
+        self.try_read(self.mcq_opr_offset(oprs, region, queue, reg))
+    }
+
+    #[inline]
+    pub(crate) fn write_mcq_opr(
+        &self,
+        oprs: &UfsMcqOprSet,
+        region: UfsMcqOprRegion,
+        queue: usize,
+        reg: usize,
+        value: u32,
+    ) -> Result<()> {
+        self.try_write(self.mcq_opr_offset(oprs, region, queue, reg), value)
+    }
+
+    #[inline]
+    pub(crate) fn read_mcq_sq_head(&self, oprs: &UfsMcqOprSet, queue: usize) -> Result<u32> {
+        self.read_mcq_opr(oprs, UfsMcqOprRegion::Sqd, queue, REG_MCQ_SQHP)
+    }
+
+    #[inline]
+    pub(crate) fn read_mcq_sq_tail(&self, oprs: &UfsMcqOprSet, queue: usize) -> Result<u32> {
+        self.read_mcq_opr(oprs, UfsMcqOprRegion::Sqd, queue, REG_MCQ_SQTP)
+    }
+
+    #[inline]
+    pub(crate) fn write_mcq_sq_tail(
+        &self,
+        oprs: &UfsMcqOprSet,
+        queue: usize,
+        tail: u32,
+    ) -> Result<()> {
+        self.write_mcq_opr(oprs, UfsMcqOprRegion::Sqd, queue, REG_MCQ_SQTP, tail)
+    }
+
+    #[inline]
+    pub(crate) fn write_mcq_sq_runtime_control(
+        &self,
+        oprs: &UfsMcqOprSet,
+        queue: usize,
+        value: u32,
+    ) -> Result<()> {
+        self.write_mcq_opr(oprs, UfsMcqOprRegion::Sqd, queue, REG_MCQ_SQRTC, value)
+    }
+
+    #[inline]
+    pub(crate) fn read_mcq_sq_runtime_status(
+        &self,
+        oprs: &UfsMcqOprSet,
+        queue: usize,
+    ) -> Result<u32> {
+        self.read_mcq_opr(oprs, UfsMcqOprRegion::Sqd, queue, REG_MCQ_SQRTS)
+    }
+
+    fn wait_mcq_sq_status(
+        &self,
+        oprs: &UfsMcqOprSet,
+        queue: usize,
+        mask: u32,
+        set: bool,
+    ) -> Result<()> {
+        read_poll_timeout(
+            || self.read_mcq_sq_runtime_status(oprs, queue),
+            |v: &u32| ((*v & mask) != 0) == set,
+            Delta::from_micros(MCQ_POLL_INTERVAL_US),
+            Delta::from_micros(MCQ_POLL_TIMEOUT_US),
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn stop_mcq_sq(&self, oprs: &UfsMcqOprSet, queue: usize) -> Result<()> {
+        self.write_mcq_sq_runtime_control(oprs, queue, MCQ_SQ_STOP)?;
+        self.wait_mcq_sq_status(oprs, queue, MCQ_SQ_STS, true)
+    }
+
+    pub(crate) fn start_mcq_sq(&self, oprs: &UfsMcqOprSet, queue: usize) -> Result<()> {
+        self.write_mcq_sq_runtime_control(oprs, queue, MCQ_SQ_START)?;
+        self.wait_mcq_sq_status(oprs, queue, MCQ_SQ_STS, false)
+    }
+
+    #[inline]
+    pub(crate) fn write_mcq_sq_cleanup_target(
+        &self,
+        oprs: &UfsMcqOprSet,
+        queue: usize,
+        lun: u8,
+        tag: u8,
+    ) -> Result<()> {
+        self.write_mcq_opr(
+            oprs,
+            UfsMcqOprRegion::Sqd,
+            queue,
+            REG_MCQ_SQCTI,
+            (u32::from(lun) << 8) | u32::from(tag),
+        )
+    }
+
+    pub(crate) fn initiate_mcq_sq_cleanup(
+        &self,
+        oprs: &UfsMcqOprSet,
+        queue: usize,
+    ) -> Result<()> {
+        let rtc = self.read_mcq_opr(oprs, UfsMcqOprRegion::Sqd, queue, REG_MCQ_SQRTC)?;
+        self.write_mcq_sq_runtime_control(oprs, queue, rtc | MCQ_SQ_ICU)?;
+        self.wait_mcq_sq_status(oprs, queue, MCQ_SQ_CUS, true)
+    }
+
+    #[inline]
+    pub(crate) fn mcq_sq_cleanup_error_code(
+        &self,
+        oprs: &UfsMcqOprSet,
+        queue: usize,
+    ) -> Result<u32> {
+        Ok((self.read_mcq_sq_runtime_status(oprs, queue)? & MASK_MCQ_SQ_ICU_ERR_CODE)
+            >> SHIFT_MCQ_SQ_ICU_ERR_CODE)
+    }
+
+    #[inline]
+    pub(crate) fn read_mcq_cq_head(&self, oprs: &UfsMcqOprSet, queue: usize) -> Result<u32> {
+        self.read_mcq_opr(oprs, UfsMcqOprRegion::Cqd, queue, REG_MCQ_CQHP)
+    }
+
+    #[inline]
+    pub(crate) fn write_mcq_cq_head(
+        &self,
+        oprs: &UfsMcqOprSet,
+        queue: usize,
+        head: u32,
+    ) -> Result<()> {
+        self.write_mcq_opr(oprs, UfsMcqOprRegion::Cqd, queue, REG_MCQ_CQHP, head)
+    }
+
+    #[inline]
+    pub(crate) fn read_mcq_cq_tail(&self, oprs: &UfsMcqOprSet, queue: usize) -> Result<u32> {
+        self.read_mcq_opr(oprs, UfsMcqOprRegion::Cqd, queue, REG_MCQ_CQTP)
+    }
+
+    #[inline]
+    pub(crate) fn read_mcq_cqis(&self, oprs: &UfsMcqOprSet, queue: usize) -> Result<u32> {
+        self.read_mcq_opr(oprs, UfsMcqOprRegion::Cqis, queue, REG_MCQ_CQIS)
+    }
+
+    #[inline]
+    pub(crate) fn write_mcq_cqis(
+        &self,
+        oprs: &UfsMcqOprSet,
+        queue: usize,
+        value: u32,
+    ) -> Result<()> {
+        self.write_mcq_opr(oprs, UfsMcqOprRegion::Cqis, queue, REG_MCQ_CQIS, value)
+    }
+
+    #[inline]
+    pub(crate) fn enable_mcq_cq_tail_push_intr(
+        &self,
+        oprs: &UfsMcqOprSet,
+        queue: usize,
+    ) -> Result<()> {
+        self.write_mcq_opr(
+            oprs,
+            UfsMcqOprRegion::Cqis,
+            queue,
+            REG_MCQ_CQIE,
+            MCQ_CQIS_TAIL_ENT_PUSH_STS,
+        )
+    }
+
     // Helpers
     #[inline]
     pub(crate) fn nutrs(&self) -> usize {
         (self.read_cap_lo() & MASK_TRANSFER_REQUESTS_SLOTS_SDB) as usize + 1
+    }
+
+    #[inline]
+    pub(crate) fn mcq_supported(&self) -> bool {
+        (self.read_cap_lo() & MASK_MCQ_SUPPORT) != 0
+    }
+
+    #[inline]
+    pub(crate) fn nutrs_mcq(&self) -> usize {
+        (self.read_cap_lo() & MASK_TRANSFER_REQUESTS_SLOTS_MCQ) as usize + 1
     }
 
     #[inline]
@@ -409,15 +944,19 @@ impl UfsReg {
     }
 
     pub(crate) fn read_transfer_interrupts(&self) -> u32 {
-        self.read_is() & self.read_ie() & UTP_TRANSFER_REQ_COMPL
+        self.read_is() & self.read_ie() & (UTP_TRANSFER_REQ_COMPL | MCQ_CQ_EVENT_STATUS)
     }
 
     pub(crate) fn confirm_transfer_interrupts(&self, value: u32) {
-        self.write_is(value & UTP_TRANSFER_REQ_COMPL);
+        self.write_is(value & (UTP_TRANSFER_REQ_COMPL | MCQ_CQ_EVENT_STATUS));
     }
 
     pub(crate) fn enable_interrupts(&self) {
         self.write_ie(self.read_ie() | UTP_REQ_COMPL_MASK | ERROR_MASK);
+    }
+
+    pub(crate) fn enable_mcq_interrupts(&self) {
+        self.write_ie(self.read_ie() | MCQ_CQ_EVENT_STATUS);
     }
 
     pub(crate) fn wait_for_request_ready(
