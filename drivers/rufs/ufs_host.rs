@@ -167,6 +167,7 @@ impl UfsHost {
                 },
             }
         }
+        host.dev.alloc_dev_request()?;
         host.dev.verify_dev_init()?;
         host.dev.complete_dev_init()?;
         host.dev.device_params_init()?;

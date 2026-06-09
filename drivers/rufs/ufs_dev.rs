@@ -699,11 +699,13 @@ pub(crate) struct UfsDevInfo {
 
 #[pin_data]
 pub(crate) struct UfsDev {
+    queue: Arc<UfsQueue>,
+
     #[pin]
     pub(crate) info: Mutex<UfsDevInfo>,
 
     #[pin]
-    request: Mutex<Arc<UfsRequest>>,
+    request: Mutex<Option<Arc<UfsRequest>>>,
 
     #[pin]
     tmf_queue: Mutex<Option<KBox<TmfQueue>>>,
@@ -711,15 +713,25 @@ pub(crate) struct UfsDev {
 
 impl UfsDev{
     pub(crate) fn new(queue: Arc<UfsQueue>) -> Result<Arc<Self>> {
-        let request = queue.reserve()?;
         Arc::pin_init(
             try_pin_init!(Self {
+                queue,
                 info <- new_mutex!(UfsDevInfo::default()),
-                request <- new_mutex!(request),
+                request <- new_mutex!(None),
                 tmf_queue <- new_mutex!(None),
             }),
             GFP_KERNEL,
         )
+    }
+
+    pub(crate) fn alloc_dev_request(&self) -> Result<()> {
+        let mut request = self.request.lock();
+        if request.is_some() {
+            return Err(EBUSY);
+        }
+
+        request.replace(self.queue.reserve()?);
+        Ok(())
     }
 
     // Allocate the placeholder TMF blk-mq objects early so the ownership and
@@ -737,9 +749,13 @@ impl UfsDev{
         Ok(())
     }
 
-    fn nop(&self) -> Result<()> {
+    fn issue(&self, cmd: UfsCmd) -> Result<UfsCmd> {
         let request = self.request.lock();
-        let cmd = request.issue(UfsDevCmd::nop())?;
+        request.as_ref().ok_or(EINVAL)?.issue(cmd)
+    }
+
+    fn nop(&self) -> Result<()> {
+        let cmd = self.issue(UfsDevCmd::nop())?;
         Ok(())
     }
 
@@ -750,14 +766,12 @@ impl UfsDev{
     }
 
     fn read_desc(&self, idn: DescIdn, index: u8, selector: u8) -> Result<Desc> {
-        let cmd = self.request.lock().issue(
-            UfsDevCmd::query().read_desc(idn, index, selector))?;
+        let cmd = self.issue(UfsDevCmd::query().read_desc(idn, index, selector))?;
         Ok(cmd.get_device()?.get_query()?.get_read_desc()?.desc)
     }
 
     fn read_attr(&self, idn: AttrIdn, index: u8, selector: u8) -> Result<u64> {
-        let cmd = self.request.lock().issue(
-            UfsDevCmd::query().read_attr(idn, index, selector))?;
+        let cmd = self.issue(UfsDevCmd::query().read_attr(idn, index, selector))?;
         Ok(cmd.get_device()?.get_query()?.get_attr_value()?)
     }
 
@@ -776,8 +790,7 @@ impl UfsDev{
         selector: u8,
         value: u64,
     ) -> Result<()> {
-        let cmd = self.request.lock().issue(
-            UfsDevCmd::query().write_attr(idn, index, selector, value))?;
+        let cmd = self.issue(UfsDevCmd::query().write_attr(idn, index, selector, value))?;
         if cmd.get_device()?.get_query()?.get_attr_value()? == value {
             Ok(())
         } else {
@@ -786,14 +799,12 @@ impl UfsDev{
     }
 
     fn read_flag(&self, idn: FlagIdn, index: u8, selector: u8) -> Result<u8> {
-        let cmd = self.request.lock().issue(
-            UfsDevCmd::query().read_flag(idn, index, selector))?;
+        let cmd = self.issue(UfsDevCmd::query().read_flag(idn, index, selector))?;
         Ok(cmd.get_device()?.get_query()?.get_flag_value()?)
     }
 
     fn set_flag(&self, idn: FlagIdn, index: u8, selector: u8) -> Result<()> {
-        let cmd = self.request.lock().issue(
-            UfsDevCmd::query().set_flag(idn, index, selector))?;
+        let cmd = self.issue(UfsDevCmd::query().set_flag(idn, index, selector))?;
         match cmd.get_device()?.get_query()?.get_flag_value()? {
             1 => Ok(()),
             _ => Err(EIO),
@@ -801,8 +812,7 @@ impl UfsDev{
     }
 
     fn clear_flag(&self, idn: FlagIdn, index: u8, selector: u8) -> Result<()> {
-        let cmd = self.request.lock().issue(
-            UfsDevCmd::query().clear_flag(idn, index, selector))?;
+        let cmd = self.issue(UfsDevCmd::query().clear_flag(idn, index, selector))?;
         match cmd.get_device()?.get_query()?.get_flag_value()? {
             0 => Ok(()),
             _ => Err(EIO),
@@ -810,8 +820,7 @@ impl UfsDev{
     }
 
     fn toggle_flag(&self, idn: FlagIdn, index: u8, selector: u8) -> Result<u8> {
-        let cmd = self.request.lock().issue(
-            UfsDevCmd::query().toggle_flag(idn, index, selector))?;
+        let cmd = self.issue(UfsDevCmd::query().toggle_flag(idn, index, selector))?;
         Ok(cmd.get_device()?.get_query()?.get_flag_value()?)
     }
 
