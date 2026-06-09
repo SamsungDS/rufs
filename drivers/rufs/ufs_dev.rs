@@ -53,6 +53,9 @@ const TMF_OPS: bindings::blk_mq_ops = bindings::blk_mq_ops {
     show_rq: None,
 };
 
+// This queue is scaffolding for future task-management/error-recovery support.
+// RUFS does not issue TMF requests yet; `queue_tmf()` is only a guard callback
+// so accidental dispatch is rejected instead of silently completing.
 struct TmfQueue {
     tag_set: bindings::blk_mq_tag_set,
     queue: *mut bindings::request_queue,
@@ -715,6 +718,10 @@ impl UfsDev{
         )
     }
 
+    // Allocate the placeholder TMF blk-mq objects early so the ownership and
+    // cleanup path are exercised, but do not treat this as functional TMF
+    // support. Real TMF request composition/completion belongs with error
+    // recovery.
     pub(crate) fn alloc_tmf_queue(&self, depth: usize) -> Result<()> {
         let mut tmf_queue = self.tmf_queue.lock();
         if tmf_queue.is_some() {
