@@ -656,10 +656,6 @@ impl SdbTransferBackend {
         self.reg.nutrs()
     }
 
-    fn nr_hw_queues(&self) -> usize {
-        1
-    }
-
     fn compose_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
         self.dma.compose_devman_upiu(cmd, tag)
     }
@@ -743,10 +739,6 @@ impl McqTransferBackend {
 
     fn queue_depth(&self) -> usize {
         self.queue_depth
-    }
-
-    fn nr_hw_queues(&self) -> usize {
-        self.layout.total_queues
     }
 
     fn default_queues(&self) -> usize {
@@ -844,13 +836,6 @@ impl UfsTransferBackend {
         match self {
             Self::Sdb(backend) => backend.queue_depth(),
             Self::Mcq(backend) => backend.queue_depth(),
-        }
-    }
-
-    fn nr_hw_queues(&self) -> usize {
-        match self {
-            Self::Sdb(backend) => backend.nr_hw_queues(),
-            Self::Mcq(backend) => backend.nr_hw_queues(),
         }
     }
 
@@ -1064,23 +1049,14 @@ impl UfsRequest {
     }
 
     pub(crate) fn submit(&self) -> Result<()> {
-        let cmd = match self.inner.lock().cmd {
-            Some(cmd) => cmd,
-            None => {
-                pr_err!("no command in UfsRequest");
-                return Err(EIO);
-            },
-        };
+        let (cmd, hw_queue) = self.cmd_and_hw_queue()?;
 
         let result = match cmd {
             UfsCmd::Device(cmd) => {
                 self.queue.prepare_dev_wait();
                 self.queue.submit_dev(cmd, self.tag)
             },
-            UfsCmd::SCSI(cmd) => {
-                let hw_queue = self.inner.lock().hw_queue;
-                self.queue.submit_scsi(cmd, self.tag, hw_queue)
-            },
+            UfsCmd::SCSI(cmd) => self.queue.submit_scsi(cmd, self.tag, hw_queue),
         };
 
         match result {
@@ -1099,16 +1075,13 @@ impl UfsRequest {
     }
 
     pub(crate) fn wait(&self) -> Result<()> {
-        let cmd = match self.inner.lock().cmd {
-            Some(cmd) => cmd,
-            None => {
-                pr_err!("no command in UfsRequest");
-                return Err(EIO);
-            },
-        };
+        let cmd = self.cmd()?;
 
         if self.inner.lock().state == RequestState::Idle {
-            pr_err!("UfsRequest is not submitted");
+            pr_err!(
+                "[RUFS] ufs_queue: request tag={} is not submitted\n",
+                self.tag,
+            );
             return Err(EIO);
         }
 
@@ -1127,16 +1100,13 @@ impl UfsRequest {
     }
 
     pub(crate) fn fetch(&self) -> Result<UfsCmd> {
-        let cmd = match self.inner.lock().cmd {
-            Some(cmd) => cmd,
-            None => {
-                pr_err!("no command in UfsRequest");
-                return Err(EIO);
-            },
-        };
+        let cmd = self.cmd()?;
 
         if self.inner.lock().state != RequestState::Completed {
-            pr_err!("UfsRequest is not completed");
+            pr_err!(
+                "[RUFS] ufs_queue: request tag={} is not completed\n",
+                self.tag,
+            );
             return Err(EIO);
         }
 
@@ -1155,6 +1125,29 @@ impl UfsRequest {
                 Ok(cmd)
             },
         }
+    }
+
+    fn cmd(&self) -> Result<UfsCmd> {
+        match self.inner.lock().cmd {
+            Some(cmd) => Ok(cmd),
+            None => self.missing_command(),
+        }
+    }
+
+    fn cmd_and_hw_queue(&self) -> Result<(UfsCmd, Option<usize>)> {
+        let inner = self.inner.lock();
+        match inner.cmd {
+            Some(cmd) => Ok((cmd, inner.hw_queue)),
+            None => self.missing_command(),
+        }
+    }
+
+    fn missing_command<T>(&self) -> Result<T> {
+        pr_err!(
+            "[RUFS] ufs_queue: request tag={} has no command\n",
+            self.tag,
+        );
+        Err(EIO)
     }
 
     pub(crate) fn clear(&self) {
@@ -1180,15 +1173,9 @@ impl UfsRequest {
     }
 
     fn complete(&self) -> bool {
-        let cmd = {
-            let inner = self.inner.lock();
-            match inner.cmd {
-                Some(cmd) => cmd,
-                None => {
-                    pr_err!("No command in UfsRequest");
-                    return true;
-                },
-            }
+        let cmd = match self.cmd() {
+            Ok(cmd) => cmd,
+            Err(_) => return true,
         };
 
         match cmd {
@@ -1202,7 +1189,10 @@ impl UfsRequest {
                 let (block_rq, prdt) = {
                     let mut inner = self.inner.lock();
                     let Some(block_rq) = inner.block_rq.take() else {
-                        pr_err!("No block request for SCSI completion tag {}", self.tag);
+                        pr_err!(
+                            "[RUFS] ufs_queue: no block request for SCSI completion tag={}\n",
+                            self.tag,
+                        );
                         return true;
                     };
 
@@ -1322,6 +1312,14 @@ impl UfsQueue {
         self.backend.lock().queue_depth()
     }
 
+    fn validate_tag_depth(&self, tag: usize) -> Result<()> {
+        if tag < self.queue_depth() {
+            Ok(())
+        } else {
+            Err(EINVAL)
+        }
+    }
+
     pub(crate) fn reserve(self: &Arc<Self>) -> Result<Arc<UfsRequest>> {
         let queue_depth = self.queue_depth();
         if queue_depth == 0 {
@@ -1329,15 +1327,15 @@ impl UfsQueue {
         }
 
         let mut slots = self.slot.lock();
-        let mut tag = queue_depth - 1;
-        while let Some(slot) = slots.get_mut(tag) {
-            match slot {
-                Some(_) => { tag -= 1; },
-                None => {
-                    let request = UfsRequest::new(self.clone(), tag)?;
-                    slot.replace(request.clone());
-                    return Ok(request);
-                },
+        if queue_depth > slots.len() {
+            return Err(EINVAL);
+        }
+
+        for (tag, slot) in slots.iter_mut().take(queue_depth).enumerate().rev() {
+            if slot.is_none() {
+                let request = UfsRequest::new(self.clone(), tag)?;
+                slot.replace(request.clone());
+                return Ok(request);
             }
         }
 
@@ -1348,11 +1346,13 @@ impl UfsQueue {
         self: &Arc<Self>,
         tag: usize,
     ) -> Result<Arc<UfsRequest>> {
+        self.validate_tag_depth(tag)?;
+
         let mut binding = self.slot.lock();
         let slot = match binding.get_mut(tag) {
             Some(slot) => slot,
             None => {
-                pr_err!("No slot for tag {}", tag);
+                pr_err!("[RUFS] ufs_queue: no slot for tag={}\n", tag);
                 return Err(EINVAL);
             }
         };
