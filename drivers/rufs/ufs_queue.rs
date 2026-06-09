@@ -1214,6 +1214,60 @@ impl UfsRequest {
         inner.state = RequestState::Idle;
     }
 
+    fn timeout(&self) -> bool {
+        let (cmd, block_rq, prdt, hw_queue) = {
+            let mut inner = self.inner.lock();
+            if inner.state != RequestState::Submitted && inner.state != RequestState::Completed {
+                return true;
+            }
+
+            let Some(block_rq) = inner.block_rq.take() else {
+                return true;
+            };
+
+            let cmd = inner.cmd;
+            let prdt = inner.prdt.take();
+            let hw_queue = inner.hw_queue.take();
+            inner.scsi_completion = None;
+            inner.cmd = None;
+            inner.state = RequestState::Idle;
+            (cmd, block_rq, prdt, hw_queue)
+        };
+
+        if let Some(UfsCmd::SCSI(cmd)) = cmd {
+            let cdb = cmd.cdb();
+            pr_err!(
+                "[RUFS] ufs_queue: SCSI request timeout tag={} lun={} opcode=0x{:02x}\n",
+                self.tag,
+                cmd.lun(),
+                cdb[0],
+            );
+        } else {
+            pr_err!("[RUFS] ufs_queue: request timeout tag={}\n", self.tag);
+        }
+        self.queue.dump_backend_state(self.tag, "request timeout");
+
+        // This is only a minimum timeout return path. It does not clean the MCQ
+        // SQ or prevent a late CQE for the same tag; full error handling will
+        // need to quiesce/recover hardware before reusing timed-out tags.
+        match OwnableRefCounted::try_from_shared(block_rq) {
+            Ok(block_rq) => {
+                block_rq.end(bindings::BLK_STS_IOERR as u8);
+                drop(prdt);
+                true
+            },
+            Err(block_rq) => {
+                let mut inner = self.inner.lock();
+                inner.cmd = cmd;
+                inner.prdt = prdt;
+                inner.block_rq = Some(block_rq);
+                inner.hw_queue = hw_queue;
+                inner.state = RequestState::Completed;
+                false
+            },
+        }
+    }
+
     fn scsi_completion_result(&self) -> UfsScsiResult {
         if let Some(result) = self.inner.lock().scsi_completion {
             return result;
@@ -1481,6 +1535,18 @@ impl UfsQueue {
 
     fn dump_backend_state(&self, tag: usize, reason: &str) {
         self.backend.lock().dump_state(tag, reason);
+    }
+
+    pub(crate) fn timeout(&self, tag: usize) -> bool {
+        let request = {
+            let mut slots = self.slot.lock();
+            slots.get_mut(tag).and_then(|slot| slot.as_ref()).cloned()
+        };
+
+        match request {
+            Some(request) => request.timeout(),
+            None => true,
+        }
     }
 
     fn poll_backend_queue(&self, queue: usize) -> Result<()> {

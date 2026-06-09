@@ -234,17 +234,42 @@ impl UfsLu {
         cmd: UfsSCSICmd,
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
     ) -> Result<Arc<UfsRequest>> {
+        let tag = self.global_tag(hw_queue, tag)?;
+        let request = self.queue.acquire(tag)?;
+        request.compose_block_request(rq.clone(), cmd, hw_queue)?;
+        Ok(request)
+    }
+
+    fn global_tag(&self, hw_queue: usize, tag: usize) -> Result<usize> {
         if tag >= self.hw_queue_depth {
             return Err(EINVAL);
         }
 
-        let tag = hw_queue
+        hw_queue
             .checked_mul(self.hw_queue_depth)
             .and_then(|base| base.checked_add(tag))
-            .ok_or(EOVERFLOW)?;
-        let request = self.queue.acquire(tag)?;
-        request.compose_block_request(rq.clone(), cmd, hw_queue)?;
-        Ok(request)
+            .ok_or(EOVERFLOW)
+    }
+
+    fn timeout_request(&self, hw_queue: usize, tag: usize) -> mq::RequestTimeoutStatus {
+        let global_tag = match self.global_tag(hw_queue, tag) {
+            Ok(global_tag) => global_tag,
+            Err(e) => {
+                pr_err!(
+                    "[RUFS] ufs_lu: invalid timeout request tag={} hctx={} errno={}\n",
+                    tag,
+                    hw_queue,
+                    e.to_errno(),
+                );
+                return mq::RequestTimeoutStatus::RetryLater;
+            },
+        };
+
+        if self.queue.timeout(global_tag) {
+            mq::RequestTimeoutStatus::Completed
+        } else {
+            mq::RequestTimeoutStatus::RetryLater
+        }
     }
 }
 
@@ -422,6 +447,25 @@ impl Operations for UfsLuBlockOps {
             .map_err(|_| EBUSY)
             .expect("rufs: request completion failed")
             .end_ok();
+    }
+
+    fn request_timeout(
+        tag_set: &TagSet<Self>,
+        queue_id: u32,
+        tag: u32,
+    ) -> mq::RequestTimeoutStatus {
+        let Some(request) = tag_set.tag_to_rq(queue_id, tag) else {
+            pr_err!(
+                "[RUFS] ufs_lu: timeout for unknown request hctx={} tag={}\n",
+                queue_id,
+                tag,
+            );
+            return mq::RequestTimeoutStatus::RetryLater;
+        };
+
+        request
+            .queue_data()
+            .timeout_request(queue_id as usize, tag as usize)
     }
 
     fn poll(
