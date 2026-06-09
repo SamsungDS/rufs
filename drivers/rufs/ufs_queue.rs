@@ -520,7 +520,7 @@ impl McqQueueSet {
             .ok_or(EINVAL)?;
 
         for queue in queues.iter_mut() {
-            self.poll_queue(reg, dma, queue)?;
+            self.collect_queue_completions(reg, dma, queue)?;
         }
 
         Ok(())
@@ -535,10 +535,15 @@ impl McqQueueSet {
             .ok_or(EINVAL)?;
         let queue = queues.get_mut(queue_id).ok_or(EINVAL)?;
 
-        self.poll_queue(reg, dma, queue)
+        self.collect_queue_completions(reg, dma, queue)
     }
 
-    fn poll_queue(&self, reg: &UfsReg, dma: &UfsDma, queue: &mut UfsMcqQueue) -> Result<()> {
+    fn collect_queue_completions(
+        &self,
+        reg: &UfsReg,
+        dma: &UfsDma,
+        queue: &mut UfsMcqQueue,
+    ) -> Result<()> {
         queue.update_cq_tail_slot(reg)?;
         while !queue.cq_is_empty() {
             if let Some(cqe) = queue.consume_cq_entry(reg)? {
@@ -682,6 +687,13 @@ impl SdbTransferBackend {
         (self.reg.read_utrl_doorbell() & (1 << tag)) == 0
     }
 
+    // SDB has no destructive completion queue entry to snapshot, so this is a
+    // no-op. MCQ uses the same backend interface to separate CQ consumption
+    // from request finalization.
+    fn refresh_completions(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn poll_queue(&self, _queue: usize) -> Result<()> {
         Ok(())
     }
@@ -781,6 +793,19 @@ impl McqTransferBackend {
 
     fn request_completed(&self, tag: usize) -> bool {
         self.queues.request_completed(&self.reg, &self.dma, tag)
+    }
+
+    // MCQ completion is intentionally split into two phases. Reading a CQE is
+    // destructive because the software CQ head advances, so the IRQ-thread
+    // executor first snapshots all visible CQEs into `completed`. It then scans
+    // requests using only the cached CQE state. This avoids repeatedly walking
+    // every MCQ CQ for each submitted request, and it also preserves CQEs if
+    // blk-mq cannot accept final completion immediately due to outstanding
+    // request references. This is not a legacy SDB completion path; it mirrors
+    // the MCQ requirement that CQ consumption and request finalization are
+    // separate operations.
+    fn refresh_completions(&self) -> Result<()> {
+        self.queues.poll_completions(&self.reg, &self.dma)
     }
 
     fn poll_queue(&self, queue: usize) -> Result<()> {
@@ -887,6 +912,13 @@ impl UfsTransferBackend {
         match self {
             Self::Sdb(backend) => backend.request_completed(tag),
             Self::Mcq(backend) => backend.request_completed(tag),
+        }
+    }
+
+    fn refresh_completions(&self) -> Result<()> {
+        match self {
+            Self::Sdb(backend) => backend.refresh_completions(),
+            Self::Mcq(backend) => backend.refresh_completions(),
         }
     }
 
@@ -1199,14 +1231,6 @@ impl UfsRequest {
         }
     }
 
-    fn completion_ready(&self) -> bool {
-        if self.inner.lock().state == RequestState::Completed {
-            return true;
-        }
-
-        self.queue.request_completed(self.tag)
-    }
-
     fn completion_ready_cached(&self) -> bool {
         if self.inner.lock().state == RequestState::Completed {
             return true;
@@ -1394,6 +1418,10 @@ impl UfsQueue {
         self.backend.lock().request_completed(tag)
     }
 
+    fn refresh_backend_completions(&self) -> Result<()> {
+        self.backend.lock().refresh_completions()
+    }
+
     fn poll_backend_queue(&self, queue: usize) -> Result<()> {
         self.backend.lock().poll_queue(queue)
     }
@@ -1477,18 +1505,22 @@ impl UfsQueue {
         // registered as a threaded IRQ. Submit-side fast completion and retry
         // paths wake that same IRQ thread instead of using a separate work
         // item, so there is a single completion executor.
-        let mut tag = 0 as usize;
+        if let Err(e) = self.refresh_backend_completions() {
+            pr_err!(
+                "[RUFS] ufs_queue: refresh completions failed errno={}\n",
+                e.to_errno(),
+            );
+            return false;
+        }
+
+        let mut tag = 0;
         let mut completed = false;
         let mut retry = false;
         while let Some(request) = self.next_completable_request(tag) {
             let request_tag = request.tag;
-            if request.completion_ready() {
-                if !request.complete() {
-                    retry = true;
-                } else {
-                    completed = true;
-                }
-            }
+            let (request_completed, request_retry) = self.complete_ready_request(&request);
+            completed |= request_completed;
+            retry |= request_retry;
             tag = request_tag + 1;
         }
 
@@ -1509,7 +1541,7 @@ impl UfsQueue {
             return false;
         }
 
-        let mut tag = 0 as usize;
+        let mut tag = 0;
         let mut completed = false;
         let mut retry = false;
         while let Some(request) = self.next_completable_request_on_queue(tag, hw_queue) {
