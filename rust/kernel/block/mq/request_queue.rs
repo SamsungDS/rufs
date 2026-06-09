@@ -28,7 +28,6 @@ where
     ///
     /// - `ptr` must be valid for use as a reference for the duration of `'a`.
     /// - `ptr` must have been initialized as part of [`GenDiskBuilder::build`].
-    #[expect(dead_code)]
     pub(crate) unsafe fn from_raw<'a>(ptr: *const bindings::request_queue) -> &'a Self {
         // INVARIANT:
         // - By function safety requirements, `ptr` is a valid `request_queue`.

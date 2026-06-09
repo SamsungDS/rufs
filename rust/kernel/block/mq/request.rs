@@ -29,6 +29,7 @@ use core::{
     ptr::NonNull, //
 };
 
+use super::RequestQueue;
 /// A [`Request`] that a driver has not yet begun to process.
 ///
 /// A driver can convert an `IdleRequest` to a [`Request`] by calling [`IdleRequest::start`].
@@ -124,6 +125,12 @@ impl<T: Operations> RequestInner<T> {
     pub fn queue_data(&self) -> <T::QueueData as ForeignOwnable>::Borrowed<'_> {
         // SAFETY: By type invariants of `Request`, `self.0` is a valid request.
         unsafe { T::QueueData::borrow((*(*self.0.get()).q).queuedata) }
+    }
+
+    /// Get the request queue associated with this request.
+    pub fn queue(&self) -> &RequestQueue<T> {
+        // SAFETY: By type invariant, self.0 is guaranteed to be valid.
+        unsafe { RequestQueue::from_raw((*self.0.get()).q) }
     }
 }
 
