@@ -107,6 +107,15 @@ impl<T: Operations> TagSet<T> {
     pub(crate) fn raw_tag_set(&self) -> *mut bindings::blk_mq_tag_set {
         self.inner.get()
     }
+
+    /// Return the [`Flags`] that this tag set was configured with.
+    pub fn flags(&self) -> Flags {
+        let this = self.raw_tag_set();
+        // SAFETY: By type invariant, `this` points to a valid and initialized
+        // `blk_mq_tag_set`.
+        let flags_raw = unsafe { (*this).flags };
+        Flags::try_from(flags_raw).expect("Expected valid flags from C struct")
+    }
 }
 
 #[pinned_drop]
