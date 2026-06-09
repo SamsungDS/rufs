@@ -17,7 +17,7 @@ use crate::{
         self,
         Result, //
     },
-    prelude::try_pin_init,
+    prelude::*,
     types::Opaque,
 };
 use core::{
@@ -28,6 +28,12 @@ use pin_init::{
     pin_data,
     pinned_drop,
     PinInit, //
+};
+
+mod flags;
+pub use flags::{
+    Flag,
+    Flags, //
 };
 
 /// A wrapper for the C `struct blk_mq_tag_set`.
@@ -51,6 +57,7 @@ impl<T: Operations> TagSet<T> {
         nr_hw_queues: u32,
         num_tags: u32,
         num_maps: u32,
+        flags: Flags,
     ) -> impl PinInit<Self, error::Error> {
         let tag_set: bindings::blk_mq_tag_set = pin_init::zeroed();
         let tag_set: Result<_> = size_of::<RequestDataWrapper<T>>()
@@ -63,8 +70,8 @@ impl<T: Operations> TagSet<T> {
                     numa_node: bindings::NUMA_NO_NODE,
                     queue_depth: num_tags,
                     cmd_size,
-                    flags: 0,
-                    driver_data: core::ptr::null_mut::<crate::ffi::c_void>(),
+                    flags: flags.into(),
+                    driver_data: core::ptr::null_mut::<c_void>(),
                     nr_maps: num_maps,
                     ..tag_set
                 }
