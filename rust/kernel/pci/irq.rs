@@ -93,8 +93,20 @@ impl<'a> IrqVector<'a> {
     }
 
     /// Returns the raw vector index.
-    fn index(&self) -> u32 {
+    pub fn index(&self) -> u32 {
         self.index
+    }
+
+    /// Returns another IRQ vector for the same device and allocation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `index` is inside the range returned by
+    /// [`Device::alloc_irq_vectors`].
+    pub unsafe fn from_allocated_index(&self, index: u32) -> Self {
+        // SAFETY: The caller guarantees that `index` names an allocated vector
+        // for the same PCI device.
+        unsafe { Self::new(self.dev, index) }
     }
 }
 
