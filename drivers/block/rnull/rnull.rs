@@ -54,7 +54,13 @@ impl NullBlkDevice {
         irq_mode: IRQMode,
     ) -> Result<GenDisk<Self>> {
         let tagset = Arc::pin_init(
-            TagSet::new(1, 256, 1, mq::tag_set::Flags::default()),
+            TagSet::new(
+                1,
+                256,
+                1,
+                kernel::alloc::NumaNode::NO_NODE,
+                mq::tag_set::Flags::default(),
+            ),
             GFP_KERNEL,
         )?;
 
