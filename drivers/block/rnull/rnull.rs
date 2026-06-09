@@ -85,13 +85,19 @@ impl Operations for NullBlkDevice {
     type QueueData = KBox<QueueData>;
     type TagSetData = ();
     type RequestData = ();
+    type HwData = ();
 
     fn new_request_data() -> impl PinInit<Self::RequestData> {
         Ok(())
     }
 
     #[inline(always)]
-    fn queue_rq(queue_data: &QueueData, rq: Owned<mq::Request<Self>>, _is_last: bool) -> Result {
+    fn queue_rq(
+        _hw_data: (),
+        queue_data: &QueueData,
+        rq: Owned<mq::Request<Self>>,
+        _is_last: bool,
+    ) -> Result {
         match queue_data.irq_mode {
             IRQMode::None => rq.end_ok(),
             IRQMode::Soft => mq::Request::complete(rq.into()),
@@ -99,7 +105,11 @@ impl Operations for NullBlkDevice {
         Ok(())
     }
 
-    fn commit_rqs(_queue_data: &QueueData) {}
+    fn commit_rqs(_hw_data: (), _queue_data: &QueueData) {}
+
+    fn init_hctx(_tagset_data: (), _hctx_idx: u32) -> Result {
+        Ok(())
+    }
 
     fn complete(rq: ARef<mq::Request<Self>>) {
         OwnableRefCounted::try_from_shared(rq)
