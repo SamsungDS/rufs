@@ -143,6 +143,8 @@ pub use operations::{
 };
 pub use request::{
     Command,
+    Flag as RequestFlag,
+    Flags as RequestFlags,
     IdleRequest,
     Request, //
 };
