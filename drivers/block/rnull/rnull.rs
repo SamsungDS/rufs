@@ -98,6 +98,7 @@ impl Operations for NullBlkDevice {
         queue_data: &QueueData,
         rq: Owned<mq::IdleRequest<Self>>,
         _is_last: bool,
+        _is_poll: bool,
     ) -> BlkResult {
         let rq = rq.start();
         match queue_data.irq_mode {
