@@ -181,7 +181,7 @@ impl configfs::AttributeOperations<1> for DeviceConfig {
         let text = core::str::from_utf8(page)?.trim();
         let value = text.parse::<u32>().map_err(|_| EINVAL)?;
 
-        GenDiskBuilder::validate_block_size(value)?;
+        GenDiskBuilder::<NullBlkDevice>::validate_block_size(value)?;
         this.data.lock().block_size = value;
         Ok(())
     }
