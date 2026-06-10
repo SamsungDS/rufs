@@ -129,6 +129,7 @@ pub(crate) struct UfsLu {
     queue: Arc<UfsQueue>,
     lun: u8,
     geometry: UfsLuGeometry,
+    hw_queue_depth: usize,
 
     #[pin]
     state: SpinLock<UfsLuState>,
@@ -138,12 +139,18 @@ pub(crate) struct UfsLu {
 }
 
 impl UfsLu {
-    pub(crate) fn new(queue: Arc<UfsQueue>, lun: u8, geometry: UfsLuGeometry) -> Result<Arc<Self>> {
+    pub(crate) fn new(
+        queue: Arc<UfsQueue>,
+        lun: u8,
+        geometry: UfsLuGeometry,
+        hw_queue_depth: usize,
+    ) -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(Self {
                 queue,
                 lun,
                 geometry,
+                hw_queue_depth,
                 state <- new_spinlock!(UfsLuState::Reset),
                 disk <- new_mutex!(None),
             }),
@@ -218,12 +225,21 @@ impl UfsLu {
 
     fn compose_request(
         &self,
+        hw_queue: usize,
         tag: usize,
         cmd: UfsSCSICmd,
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
     ) -> Result<Arc<UfsRequest>> {
+        if tag >= self.hw_queue_depth {
+            return Err(EINVAL);
+        }
+
+        let tag = hw_queue
+            .checked_mul(self.hw_queue_depth)
+            .and_then(|base| base.checked_add(tag))
+            .ok_or(EOVERFLOW)?;
         let request = self.queue.acquire(tag)?;
-        request.compose_block_request(rq.clone(), cmd)?;
+        request.compose_block_request(rq.clone(), cmd, hw_queue)?;
         Ok(request)
     }
 }
@@ -234,13 +250,13 @@ pub(crate) struct UfsLuBlockOps;
 impl Operations for UfsLuBlockOps {
     type RequestData = ();
     type QueueData = Arc<UfsLu>;
-    type HwData = ();
-    type TagSetData = ();
+    type HwData = KBox<u32>;
+    type TagSetData = KBox<UfsQueueMap>;
 
     fn new_request_data() -> impl PinInit<Self::RequestData> {}
 
     fn queue_rq(
-        _hw_data: (),
+        _hw_data: &u32,
         lu: ArcBorrow<'_, UfsLu>,
         rq: Owned<IdleRequest<Self>>,
         _is_last: bool,
@@ -248,9 +264,10 @@ impl Operations for UfsLuBlockOps {
         let op = rq.command() as bindings::req_op;
         let sector = rq.sector();
         let sectors = rq.sectors();
-        let tag = rq.tag() as usize;
         let geometry = lu.geometry();
         let mask = geometry.sectors_per_block() - 1;
+        let tag = usize::try_from(rq.tag()).map_err(|_| EINVAL)?;
+        let hw_queue = usize::try_from(rq.queue_index()).map_err(|_| EINVAL)?;
 
         let cmd = match op {
             bindings::req_op_REQ_OP_READ | bindings::req_op_REQ_OP_WRITE => {
@@ -363,7 +380,7 @@ impl Operations for UfsLuBlockOps {
         // hardware command, so the completion path can hand it back to the
         // block layer once the command finishes.
         let rq = OwnableRefCounted::into_shared(rq.start());
-        let request = lu.compose_request(tag, cmd, &rq)?;
+        let request = lu.compose_request(hw_queue, tag, cmd, &rq)?;
 
         if let Err(e) = request.submit() {
             // `submit` dropped the request reference it stored, so we hold the
@@ -388,10 +405,12 @@ impl Operations for UfsLuBlockOps {
         Ok(())
     }
 
-    fn commit_rqs(_hw_data: (), _queue_data: ArcBorrow<'_, UfsLu>) {}
+    fn commit_rqs(_hw_data: &u32, _queue_data: ArcBorrow<'_, UfsLu>) {}
 
-    fn init_hctx(_tagset_data: (), _hctx_idx: u32) -> Result<Self::HwData> {
-        Ok(())
+    fn init_hctx(_tagset_data: &UfsQueueMap, hctx_idx: u32) -> Result<Self::HwData> {
+        // Remember which hardware queue this context drives, so `poll` can find
+        // the matching backend completion queue.
+        Ok(KBox::new(hctx_idx, GFP_KERNEL)?)
     }
 
     fn complete(rq: ARef<mq::Request<Self>>) {
@@ -399,5 +418,37 @@ impl Operations for UfsLuBlockOps {
             .map_err(|_| EBUSY)
             .expect("rufs: request completion failed")
             .end_ok();
+    }
+
+    fn poll(
+        hw_data: &u32,
+        queue_data: ArcBorrow<'_, UfsLu>,
+        _batch: &mut mq::IoCompletionBatch<Self>,
+    ) -> Result<bool> {
+        Ok(queue_data.queue.poll(*hw_data as usize))
+    }
+
+    fn map_queues(tag_set: Pin<&mut TagSet<Self>>) {
+        let layout = *tag_set.data();
+        let default_queues = layout.default_queues() as u32;
+        let read_queues = layout.read_queues() as u32;
+        let poll_queues = layout.poll_queues() as u32;
+
+        let mut offset = 0;
+        let result = tag_set.update_maps(|mut qmap| {
+            let queue_count = match qmap.kind() {
+                mq::QueueType::Default => default_queues,
+                mq::QueueType::Read => read_queues,
+                mq::QueueType::Poll => poll_queues,
+            };
+            qmap.set_queue_count(queue_count);
+            qmap.set_offset(offset);
+            offset += queue_count;
+            qmap.map_queues();
+        });
+
+        if result.is_err() {
+            pr_err!("[RUFS] ufs_lu: failed to update blk-mq queue maps\n");
+        }
     }
 }

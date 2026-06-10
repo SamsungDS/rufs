@@ -61,6 +61,49 @@ impl UfsHost {
         reg.clear_all_interrupts();
         reg.disable_interrupts();
 
+        let requested_irq_vectors = match ufs_mcq_interrupt_queue_count(&reg)
+            .and_then(|queues| u32::try_from(queues).map_err(|_| EOVERFLOW))
+        {
+            Ok(queues) => queues,
+            Err(e) => {
+                pr_warn!(
+                    "[RUFS] ufs_host: failed to plan MCQ IRQ vectors errno={}, fallback to single shared IRQ\n",
+                    e.to_errno(),
+                );
+                1
+            },
+        };
+        let msi_irq_types = pci::IrqTypes::default()
+            .with(pci::IrqType::MsiX)
+            .with(pci::IrqType::Msi);
+        let irq_vectors = if requested_irq_vectors > 1 {
+            match pdev.alloc_irq_vectors(requested_irq_vectors, requested_irq_vectors, msi_irq_types) {
+                Ok(irq_vectors) => irq_vectors,
+                Err(e) => {
+                    pr_warn!(
+                        "[RUFS] ufs_host: failed to allocate {} MSI/MSI-X IRQ vectors errno={}, fallback to single shared IRQ\n",
+                        requested_irq_vectors,
+                        e.to_errno(),
+                    );
+                    pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?
+                },
+            }
+        } else {
+            pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?
+        };
+        let first_irq_vector = *irq_vectors.start();
+        let allocated_irq_vectors = irq_vectors
+            .end()
+            .index()
+            .checked_sub(first_irq_vector.index())
+            .ok_or(EINVAL)?
+            + 1;
+        pr_info!(
+            "[RUFS] ufs_host: IRQ vectors requested={} allocated={}\n",
+            requested_irq_vectors,
+            allocated_irq_vectors,
+        );
+
         let irq = UfsIrq::new()?;
         let uic = UfsUic::new(reg.clone(), irq.clone())?;
         let queue = UfsQueue::new(
@@ -88,13 +131,10 @@ impl UfsHost {
         fsleep(Delta::from_micros(HBA_ENABLE_DELAY_US));
         host.reg.wait_for_ctrl_enable(1000, 50)?;
 
-        let irq_vectors = pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?;
-        let irq_vector = *irq_vectors.start();
-
         /* ufshcd_link_startup() */
         host.irq.request_uic_irq(
             pdev,
-            irq_vector,
+            first_irq_vector,
             host.reg.clone(),
             host.uic.clone(),
         )?;
@@ -102,12 +142,20 @@ impl UfsHost {
         host.dma.make_hba_operational()?;
 
         /* ufshcd_verify_dev_init */
-        host.irq.request_queue_irq(
+        host.irq.request_queue_irqs(
             pdev,
-            irq_vector,
+            first_irq_vector,
+            allocated_irq_vectors as usize,
             host.reg.clone(),
             host.queue.clone(),
         )?;
+        if allocated_irq_vectors < requested_irq_vectors {
+            pr_info!(
+                "[RUFS] ufs_host: allocated fewer IRQ vectors than requested {}/{}\n",
+                allocated_irq_vectors,
+                requested_irq_vectors,
+            );
+        }
         if host.reg.mcq_supported() {
             match host.queue.enable_mcq_backend(host.reg.clone(), host.dma.clone()) {
                 Ok(()) => {},
@@ -130,18 +178,23 @@ impl UfsHost {
 
     fn alloc_luns(&self) -> Result<()> {
         let num_lu = self.dev.num_lu();
-        let nr_hw_queues = self.queue.nr_hw_queues().max(1);
+        let queue_map = self.queue.queue_map()?;
+        let nr_hw_queues = queue_map.nr_hw_queues();
         let total_block_tags = self.queue.queue_depth().checked_sub(1).ok_or(EINVAL)?;
+        if total_block_tags == 0 {
+            return Err(EINVAL);
+        }
         let hw_queue_depth = total_block_tags / nr_hw_queues;
         if hw_queue_depth == 0 {
             return Err(EINVAL);
         }
+        let num_maps = queue_map.num_maps();
         let tagset = Arc::pin_init(
             TagSet::<UfsLuBlockOps>::new(
                 u32::try_from(nr_hw_queues).map_err(|_| EOVERFLOW)?,
-                (),
+                KBox::new(queue_map, GFP_KERNEL)?,
                 u32::try_from(hw_queue_depth).map_err(|_| EOVERFLOW)?,
-                1,
+                num_maps,
                 kernel::alloc::NumaNode::NO_NODE,
                 kernel::block::mq::tag_set::Flags::default(),
             ),
@@ -160,7 +213,7 @@ impl UfsHost {
                 desc.logical_block_shift(),
                 desc.logical_block_count(),
             )?;
-            let lu = UfsLu::new(self.queue.clone(), lun as u8, geometry)?;
+            let lu = UfsLu::new(self.queue.clone(), lun as u8, geometry, hw_queue_depth)?;
             lu.init_disk(tagset.clone())?;
 
             pr_info!(

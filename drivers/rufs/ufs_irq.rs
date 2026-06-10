@@ -61,7 +61,7 @@ pub(crate) struct UfsIrq {
     #[pin]
     uic: Mutex<Option<Arc<irq::Registration<UfsUicHandler>>>>,
     #[pin]
-    queue: Mutex<Option<Arc<irq::ThreadedRegistration<UfsQueueHandler>>>>,
+    queue: SpinLock<KVec<Arc<irq::ThreadedRegistration<UfsQueueHandler>>>>,
 }
 
 impl UfsIrq {
@@ -69,7 +69,7 @@ impl UfsIrq {
         Arc::pin_init(
             try_pin_init!(Self {
                 uic <- new_mutex!(None),
-                queue <- new_mutex!(None),
+                queue <- new_spinlock!(KVec::new()),
             }), GFP_KERNEL,
         )
     }
@@ -100,8 +100,38 @@ impl UfsIrq {
         Ok(())
     }
 
-    pub(crate) fn request_queue_irq(
+    pub(crate) fn request_queue_irqs(
         &self,
+        pdev: &pci::Device<Core>,
+        first_vector: pci::IrqVector<'_>,
+        nr_vectors: usize,
+        reg: Arc<UfsReg>,
+        queue: Arc<UfsQueue>,
+    ) -> Result<()> {
+        if nr_vectors == 0 {
+            return Err(EINVAL);
+        }
+
+        let mut irqs = KVec::new();
+        let nr_vectors = u32::try_from(nr_vectors).map_err(|_| EOVERFLOW)?;
+        let last_vector = first_vector
+            .index()
+            .checked_add(nr_vectors)
+            .ok_or(EOVERFLOW)?;
+        for index in first_vector.index()..last_vector {
+            // SAFETY: `UfsHost` passes `nr_vectors` from the range returned by
+            // `alloc_irq_vectors()`, so every index in this loop is allocated
+            // for `pdev`.
+            let vector = unsafe { first_vector.from_allocated_index(index) };
+            Self::request_one_queue_irq(&mut irqs, pdev, vector, reg.clone(), queue.clone())?;
+        }
+
+        *self.queue.lock() = irqs;
+        Ok(())
+    }
+
+    fn request_one_queue_irq(
+        irqs: &mut KVec<Arc<irq::ThreadedRegistration<UfsQueueHandler>>>,
         pdev: &pci::Device<Core>,
         vector: pci::IrqVector<'_>,
         reg: Arc<UfsReg>,
@@ -121,13 +151,13 @@ impl UfsIrq {
         );
 
         let irq = Arc::pin_init(irq, GFP_KERNEL)?;
-        self.queue.lock().replace(irq);
+        irqs.push(irq, GFP_KERNEL)?;
 
         Ok(())
     }
 
     pub(crate) fn wake_queue_thread(&self) {
-        let Some(irq) = self.queue.lock().as_ref().map(|irq| irq.clone()) else {
+        let Some(irq) = self.queue.lock().first().map(|irq| irq.clone()) else {
             pr_err!("rufs: queue IRQ thread is not registered\n");
             return;
         };
