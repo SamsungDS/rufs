@@ -44,6 +44,8 @@ pub struct GenDiskBuilder<T> {
     physical_block_size: u32,
     capacity_sectors: u64,
     max_hw_discard_sectors: u32,
+    discard_granularity: u32,
+    max_discard_segments: u16,
     write_cache: bool,
     forced_unit_access: bool,
     max_sectors: u32,
@@ -59,6 +61,8 @@ impl<T> Default for GenDiskBuilder<T> {
             physical_block_size: bindings::PAGE_SIZE as u32,
             capacity_sectors: 0,
             max_hw_discard_sectors: 0,
+            discard_granularity: 0,
+            max_discard_segments: 0,
             write_cache: false,
             forced_unit_access: false,
             max_sectors: 0,
@@ -134,6 +138,27 @@ impl<T: Operations> GenDiskBuilder<T> {
         self
     }
 
+    /// Set the granularity of discard operations, in bytes.
+    ///
+    /// Devices that support discard may internally allocate space in units that
+    /// are bigger than the logical block size. This value indicates the size of
+    /// the internal allocation unit in bytes. The beginning and the size of a
+    /// discard request should be aligned to this granularity for the discard to
+    /// take effect. If 0 is set here, the granularity is set to match the
+    /// physical block size of the device.
+    pub fn discard_granularity(mut self, discard_granularity: u32) -> Self {
+        self.discard_granularity = discard_granularity;
+        self
+    }
+
+    /// Set the maximum number of scatter/gather entries in a discard request.
+    ///
+    /// This is the maximum number of discontiguous ranges the underlying
+    /// hardware device can discard/trim in a single operation.
+    pub fn max_discard_segments(mut self, max_discard_segments: u16) -> Self {
+        self.max_discard_segments = max_discard_segments;
+        self
+    }
     /// Declare that this device supports forced unit access.
     pub fn forced_unit_access(mut self, enable: bool) -> Self {
         self.forced_unit_access = enable;
@@ -179,6 +204,8 @@ impl<T: Operations> GenDiskBuilder<T> {
         lim.logical_block_size = self.logical_block_size;
         lim.physical_block_size = self.physical_block_size;
         lim.max_hw_discard_sectors = self.max_hw_discard_sectors;
+        lim.discard_granularity = self.discard_granularity;
+        lim.max_discard_segments = self.max_discard_segments;
         lim.max_sectors = self.max_sectors;
         lim.virt_boundary_mask = self.virt_boundary_mask;
         if self.rotational {
