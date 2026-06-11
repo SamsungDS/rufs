@@ -6,7 +6,11 @@
 
 use crate::{
     bindings,
-    prelude::*, //
+    prelude::*,
+    ptr::{
+        Alignment,
+        KnownSize, //
+    }, //
 };
 
 #[cfg(CONFIG_HAS_IOMEM)]
@@ -31,6 +35,58 @@ pub type PhysAddr = bindings::phys_addr_t;
 /// This is a type alias to either `u32` or `u64` depending on the config option
 /// `CONFIG_PHYS_ADDR_T_64BIT`, and it can be a u64 even on 32-bit architectures.
 pub type ResourceSize = bindings::resource_size_t;
+
+/// Untyped I/O region.
+///
+/// This type can be used when an I/O region without known type information has a compile-time known
+/// minimum size (and a runtime known actual size).
+///
+/// This must be 4-byte aligned.
+///
+/// # Invariants
+///
+/// Size of the region is at least as large as the `SIZE` generic parameter.
+#[repr(C, align(4))]
+pub struct Region<const SIZE: usize = 0> {
+    inner: [u8],
+}
+
+impl<const SIZE: usize> Region<SIZE> {
+    /// Create a raw mutable pointer from given base address and size.
+    ///
+    /// `size` should be at least as large as the minimum size `SIZE`, and `base` and `size` should
+    /// be 4-byte aligned to uphold the type invariant.
+    ///
+    /// Just like other methods on raw pointers, it is not unsafe to create a raw pointer
+    /// that does not uphold the type invariants. However such pointers are not valid.
+    #[inline]
+    pub fn ptr_from_raw_parts_mut(base: *mut u8, size: usize) -> *mut Self {
+        core::ptr::slice_from_raw_parts_mut(base, size) as *mut Region<SIZE>
+    }
+
+    /// Create a raw mutable pointer from given base address and size.
+    ///
+    /// The alignment of `base` is checked, and `size` is checked against the minimum size specified
+    /// via const generics.
+    #[inline]
+    pub fn ptr_try_from_raw_parts_mut(base: *mut u8, size: usize) -> Result<*mut Self> {
+        if size < SIZE || base.align_offset(4) != 0 || !size.is_multiple_of(4) {
+            return Err(EINVAL);
+        }
+
+        Ok(Self::ptr_from_raw_parts_mut(base, size))
+    }
+}
+
+impl<const SIZE: usize> KnownSize for Region<SIZE> {
+    const MIN_SIZE: usize = SIZE;
+    const MIN_ALIGN: Alignment = Alignment::new::<4>();
+
+    #[inline(always)]
+    fn size(p: *const Self) -> usize {
+        (p as *const [u8]).len()
+    }
+}
 
 /// Raw representation of an MMIO region.
 ///
@@ -87,7 +143,6 @@ impl<const SIZE: usize> MmioRaw<SIZE> {
 ///     ffi::c_void,
 ///     io::{
 ///         Io,
-///         IoKnownSize,
 ///         Mmio,
 ///         MmioRaw,
 ///         PhysAddr,
@@ -243,11 +298,24 @@ impl_usize_ioloc!(u8, u16, u32, u64);
 /// For MMIO regions, all widths (u8, u16, u32, and u64 on 64-bit systems) are typically
 /// supported. For PCI configuration space, u8, u16, and u32 are supported but u64 is not.
 pub trait Io {
+    /// Type of this I/O region. For untyped regions, [`Region`] can be used.
+    type Target: ?Sized + KnownSize;
+
     /// Returns the base address of this mapping.
     fn addr(&self) -> usize;
 
     /// Returns the maximum size of this mapping.
     fn maxsize(&self) -> usize;
+
+    /// Returns the absolute I/O address for a given `offset`,
+    /// performing compile-time bound checks.
+    // Always inline to optimize out error path of `build_assert`.
+    #[inline(always)]
+    fn io_addr_assert<U>(&self, offset: usize) -> usize {
+        build_assert!(offset_valid::<U>(offset, Self::Target::MIN_SIZE));
+
+        self.addr() + offset
+    }
 
     /// Returns the absolute I/O address for a given `offset`,
     /// performing runtime bound checks.
@@ -338,7 +406,7 @@ pub trait Io {
     #[inline(always)]
     fn read8(&self, offset: usize) -> u8
     where
-        Self: IoKnownSize + IoCapable<u8>,
+        Self: IoCapable<u8>,
     {
         self.read(offset)
     }
@@ -347,7 +415,7 @@ pub trait Io {
     #[inline(always)]
     fn read16(&self, offset: usize) -> u16
     where
-        Self: IoKnownSize + IoCapable<u16>,
+        Self: IoCapable<u16>,
     {
         self.read(offset)
     }
@@ -356,7 +424,7 @@ pub trait Io {
     #[inline(always)]
     fn read32(&self, offset: usize) -> u32
     where
-        Self: IoKnownSize + IoCapable<u32>,
+        Self: IoCapable<u32>,
     {
         self.read(offset)
     }
@@ -365,7 +433,7 @@ pub trait Io {
     #[inline(always)]
     fn read64(&self, offset: usize) -> u64
     where
-        Self: IoKnownSize + IoCapable<u64>,
+        Self: IoCapable<u64>,
     {
         self.read(offset)
     }
@@ -374,7 +442,7 @@ pub trait Io {
     #[inline(always)]
     fn write8(&self, value: u8, offset: usize)
     where
-        Self: IoKnownSize + IoCapable<u8>,
+        Self: IoCapable<u8>,
     {
         self.write(offset, value)
     }
@@ -383,7 +451,7 @@ pub trait Io {
     #[inline(always)]
     fn write16(&self, value: u16, offset: usize)
     where
-        Self: IoKnownSize + IoCapable<u16>,
+        Self: IoCapable<u16>,
     {
         self.write(offset, value)
     }
@@ -392,7 +460,7 @@ pub trait Io {
     #[inline(always)]
     fn write32(&self, value: u32, offset: usize)
     where
-        Self: IoKnownSize + IoCapable<u32>,
+        Self: IoCapable<u32>,
     {
         self.write(offset, value)
     }
@@ -401,7 +469,7 @@ pub trait Io {
     #[inline(always)]
     fn write64(&self, value: u64, offset: usize)
     where
-        Self: IoKnownSize + IoCapable<u64>,
+        Self: IoCapable<u64>,
     {
         self.write(offset, value)
     }
@@ -584,7 +652,7 @@ pub trait Io {
     fn read<T, L>(&self, location: L) -> T
     where
         L: IoLoc<T>,
-        Self: IoKnownSize + IoCapable<L::IoType>,
+        Self: IoCapable<L::IoType>,
     {
         let address = self.io_addr_assert::<L::IoType>(location.offset());
 
@@ -616,7 +684,7 @@ pub trait Io {
     fn write<T, L>(&self, location: L, value: T)
     where
         L: IoLoc<T>,
-        Self: IoKnownSize + IoCapable<L::IoType>,
+        Self: IoCapable<L::IoType>,
     {
         let address = self.io_addr_assert::<L::IoType>(location.offset());
         let io_value = value.into();
@@ -660,7 +728,7 @@ pub trait Io {
     where
         L: IoLoc<T>,
         V: LocatedRegister<Location = L, Value = T>,
-        Self: IoKnownSize + IoCapable<L::IoType>,
+        Self: IoCapable<L::IoType>,
     {
         let (location, value) = value.into_io_op();
 
@@ -692,7 +760,7 @@ pub trait Io {
     fn update<T, L, F>(&self, location: L, f: F)
     where
         L: IoLoc<T>,
-        Self: IoKnownSize + IoCapable<L::IoType> + Sized,
+        Self: IoCapable<L::IoType> + Sized,
         F: FnOnce(T) -> T,
     {
         let address = self.io_addr_assert::<L::IoType>(location.offset());
@@ -703,28 +771,6 @@ pub trait Io {
 
         // SAFETY: `address` has been validated by `io_addr_assert`.
         unsafe { self.io_write(io_value, address) }
-    }
-}
-
-/// Trait for types with a known size at compile time.
-///
-/// This trait is implemented by I/O backends that have a compile-time known size,
-/// enabling the use of infallible I/O accessors with compile-time bounds checking.
-///
-/// Types implementing this trait can use the infallible methods in [`Io`] trait
-/// (e.g., `read8`, `write32`), which require `Self: IoKnownSize` bound.
-pub trait IoKnownSize: Io {
-    /// Minimum usable size of this region.
-    const MIN_SIZE: usize;
-
-    /// Returns the absolute I/O address for a given `offset`,
-    /// performing compile-time bound checks.
-    // Always inline to optimize out error path of `build_assert`.
-    #[inline(always)]
-    fn io_addr_assert<U>(&self, offset: usize) -> usize {
-        build_assert!(offset_valid::<U>(offset, Self::MIN_SIZE));
-
-        self.addr() + offset
     }
 }
 
@@ -760,6 +806,8 @@ impl_mmio_io_capable!(
 );
 
 impl<const SIZE: usize> Io for Mmio<SIZE> {
+    type Target = Region<SIZE>;
+
     /// Returns the base address of this mapping.
     #[inline]
     fn addr(&self) -> usize {
@@ -771,10 +819,6 @@ impl<const SIZE: usize> Io for Mmio<SIZE> {
     fn maxsize(&self) -> usize {
         self.0.maxsize()
     }
-}
-
-impl<const SIZE: usize> IoKnownSize for Mmio<SIZE> {
-    const MIN_SIZE: usize = SIZE;
 }
 
 impl<const SIZE: usize> Mmio<SIZE> {
@@ -800,6 +844,8 @@ impl<const SIZE: usize> Mmio<SIZE> {
 pub struct RelaxedMmio<const SIZE: usize = 0>(Mmio<SIZE>);
 
 impl<const SIZE: usize> Io for RelaxedMmio<SIZE> {
+    type Target = Region<SIZE>;
+
     #[inline]
     fn addr(&self) -> usize {
         self.0.addr()
@@ -809,10 +855,6 @@ impl<const SIZE: usize> Io for RelaxedMmio<SIZE> {
     fn maxsize(&self) -> usize {
         self.0.maxsize()
     }
-}
-
-impl<const SIZE: usize> IoKnownSize for RelaxedMmio<SIZE> {
-    const MIN_SIZE: usize = SIZE;
 }
 
 impl<const SIZE: usize> Mmio<SIZE> {
