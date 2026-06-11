@@ -42,6 +42,7 @@ pub struct GenDiskBuilder<T> {
     max_hw_discard_sectors: u32,
     discard_granularity: u32,
     max_discard_segments: u16,
+    queue_depth: u32,
     _p: PhantomData<T>,
 }
 
@@ -55,6 +56,7 @@ impl<T> Default for GenDiskBuilder<T> {
             max_hw_discard_sectors: 0,
             discard_granularity: 0,
             max_discard_segments: 0,
+            queue_depth: 0,
             _p: PhantomData,
         }
     }
@@ -147,6 +149,19 @@ impl<T: Operations> GenDiskBuilder<T> {
         self.max_discard_segments = max_discard_segments;
         self
     }
+
+    /// Set the request queue depth for the device to be built.
+    ///
+    /// Rejects a depth of zero, which is not a valid queue depth. Leaving this
+    /// unset preserves the tag-set default.
+    pub fn queue_depth(mut self, depth: u32) -> Result<Self> {
+        if depth == 0 {
+            return Err(EINVAL);
+        }
+
+        self.queue_depth = depth;
+        Ok(self)
+    }
     /// Build a new `GenDisk` and add it to the VFS.
     pub fn build(
         self,
@@ -183,6 +198,11 @@ impl<T: Operations> GenDiskBuilder<T> {
 
         // SAFETY: `gendisk` is a valid pointer as we initialized it above
         unsafe { (*gendisk).fops = Self::build_vtable() };
+
+        if self.queue_depth != 0 {
+            // SAFETY: `gendisk` and its request queue are initialized.
+            unsafe { bindings::blk_set_queue_depth((*gendisk).queue, self.queue_depth) };
+        }
 
         let cleanup_failure = ScopeGuard::new_with_data((gendisk, data), |(gendisk, data)| {
             // SAFETY: `gendisk` came from `__blk_mq_alloc_disk()` above and
