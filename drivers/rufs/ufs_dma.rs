@@ -13,6 +13,7 @@ use crate::ufs_dev::*;
 
 const PRDT_DATA_BYTE_COUNT_MAX: u32 = 0x00040000; // SZ_256K
 const PRDT_DATA_BYTE_COUNT_PAD: usize = 4;
+const UNMAP_PARAM_LIST_SIZE: usize = 24;
 const ALIGNED_UPIU_SIZE: usize = 512;
 const MAX_PRD_ENTRIES: usize = 256;
 const UFS_CDB_SIZE: usize = 16;
@@ -1269,19 +1270,35 @@ pub(crate) struct UfsDma {
 // SAFETY: UfsDma itself doesn't have any thread-affinity
 unsafe impl Send for UfsDma {}
 
-pub(crate) struct UfsPrdtMapping {
+pub(crate) enum UfsPrdtMapping {
+    Sg(UfsSgMapping),
+    Unmap(UfsUnmapMapping),
+}
+
+pub(crate) struct UfsSgMapping {
     dev: ARef<device::Device>,
     sg: KVec<bindings::scatterlist>,
     nents: i32,
     dma_dir: bindings::dma_data_direction,
 }
 
+pub(crate) struct UfsUnmapMapping {
+    dev: ARef<device::Device>,
+    cpu_addr: core::ptr::NonNull<u8>,
+    dma_addr: dma::DmaAddress,
+}
+
+// SAFETY: `UfsUnmapMapping` owns a DMA allocation associated with a refcounted
+// device and only frees it on drop. Moving the owner between threads does not
+// expose shared mutable access to the allocation.
+unsafe impl Send for UfsUnmapMapping {}
+
 struct UfsPrdt {
     mapping: Option<UfsPrdtMapping>,
     entries: KVec<PrdEntry>,
 }
 
-impl Drop for UfsPrdtMapping {
+impl Drop for UfsSgMapping {
     fn drop(&mut self) {
         // SAFETY: `sg` was mapped by `dma_map_sg_attrs` with this device,
         // entry count, direction, and attributes.
@@ -1291,6 +1308,22 @@ impl Drop for UfsPrdtMapping {
                 self.sg.as_mut_ptr(),
                 self.nents,
                 self.dma_dir,
+                0,
+            )
+        };
+    }
+}
+
+impl Drop for UfsUnmapMapping {
+    fn drop(&mut self) {
+        // SAFETY: `cpu_addr` and `dma_addr` were returned by `dma_alloc_attrs`
+        // for this device and size, and this object owns that allocation.
+        unsafe {
+            bindings::dma_free_attrs(
+                self.dev.as_raw(),
+                UNMAP_PARAM_LIST_SIZE,
+                self.cpu_addr.as_ptr().cast(),
+                self.dma_addr,
                 0,
             )
         };
@@ -1424,11 +1457,15 @@ impl UfsDma {
             });
         }
 
-        if rq.is_null() {
+        if tag >= self.reg.nutrs() {
             return Err(EINVAL);
         }
 
-        if tag >= self.reg.nutrs() {
+        if cmd.is_unmap() {
+            return self.map_unmap_prdt(cmd);
+        }
+
+        if rq.is_null() {
             return Err(EINVAL);
         }
 
@@ -1474,7 +1511,7 @@ impl UfsDma {
             return Err(ENOMEM);
         }
 
-        let mut mapping = UfsPrdtMapping {
+        let mut mapping = UfsSgMapping {
             dev: self.dev.clone(),
             sg,
             nents,
@@ -1509,7 +1546,65 @@ impl UfsDma {
         }
 
         Ok(UfsPrdt {
-            mapping: Some(mapping),
+            mapping: Some(UfsPrdtMapping::Sg(mapping)),
+            entries,
+        })
+    }
+
+    fn map_unmap_prdt(&self, cmd: UfsSCSICmd) -> Result<UfsPrdt> {
+        if cmd.unmap_blocks() == 0 {
+            return Err(EINVAL);
+        }
+
+        let mut data = [0u8; UNMAP_PARAM_LIST_SIZE];
+        let mut dma_addr = 0;
+
+        data[0..2].copy_from_slice(&22u16.to_be_bytes());
+        data[2..4].copy_from_slice(&16u16.to_be_bytes());
+        data[8..16].copy_from_slice(&cmd.unmap_lba().to_be_bytes());
+        data[16..20].copy_from_slice(&cmd.unmap_blocks().to_be_bytes());
+
+        // SAFETY: `self.dev` is a valid DMA device. The returned allocation is
+        // owned by `UfsUnmapMapping` and freed in its `Drop` implementation.
+        let cpu_addr = unsafe {
+            bindings::dma_alloc_attrs(
+                self.dev.as_raw(),
+                UNMAP_PARAM_LIST_SIZE,
+                &mut dma_addr,
+                bindings::GFP_KERNEL,
+                0,
+            )
+        };
+        let cpu_addr = core::ptr::NonNull::new(cpu_addr.cast::<u8>()).ok_or(ENOMEM)?;
+
+        // SAFETY: `cpu_addr` points to a DMA allocation of
+        // `UNMAP_PARAM_LIST_SIZE` bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                cpu_addr.as_ptr(),
+                UNMAP_PARAM_LIST_SIZE,
+            )
+        };
+
+        let mapping = UfsUnmapMapping {
+            dev: self.dev.clone(),
+            cpu_addr,
+            dma_addr,
+        };
+
+        let mut entries = KVec::with_capacity(1, GFP_KERNEL)?;
+        entries.push(
+            PrdEntry {
+                addr: mapping.dma_addr.to_le(),
+                reserved: 0,
+                size: ((UNMAP_PARAM_LIST_SIZE as u32) - 1).to_le(),
+            },
+            GFP_KERNEL,
+        )?;
+
+        Ok(UfsPrdt {
+            mapping: Some(UfsPrdtMapping::Unmap(mapping)),
             entries,
         })
     }

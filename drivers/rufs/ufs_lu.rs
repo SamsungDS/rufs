@@ -16,6 +16,7 @@ use kernel::{new_mutex, new_spinlock, prelude::*};
 use crate::ufs_queue::*;
 
 const SECTOR_SIZE_U64: u64 = SECTOR_SIZE as u64;
+const MAX_DISCARD_SEGMENTS: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UfsLuState {
@@ -102,6 +103,10 @@ impl UfsLuGeometry {
         self.capacity_blocks.checked_mul(self.sectors_per_block)
     }
 
+    pub(crate) fn max_discard_sectors(&self) -> u32 {
+        u32::MAX - (u32::MAX % self.sectors_per_block as u32)
+    }
+
     pub(crate) fn sectors_to_logical(&self, sectors: u64) -> u64 {
         sectors / self.sectors_per_block
     }
@@ -151,6 +156,9 @@ impl UfsLu {
         let disk = GenDiskBuilder::new()
             .logical_block_size(self.geometry.logical_block_size())?
             .physical_block_size(self.geometry.physical_block_size())?
+            .max_hw_discard_sectors(self.geometry.max_discard_sectors())
+            .discard_granularity(self.geometry.logical_block_size())
+            .max_discard_segments(MAX_DISCARD_SEGMENTS)
             .capacity_sectors(capacity_sectors)
             .build(fmt!("ufs{}", self.lun), tagset, self.clone())?;
 
@@ -201,7 +209,9 @@ impl UfsLu {
                 Ok(UfsSCSICmd::read_write(self.lun, true, lba, blocks, data_len, false))
             }
             bindings::req_op_REQ_OP_FLUSH => Ok(UfsSCSICmd::flush(self.lun)),
-            bindings::req_op_REQ_OP_DISCARD => Ok(UfsSCSICmd::unmap(self.lun, 24)),
+            bindings::req_op_REQ_OP_DISCARD => {
+                Ok(UfsSCSICmd::unmap(self.lun, lba, blocks))
+            }
             _ => Err(ENOTSUPP),
         }
     }
@@ -294,14 +304,49 @@ impl Operations for UfsLuBlockOps {
                 lu.build_scsi_cmd(op, 0, 0)?
             }
             bindings::req_op_REQ_OP_DISCARD => {
-                pr_warn!(
-                    "[RUFS] ufs_lu: discard request is not supported yet on LU {} sector={} sectors={}\n",
+                if sectors == 0 {
+                    pr_debug!("[RUFS] ufs_lu: zero-length discard on LU {}\n", lu.lun());
+                    rq.start().end_ok();
+                    return Ok(());
+                }
+
+                if sector.checked_add(u64::from(sectors)).ok_or(EINVAL)?
+                    > geometry.capacity_sectors().ok_or(EOVERFLOW)?
+                {
+                    pr_warn!(
+                        "[RUFS] ufs_lu: discard exceeds LU {} capacity sector={} sectors={}\n",
+                        lu.lun(),
+                        sector,
+                        sectors,
+                    );
+                    rq.start().end(bindings::BLK_STS_INVAL as u8);
+                    return Ok(());
+                }
+
+                if (sector & mask) != 0 || (u64::from(sectors) & mask) != 0 {
+                    pr_warn!(
+                        "[RUFS] ufs_lu: unaligned discard on LU {} sector={} sectors={} spb={}\n",
+                        lu.lun(),
+                        sector,
+                        sectors,
+                        geometry.sectors_per_block(),
+                    );
+                    rq.start().end(bindings::BLK_STS_INVAL as u8);
+                    return Ok(());
+                }
+
+                let lba = geometry.sectors_to_logical(sector);
+                let blocks = geometry.sectors_to_logical(u64::from(sectors));
+                let cmd = lu.build_scsi_cmd(op, lba, blocks)?;
+
+                pr_debug!(
+                    "[RUFS] ufs_lu: discard LU {} lba={} blocks={}\n",
                     lu.lun(),
-                    sector,
-                    sectors,
+                    lba,
+                    blocks,
                 );
-                rq.start().end(bindings::BLK_STS_NOTSUPP as u8);
-                return Ok(());
+
+                cmd
             }
             _ => {
                 pr_warn!(

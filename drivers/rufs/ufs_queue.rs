@@ -115,6 +115,8 @@ pub(crate) struct UfsSCSICmd {
     direction: UfsScsiDataDirection,
     data_len: u32,
     cdb: [u8; 16],
+    unmap_lba: u64,
+    unmap_blocks: u32,
 }
 
 impl UfsSCSICmd {
@@ -151,6 +153,8 @@ impl UfsSCSICmd {
             direction,
             data_len,
             cdb,
+            unmap_lba: 0,
+            unmap_blocks: 0,
         }
     }
 
@@ -163,19 +167,24 @@ impl UfsSCSICmd {
             direction: UfsScsiDataDirection::None,
             data_len: 0,
             cdb,
+            unmap_lba: 0,
+            unmap_blocks: 0,
         }
     }
 
-    pub(crate) fn unmap(lun: u8, data_len: u32) -> Self {
+    pub(crate) fn unmap(lun: u8, lba: u64, blocks: u32) -> Self {
         let mut cdb = [0u8; 16];
+        let data_len = 24u32;
         cdb[0] = UNMAP;
-        cdb[8] = data_len as u8;
+        cdb[7..9].copy_from_slice(&(data_len as u16).to_be_bytes());
 
         Self {
             lun,
             direction: UfsScsiDataDirection::Write,
             data_len,
             cdb,
+            unmap_lba: lba,
+            unmap_blocks: blocks,
         }
     }
 
@@ -193,6 +202,18 @@ impl UfsSCSICmd {
 
     pub(crate) fn cdb(&self) -> [u8; 16] {
         self.cdb
+    }
+
+    pub(crate) fn is_unmap(&self) -> bool {
+        self.cdb[0] == UNMAP
+    }
+
+    pub(crate) fn unmap_lba(&self) -> u64 {
+        self.unmap_lba
+    }
+
+    pub(crate) fn unmap_blocks(&self) -> u32 {
+        self.unmap_blocks
     }
 
 }
