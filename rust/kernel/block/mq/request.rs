@@ -154,6 +154,13 @@ impl<T: Operations> RequestInner<T> {
         unsafe { (*self.0.get()).__data_len }
     }
 
+    /// Get the blk-mq tag for this request.
+    #[inline(always)]
+    pub fn tag(&self) -> i32 {
+        // SAFETY: By type invariant of `Self`, `self.0` is valid and live.
+        unsafe { (*self.0.get()).tag }
+    }
+
     /// Borrow the queue data from the request queue associated with this request.
     pub fn queue_data(&self) -> <T::QueueData as ForeignOwnable>::Borrowed<'_> {
         // SAFETY: By type invariants of `Request`, `self.0` is a valid request.
