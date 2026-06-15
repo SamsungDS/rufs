@@ -1069,9 +1069,11 @@ impl UfsRequest {
         let prdt = match self.queue.compose_scsi(cmd, self.tag, &block_rq) {
             Ok(prdt) => prdt,
             Err(e) => {
-                self.clear();
+                // Keep the stored block request so the submitter can reclaim it
+                // and hand it back to the block layer.
+                self.clear_keep_block_request();
                 return Err(e);
-            },
+            }
         };
 
         let mut inner = self.inner.lock();
@@ -1096,7 +1098,9 @@ impl UfsRequest {
         }
 
         if let Err(e) = self.compose_scsi_cmd(cmd) {
-            self.clear();
+            // Keep the stored block request so the submitter can reclaim it and
+            // hand it back to the block layer.
+            self.clear_keep_block_request();
             return Err(e);
         }
 
@@ -1116,9 +1120,13 @@ impl UfsRequest {
 
         match result {
             Err(e) => {
-                self.clear();
+                // Reset the slot but keep the stored block request in place, so
+                // the submitter can reclaim and complete it. For device
+                // commands there is no block request and this is equivalent to
+                // a full `clear`.
+                self.clear_keep_block_request();
                 Err(e)
-            },
+            }
             Ok(()) => {
                 self.inner.lock().state = RequestState::Submitted;
                 if self.queue.request_completed(self.tag) {
@@ -1213,6 +1221,24 @@ impl UfsRequest {
         inner.scsi_completion = None;
         inner.cmd = None;
         inner.state = RequestState::Idle;
+    }
+
+    // Reset the slot to idle but leave the stored block request in place. Used
+    // when submission fails: the block request reference must be handed back to
+    // the submitter rather than dropped here.
+    fn clear_keep_block_request(&self) {
+        let mut inner = self.inner.lock();
+        inner.prdt = None;
+        inner.hw_queue = None;
+        inner.scsi_completion = None;
+        inner.cmd = None;
+        inner.state = RequestState::Idle;
+    }
+
+    // Take the stored block request out of the slot, if any. The caller becomes
+    // responsible for completing it.
+    pub(crate) fn take_block_request(&self) -> Option<ARef<mq::Request<UfsLuBlockOps>>> {
+        self.inner.lock().block_rq.take()
     }
 
     fn timeout(&self) -> bool {
@@ -1833,19 +1859,12 @@ impl UfsQueue {
         // Take exclusive ownership so the request can be handed back to the
         // block layer. If other references are still outstanding, return the
         // request so the caller can retry the completion later.
-        let rq = match OwnableRefCounted::try_from_shared(rq) {
-            Ok(rq) => rq,
-            Err(rq) => return Err(rq),
-        };
+        let rq = OwnableRefCounted::try_from_shared(rq)
+            .map_err(|_e| kernel::error::code::EIO)
+            .expect("Failed to complete request");
 
         if requeue {
-            // Hand the started request back to the block layer for a retry. The
-            // block layer takes ownership, so forget our reference.
-            let ptr = rq.as_raw();
-            core::mem::forget(rq);
-            // SAFETY: `ptr` came from a request we owned exclusively, and
-            // forgetting the `Owned` transfers ownership to the requeue path.
-            unsafe { bindings::blk_mq_requeue_request(ptr, true) };
+            rq.requeue(true);
         } else {
             rq.end(status as u8);
         }

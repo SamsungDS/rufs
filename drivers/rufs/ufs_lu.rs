@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use kernel::block::{
-    error::BlkResult,
+    error::{code, BlkResult},
     mq::{self, gen_disk::GenDisk, gen_disk::GenDiskBuilder, IdleRequest, Operations, TagSet},
     SECTOR_SIZE,
 };
@@ -230,17 +230,9 @@ impl UfsLu {
         }
     }
 
-    fn compose_request(
-        &self,
-        hw_queue: usize,
-        tag: usize,
-        cmd: UfsSCSICmd,
-        rq: &ARef<mq::Request<UfsLuBlockOps>>,
-    ) -> Result<Arc<UfsRequest>> {
+    fn acquire_request(&self, hw_queue: usize, tag: usize) -> Result<Arc<UfsRequest>> {
         let tag = self.global_tag(hw_queue, tag)?;
-        let request = self.queue.acquire(tag)?;
-        request.compose_block_request(rq.clone(), cmd, hw_queue)?;
-        Ok(request)
+        self.queue.acquire(tag)
     }
 
     fn global_tag(&self, hw_queue: usize, tag: usize) -> Result<usize> {
@@ -277,6 +269,27 @@ impl UfsLu {
 }
 
 pub(crate) struct UfsLuBlockOps;
+
+// Hand a request that never reached the device back to the block layer.
+//
+// The request reference is still held by the slot, so reclaim it and complete
+// it once. Because the command was not submitted, no completion can race for
+// the request.
+fn complete_unsubmitted(request: &Arc<UfsRequest>, e: Error) {
+    let Some(rq) = request.take_block_request() else {
+        return;
+    };
+
+    let rq = OwnableRefCounted::try_from_shared(rq)
+        .map_err(|_e| kernel::error::code::EIO)
+        .expect("Failed to complete request");
+
+    if e == EBUSY {
+        rq.requeue(true);
+    } else {
+        rq.end(bindings::BLK_STS_IOERR as u8);
+    }
+}
 
 #[vtable]
 impl Operations for UfsLuBlockOps {
@@ -408,30 +421,35 @@ impl Operations for UfsLuBlockOps {
             }
         };
 
-        // Convert the request into a shared reference and keep it with the
-        // hardware command, so the completion path can hand it back to the
-        // block layer once the command finishes.
+        // Resolve the request slot for this tag before taking shared ownership
+        // of the block request. While the request is still an `IdleRequest` it
+        // is owned by the block layer (refcount zero), so a not-yet-recycled
+        // slot can be handed back to the block layer without leaking a
+        // reference.
+        //
+        // The completion path frees the blk-mq tag (allowing this tag to be
+        // dispatched again) just before it resets the slot to idle, so a fresh
+        // dispatch can briefly observe the slot as still busy. Signal that with
+        // `BLK_STS_DEV_RESOURCE` so the block layer retries, rather than
+        // converting the busy error into `BLK_STS_IOERR` through `?`.
+        let request = match lu.acquire_request(hw_queue, tag) {
+            Ok(request) => request,
+            Err(e) if e == EBUSY => return Err(code::BLK_STS_DEV_RESOURCE),
+            Err(e) => return Err(e.into()),
+        };
+
+        // From here the driver takes shared ownership of the request and is
+        // responsible for completing it exactly once. The completion path
+        // reclaims unique ownership of this single reference, so the driver
+        // must never keep a second one while the command is in flight.
         let rq = OwnableRefCounted::into_shared(rq.start());
-        let request = lu.compose_request(hw_queue, tag, cmd, &rq)?;
+        if let Err(e) = request.compose_block_request(rq, cmd, hw_queue) {
+            complete_unsubmitted(&request, e);
+            return Ok(());
+        }
 
         if let Err(e) = request.submit() {
-            // `submit` dropped the request reference it stored, so we hold the
-            // only one and can dispose of it here.
-            let rq = match OwnableRefCounted::try_from_shared(rq) {
-                Ok(rq) => rq,
-                Err(_) => return Ok(()),
-            };
-
-            if e == EBUSY {
-                // The hardware queue is full; requeue the request for a retry.
-                let ptr = rq.as_raw();
-                core::mem::forget(rq);
-                // SAFETY: `ptr` came from a request we owned exclusively, and
-                // forgetting the `Owned` transfers ownership to the requeue path.
-                unsafe { bindings::blk_mq_requeue_request(ptr, true) };
-            } else {
-                rq.end(bindings::BLK_STS_IOERR as u8);
-            }
+            complete_unsubmitted(&request, e);
         }
 
         Ok(())
