@@ -103,8 +103,11 @@ impl UfsLuGeometry {
         self.capacity_blocks.checked_mul(self.sectors_per_block)
     }
 
-    pub(crate) fn max_discard_sectors(&self) -> u32 {
-        u32::MAX - (u32::MAX % self.sectors_per_block as u32)
+    pub(crate) fn max_discard_sectors(&self) -> Result<u32> {
+        let sectors_per_block = u32::try_from(self.sectors_per_block).map_err(|_| EOVERFLOW)?;
+        let remainder = u32::MAX.checked_rem(sectors_per_block).ok_or(EINVAL)?;
+
+        u32::MAX.checked_sub(remainder).ok_or(EOVERFLOW)
     }
 
     pub(crate) fn sectors_to_logical(&self, sectors: u64) -> u64 {
@@ -166,7 +169,7 @@ impl UfsLu {
         let disk = GenDiskBuilder::new()
             .logical_block_size(self.geometry.logical_block_size())?
             .physical_block_size(self.geometry.physical_block_size())?
-            .max_hw_discard_sectors(self.geometry.max_discard_sectors())
+            .max_hw_discard_sectors(self.geometry.max_discard_sectors()?)
             .discard_granularity(self.geometry.logical_block_size())
             .max_discard_segments(MAX_DISCARD_SEGMENTS)
             .queue_depth(u32::try_from(self.queue_depth).map_err(|_| EOVERFLOW)?)?

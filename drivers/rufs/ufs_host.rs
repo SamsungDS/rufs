@@ -182,10 +182,10 @@ impl UfsHost {
         let queue_map = self.queue.queue_map()?;
         let nr_hw_queues = queue_map.nr_hw_queues();
         let total_block_tags = self.queue.queue_depth().checked_sub(1).ok_or(EINVAL)?;
-        if total_block_tags == 0 {
+        if total_block_tags == 0 || nr_hw_queues == 0 {
             return Err(EINVAL);
         }
-        let hw_queue_depth = total_block_tags / nr_hw_queues;
+        let hw_queue_depth = total_block_tags.checked_div(nr_hw_queues).ok_or(EINVAL)?;
         if hw_queue_depth == 0 {
             return Err(EINVAL);
         }
@@ -202,11 +202,14 @@ impl UfsHost {
             GFP_KERNEL,
         )?;
         let mut luns = self.luns.lock();
+        let mut lun = 0;
 
-        for lun in 0..num_lu {
-            let desc = self.dev.read_unit_desc(lun as u8)?;
+        while lun < num_lu {
+            let lun_id = u8::try_from(lun).map_err(|_| EOVERFLOW)?;
+            let desc = self.dev.read_unit_desc(lun_id)?;
 
             if !desc.enabled() {
+                lun = lun.checked_add(1).ok_or(EOVERFLOW)?;
                 continue;
             }
 
@@ -220,7 +223,7 @@ impl UfsHost {
             };
             let lu = UfsLu::new(
                 self.queue.clone(),
-                lun as u8,
+                lun_id,
                 geometry,
                 hw_queue_depth,
                 lu_queue_depth,
@@ -236,6 +239,7 @@ impl UfsHost {
             );
 
             luns.push(lu, GFP_KERNEL)?;
+            lun = lun.checked_add(1).ok_or(EOVERFLOW)?;
         }
 
         Ok(())
