@@ -5,8 +5,9 @@
 
 use kernel::block::mq;
 use kernel::cpu;
-use kernel::{bindings, prelude::*, kvec, new_mutex, new_spinlock};
-use kernel::sync::{barrier, Arc, Completion, Mutex, SpinLock};
+use kernel::{bindings, prelude::*, kvec, new_spinlock};
+use kernel::sync::atomic::{Atomic, Relaxed};
+use kernel::sync::{barrier, Arc, Completion, SpinLock};
 use kernel::types::{ARef, OwnableRefCounted};
 use crate::ufs_reg::*;
 use crate::ufs_dma::*;
@@ -427,7 +428,7 @@ struct SdbTransferBackend {
 #[pin_data]
 struct McqQueueSet {
     #[pin]
-    queues: Mutex<Option<KVec<UfsMcqQueue>>>,
+    queues: SpinLock<Option<KVec<UfsMcqQueue>>>,
 
     #[pin]
     completed: SpinLock<KVec<Option<CqEntry>>>,
@@ -436,7 +437,7 @@ struct McqQueueSet {
 impl McqQueueSet {
     fn new(completed: KVec<Option<CqEntry>>) -> impl PinInit<Self> {
         pin_init!(Self {
-            queues <- new_mutex!(None),
+            queues <- new_spinlock!(None),
             completed <- new_spinlock!(completed),
         })
     }
@@ -1345,6 +1346,8 @@ pub(crate) struct UfsQueue {
     #[pin]
     backend: SpinLock<UfsTransferBackend>,
 
+    cached_queue_depth: Atomic<usize>,
+
     #[pin]
     slot: SpinLock<KVec<Option<Arc<UfsRequest>>>>,
 
@@ -1369,16 +1372,37 @@ impl UfsQueue {
         // reports the tag range that is legal for that transport.
         let slot = kvec![None; dma.transfer_slots()]?;
         let backend = UfsTransferBackend::sdb(reg, dma);
+        let queue_depth = backend.queue_depth();
 
-        Arc::pin_init(
+        let queue = Arc::pin_init(
             try_pin_init!(Self {
                 irq,
                 backend <- new_spinlock!(backend),
+                cached_queue_depth: Atomic::new(queue_depth),
                 slot <- new_spinlock!(slot),
                 completion <- Completion::new(),
             }),
             GFP_KERNEL,
-        )
+        )?;
+
+        queue.preallocate_requests()?;
+        Ok(queue)
+    }
+
+    fn preallocate_requests(self: &Arc<Self>) -> Result<()> {
+        let len = self.slot.lock().len();
+        for tag in 0..len {
+            let request = UfsRequest::new(self.clone(), tag)?;
+            let mut slots = self.slot.lock();
+            let slot = slots.get_mut(tag).ok_or(EINVAL)?;
+            if slot.is_some() {
+                return Err(EBUSY);
+            }
+
+            slot.replace(request);
+        }
+
+        Ok(())
     }
 
     pub(crate) fn enable_mcq_backend(
@@ -1400,6 +1424,7 @@ impl UfsQueue {
         let queue_depth = backend.queue_depth();
         let allocated_queues = backend.allocated_queues();
         *self.backend.lock() = UfsTransferBackend::Mcq(backend);
+        self.cached_queue_depth.store(queue_depth, Relaxed);
         pr_info!(
             "[RUFS] ufs_queue: MCQ backend enabled queues={}/{} interrupt={} poll={} allocated={} depth={}\n",
             layout.total_queues,
@@ -1417,7 +1442,7 @@ impl UfsQueue {
     }
 
     pub(crate) fn queue_depth(&self) -> usize {
-        self.backend.lock().queue_depth()
+        self.cached_queue_depth.load(Relaxed)
     }
 
     fn validate_tag_depth(&self, tag: usize) -> Result<()> {
@@ -1434,20 +1459,20 @@ impl UfsQueue {
             return Err(EINVAL);
         }
 
-        let mut slots = self.slot.lock();
+        let slots = self.slot.lock();
         if queue_depth > slots.len() {
             return Err(EINVAL);
         }
 
-        for (tag, slot) in slots.iter_mut().take(queue_depth).enumerate().rev() {
-            if slot.is_none() {
-                let request = UfsRequest::new(self.clone(), tag)?;
-                slot.replace(request.clone());
-                return Ok(request);
-            }
-        }
-
-        Err(ENOMEM)
+        slots
+            .iter()
+            .take(queue_depth)
+            .rev()
+            .find_map(|slot| {
+                let request = slot.as_ref()?;
+                (request.inner.lock().state == RequestState::Idle).then(|| request.clone())
+            })
+            .ok_or(ENOMEM)
     }
 
     pub(crate) fn acquire(
@@ -1456,28 +1481,27 @@ impl UfsQueue {
     ) -> Result<Arc<UfsRequest>> {
         self.validate_tag_depth(tag)?;
 
-        let mut binding = self.slot.lock();
-        let slot = match binding.get_mut(tag) {
-            Some(slot) => slot,
-            None => {
-                pr_err!("[RUFS] ufs_queue: no slot for tag={}\n", tag);
-                return Err(EINVAL);
+        let request = {
+            let slots = self.slot.lock();
+            match slots.get(tag) {
+                Some(Some(request)) => Some(request.clone()),
+                Some(None) => None,
+                None => {
+                    pr_err!("[RUFS] ufs_queue: no slot for tag={}\n", tag);
+                    return Err(EINVAL);
+                },
             }
         };
 
-        match slot {
-            Some(request) => {
-                if request.inner.lock().state == RequestState::Idle {
-                    Ok(request.clone())
-                } else {
-                    Err(EBUSY)
-                }
-            },
-            None => {
-                let request = UfsRequest::new(self.clone(), tag)?;
-                slot.replace(request.clone());
-                Ok(request)
-            },
+        let Some(request) = request else {
+            pr_err!("[RUFS] ufs_queue: unallocated request tag={}\n", tag);
+            return Err(EINVAL);
+        };
+
+        if request.inner.lock().state == RequestState::Idle {
+            Ok(request)
+        } else {
+            Err(EBUSY)
         }
     }
 

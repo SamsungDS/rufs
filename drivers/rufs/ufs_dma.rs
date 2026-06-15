@@ -1779,9 +1779,9 @@ impl UfsDma {
             return Err(EINVAL);
         }
 
-        let mut sg = KVec::with_capacity(nr_segments, GFP_KERNEL)?;
+        let mut sg = KVec::with_capacity(nr_segments, GFP_ATOMIC)?;
         for _ in 0..nr_segments {
-            sg.push(bindings::scatterlist::default(), GFP_KERNEL)?;
+            sg.push(bindings::scatterlist::default(), GFP_ATOMIC)?;
         }
 
         // SAFETY: `sg` has `nr_segments` initialized entries.
@@ -1822,7 +1822,7 @@ impl UfsDma {
             dma_dir,
         };
 
-        let mut entries = KVec::with_capacity(mapped as usize, GFP_KERNEL)?;
+        let mut entries = KVec::with_capacity(mapped as usize, GFP_ATOMIC)?;
         let mut sgp = mapping.sg.as_mut_ptr();
         for _ in 0..mapped as usize {
             if sgp.is_null() {
@@ -1843,7 +1843,7 @@ impl UfsDma {
                 size: (len - 1).to_le(),
             };
 
-            entries.push(entry, GFP_KERNEL)?;
+            entries.push(entry, GFP_ATOMIC)?;
 
             // SAFETY: `sgp` is a valid scatterlist entry.
             sgp = unsafe { bindings::sg_next(sgp) };
@@ -1875,7 +1875,7 @@ impl UfsDma {
                 self.dev.as_raw(),
                 UNMAP_PARAM_LIST_SIZE,
                 &mut dma_addr,
-                bindings::GFP_KERNEL,
+                bindings::GFP_ATOMIC,
                 0,
             )
         };
@@ -1897,14 +1897,14 @@ impl UfsDma {
             dma_addr,
         };
 
-        let mut entries = KVec::with_capacity(1, GFP_KERNEL)?;
+        let mut entries = KVec::with_capacity(1, GFP_ATOMIC)?;
         entries.push(
             PrdEntry {
                 addr: mapping.dma_addr.to_le(),
                 reserved: 0,
                 size: ((UNMAP_PARAM_LIST_SIZE as u32) - 1).to_le(),
             },
-            GFP_KERNEL,
+            GFP_ATOMIC,
         )?;
 
         Ok(UfsPrdt {
