@@ -108,9 +108,6 @@ impl UfsUic {
     }
 
     pub(crate) fn link_startup(self: &Arc<Self>) -> Result<()> {
-        /* Get SpinLock for UIC command */
-        let mut locked_cmd = self.cmd.lock();
-
         let cmd = UfsUicCmd {
             command: UicCmdDme::LinkStartup,
             argument1: 0,
@@ -118,7 +115,7 @@ impl UfsUic {
             argument3: 0,
         };
 
-        locked_cmd.replace(cmd);
+        self.cmd.lock().replace(cmd);
 
         self.reg.enable_uic_interrupts();
         self.reg.wait_for_uic_cmd_ready(500, UicCmdTimeoutMs::DEFAULT as i64)?;
@@ -143,14 +140,11 @@ impl UfsUic {
         match self.completion.wait_for_completion_timeout(delta) {
             0 => Err(ETIMEDOUT),
             _ => {
-                match *self.rsp.lock() {
+                let result = self.rsp.lock().as_ref().map(|rsp| rsp.result);
+                match result {
+                    Some(UicCmdResult::Success) => Ok(()),
+                    Some(_) => Err(EIO),
                     None => Err(ENOMEM),
-                    Some(rsp) => {
-                        match rsp.result {
-                           UicCmdResult:: Success => Ok(()),
-                           _ => Err(EIO),
-                        }
-                    },
                 }
             },
         }

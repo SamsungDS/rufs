@@ -5,6 +5,7 @@
 use kernel::{pci, prelude::*, c_str, new_mutex, new_spinlock};
 use kernel::device::{Device, Core, Bound};
 use kernel::sync::{Arc, Mutex, SpinLock};
+use kernel::sync::atomic::{Atomic, Acquire, Release};
 use kernel::irq::{self, Flags, IrqReturn, ThreadedIrqReturn};
 use crate::ufs_reg::*;
 use crate::ufs_uic::*;
@@ -14,14 +15,24 @@ use crate::ufs_queue::*;
 struct UfsUicHandler {
     reg: Arc<UfsReg>,
     uic: Arc<UfsUic>,
-    #[pin]
-    placeholder: SpinLock<u32>,
+    interrupt_status: Atomic<u32>,
 }
 
-impl irq::Handler for UfsUicHandler {
-    fn handle(&self, _dev: &Device<Bound>) -> IrqReturn {
+impl irq::ThreadedHandler for UfsUicHandler {
+    fn handle(&self, _dev: &Device<Bound>) -> ThreadedIrqReturn {
         let interrupt_status = self.reg.read_uic_interrupts();
+        if interrupt_status == 0 {
+            return ThreadedIrqReturn::None;
+        }
+
         self.reg.confirm_uic_interrupts(interrupt_status);
+        self.interrupt_status.store(interrupt_status, Release);
+
+        ThreadedIrqReturn::WakeThread
+    }
+
+    fn handle_threaded(&self, _dev: &Device<Bound>) -> IrqReturn {
+        let interrupt_status = self.interrupt_status.load(Acquire);
         self.uic.get_uic_cmd_response(interrupt_status);
         self.uic.complete_uic_cmd();
 
@@ -59,7 +70,7 @@ impl irq::ThreadedHandler for UfsQueueHandler {
 #[pin_data]
 pub(crate) struct UfsIrq {
     #[pin]
-    uic: Mutex<Option<Arc<irq::Registration<UfsUicHandler>>>>,
+    uic: Mutex<Option<Arc<irq::ThreadedRegistration<UfsUicHandler>>>>,
     #[pin]
     queue: SpinLock<KVec<Arc<irq::ThreadedRegistration<UfsQueueHandler>>>>,
 }
@@ -84,10 +95,10 @@ impl UfsIrq {
         let handler = try_pin_init!(UfsUicHandler {
             reg,
             uic,
-            placeholder <- new_spinlock!(0),
+            interrupt_status: Atomic::new(0),
         });
 
-        let irq = pdev.request_irq(
+        let irq = pdev.request_threaded_irq(
             vector,
             Flags::SHARED,
             c_str!("ufshcd-uic"),
