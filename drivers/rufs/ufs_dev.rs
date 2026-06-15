@@ -804,19 +804,13 @@ impl UfsDev{
     }
 
     fn set_flag(&self, idn: FlagIdn, index: u8, selector: u8) -> Result<()> {
-        let cmd = self.issue(UfsDevCmd::query().set_flag(idn, index, selector))?;
-        match cmd.get_device()?.get_query()?.get_flag_value()? {
-            1 => Ok(()),
-            _ => Err(EIO),
-        }
+        self.issue(UfsDevCmd::query().set_flag(idn, index, selector))?;
+        Ok(())
     }
 
     fn clear_flag(&self, idn: FlagIdn, index: u8, selector: u8) -> Result<()> {
-        let cmd = self.issue(UfsDevCmd::query().clear_flag(idn, index, selector))?;
-        match cmd.get_device()?.get_query()?.get_flag_value()? {
-            0 => Ok(()),
-            _ => Err(EIO),
-        }
+        self.issue(UfsDevCmd::query().clear_flag(idn, index, selector))?;
+        Ok(())
     }
 
     fn toggle_flag(&self, idn: FlagIdn, index: u8, selector: u8) -> Result<u8> {
