@@ -398,6 +398,11 @@ enum RequestState {
     Completed,
 }
 
+enum CompletionTarget<'a> {
+    Direct,
+    Poll(&'a mut mq::IoCompletionBatch<UfsLuBlockOps>),
+}
+
 struct UfsRequestInner {
     // These fields form one ownership unit. Keep them under a single lock so a
     // slot is never visible as idle while old DMA or block request state remains.
@@ -793,6 +798,10 @@ impl McqTransferBackend {
         self.layout.poll_queues
     }
 
+    fn is_poll_queue(&self, queue: usize) -> bool {
+        self.layout.is_poll_queue(queue)
+    }
+
     fn allocated_queues(&self) -> usize {
         self.queues.len()
     }
@@ -905,6 +914,13 @@ impl UfsTransferBackend {
         match self {
             Self::Sdb(_) => 0,
             Self::Mcq(backend) => backend.poll_queues(),
+        }
+    }
+
+    fn is_poll_queue(&self, queue: usize) -> bool {
+        match self {
+            Self::Sdb(_) => false,
+            Self::Mcq(backend) => backend.is_poll_queue(queue),
         }
     }
 
@@ -1308,6 +1324,14 @@ impl UfsRequest {
     }
 
     fn complete(&self) -> bool {
+        self.complete_with(CompletionTarget::Direct)
+    }
+
+    fn complete_polled(&self, batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>) -> bool {
+        self.complete_with(CompletionTarget::Poll(batch))
+    }
+
+    fn complete_with(&self, target: CompletionTarget<'_>) -> bool {
         let cmd = match self.cmd() {
             Ok(cmd) => cmd,
             Err(_) => return true,
@@ -1336,7 +1360,7 @@ impl UfsRequest {
 
                 drop(prdt);
 
-                match self.queue.complete_scsi(cmd, self.tag, result, block_rq) {
+                match self.queue.complete_scsi(cmd, self.tag, result, block_rq, target) {
                     Ok(()) => {
                         self.clear();
                         true
@@ -1607,6 +1631,10 @@ impl UfsQueue {
         self.backend.lock().completion_cached(tag)
     }
 
+    fn is_poll_queue(&self, queue: usize) -> bool {
+        self.backend.lock().is_poll_queue(queue)
+    }
+
     // Completion
     fn wake_completion_thread(&self) {
         self.irq.wake_queue_thread();
@@ -1624,12 +1652,22 @@ impl UfsQueue {
 
     fn next_completable_request(&self, mut tag: usize) -> Option<Arc<UfsRequest>> {
         while let Some(request) = self.next_request(tag) {
-            match request.inner.lock().state {
-                RequestState::Submitted | RequestState::Completed => {
-                    return Some(request.clone());
-                },
-                _ => { tag += 1; },
+            let matches = {
+                let inner = request.inner.lock();
+                match inner.state {
+                    RequestState::Submitted | RequestState::Completed => match inner.hw_queue {
+                        Some(hw_queue) => !self.is_poll_queue(hw_queue),
+                        None => true,
+                    },
+                    _ => false,
+                }
+            };
+
+            if matches {
+                return Some(request);
             }
+
+            tag = request.tag + 1;
         }
         None
     }
@@ -1661,6 +1699,22 @@ impl UfsQueue {
     fn complete_ready_request(&self, request: &Arc<UfsRequest>) -> (bool, bool) {
         if request.completion_ready_cached() {
             if request.complete() {
+                return (true, false);
+            }
+
+            return (false, true);
+        }
+
+        (false, false)
+    }
+
+    fn complete_ready_polled_request(
+        &self,
+        request: &Arc<UfsRequest>,
+        batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>,
+    ) -> (bool, bool) {
+        if request.completion_ready_cached() {
+            if request.complete_polled(batch) {
                 return (true, false);
             }
 
@@ -1709,7 +1763,11 @@ impl UfsQueue {
         completed
     }
 
-    pub(crate) fn poll(self: &Arc<Self>, hw_queue: usize) -> bool {
+    pub(crate) fn poll(
+        self: &Arc<Self>,
+        hw_queue: usize,
+        batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>,
+    ) -> bool {
         if let Err(e) = self.poll_backend_queue(hw_queue) {
             pr_err!(
                 "[RUFS] ufs_queue: poll queue {} failed errno={}\n",
@@ -1724,7 +1782,8 @@ impl UfsQueue {
         let mut retry = false;
         while let Some(request) = self.next_completable_request_on_queue(tag, hw_queue) {
             let request_tag = request.tag;
-            let (request_completed, request_retry) = self.complete_ready_request(&request);
+            let (request_completed, request_retry) =
+                self.complete_ready_polled_request(&request, batch);
             completed |= request_completed;
             retry |= request_retry;
             tag = request_tag + 1;
@@ -1747,6 +1806,7 @@ impl UfsQueue {
         tag: usize,
         result: UfsScsiResult,
         rq: ARef<mq::Request<UfsLuBlockOps>>,
+        target: CompletionTarget<'_>,
     ) -> Result<(), ARef<mq::Request<UfsLuBlockOps>>> {
         let sense_len = result.sense_data_len.min(result.sense_data.len());
         let sense = parse_scsi_sense(&result.sense_data, sense_len);
@@ -1859,15 +1919,27 @@ impl UfsQueue {
         // Take exclusive ownership so the request can be handed back to the
         // block layer. If other references are still outstanding, return the
         // request so the caller can retry the completion later.
-        let rq = OwnableRefCounted::try_from_shared(rq)
-            .map_err(|_e| kernel::error::code::EIO)
-            .expect("Failed to complete request");
+        let rq = match OwnableRefCounted::try_from_shared(rq) {
+            Ok(rq) => rq,
+            Err(rq) => return Err(rq),
+        };
 
         if requeue {
             rq.requeue(true);
-        } else {
-            rq.end(status as u8);
+            return Ok(());
         }
+
+        let status = status as u8;
+        if status == bindings::BLK_STS_OK as u8 {
+            if let CompletionTarget::Poll(batch) = target {
+                if let Err(rq) = batch.add_request(rq, false) {
+                    rq.end(status);
+                }
+                return Ok(());
+            }
+        }
+
+        rq.end(status);
 
         Ok(())
     }

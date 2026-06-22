@@ -492,9 +492,9 @@ impl Operations for UfsLuBlockOps {
     fn poll(
         hw_data: &u32,
         queue_data: ArcBorrow<'_, UfsLu>,
-        _batch: &mut mq::IoCompletionBatch<Self>,
+        batch: &mut mq::IoCompletionBatch<Self>,
     ) -> Result<bool> {
-        Ok(queue_data.queue.poll(*hw_data as usize))
+        Ok(queue_data.queue.poll(*hw_data as usize, batch))
     }
 
     fn map_queues(tag_set: Pin<&mut TagSet<Self>>) {
