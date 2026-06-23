@@ -362,7 +362,7 @@ impl Operations for UfsLuBlockOps {
                 let cmd = lu.build_scsi_cmd(command, lba, blocks)?;
 
                 pr_debug!(
-                    "[RUFS] ufs_lu: LU {} command={:?} lba={} blocks={}\n",
+                    "[RUFS] ufs_lu: LU {} command={} lba={} blocks={}\n",
                     lu.lun(),
                     command,
                     lba,
@@ -422,7 +422,7 @@ impl Operations for UfsLuBlockOps {
             }
             _ => {
                 pr_warn!(
-                    "[RUFS] ufs_lu: unsupported request command={:?} on LU {}\n",
+                    "[RUFS] ufs_lu: unsupported request command={} on LU {}\n",
                     command,
                     lu.lun(),
                 );
