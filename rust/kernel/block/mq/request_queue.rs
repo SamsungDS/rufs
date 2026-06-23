@@ -1,11 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0
 
-use super::Operations;
-use crate::types::{
-    ForeignOwnable,
-    Opaque, //
+use super::{
+    Operations,
+    TagSet, //
 };
-use core::marker::PhantomData;
+use crate::{
+    error::from_err_ptr,
+    owned::{
+        Ownable,
+        Owned, //
+    },
+    prelude::*,
+    sync::Arc,
+    types::{
+        ForeignOwnable,
+        Opaque, //
+    }, //
+};
+use core::{
+    marker::PhantomData,
+    ptr::NonNull, //
+};
 
 /// A structure describing the queues associated with a block device.
 ///
@@ -22,6 +37,19 @@ impl<T> RequestQueue<T>
 where
     T: Operations,
 {
+    /// Allocate a new [`RequestQueue`].
+    pub fn new(tagset: Arc<TagSet<T>>, queue_data: T::QueueData) -> Result<Owned<Self>> {
+        let mq = from_err_ptr(unsafe {
+            bindings::blk_mq_alloc_queue(
+                tagset.into_raw().cast_mut().cast(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        })?;
+        unsafe { (*mq).queuedata = queue_data.into_foreign() as _ };
+        Ok(unsafe { Owned::from_raw(NonNull::new_unchecked(mq.cast())) })
+    }
+
     /// Create a [`RequestQueue`] from a raw `bindings::request_queue` pointer
     ///
     /// # Safety
@@ -56,5 +84,16 @@ where
     pub fn start_stopped_hw_queues_async(&self) {
         // SAFETY: By type invariant, `self.0` is a valid `request_queue`.
         unsafe { bindings::blk_mq_start_stopped_hw_queues(self.0.get(), true) }
+    }
+}
+
+impl<T: Operations> Ownable for RequestQueue<T> {
+    unsafe fn release(&mut self) {
+        let this: *mut Self = self;
+        let tagset = unsafe { (*this.cast::<bindings::request_queue>()).tag_set };
+        // SAFETY: We own the queue
+        unsafe { bindings::blk_mq_destroy_queue(this.cast()) }
+        // SAFETY: The pointer owns a refcount.
+        drop(unsafe { Arc::from_raw(tagset.cast::<TagSet<T>>()) })
     }
 }
