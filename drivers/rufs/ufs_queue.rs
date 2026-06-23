@@ -696,13 +696,45 @@ enum UfsTransferBackend {
     Mcq(McqTransferBackend),
 }
 
+trait UfsTransferOps {
+    fn queue_depth(&self) -> usize;
+    fn queue_map(&self) -> Result<UfsQueueMap>;
+    fn is_poll_queue(&self, queue: usize) -> bool;
+    fn compose_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()>;
+    fn compose_scsi(
+        &self,
+        cmd: UfsSCSICmd,
+        tag: usize,
+        rq: &mq::Request<UfsLuBlockOps>,
+    ) -> Result<Option<UfsPrdtMapping>>;
+    fn submit_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()>;
+    fn submit_scsi(&self, cmd: UfsSCSICmd, tag: usize, hw_queue: Option<usize>) -> Result<()>;
+    fn request_completed(&self, tag: usize) -> bool;
+    fn dump_state(&self, tag: usize, reason: &str);
+    fn refresh_completions(&self) -> Result<()>;
+    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd>;
+    fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult;
+    fn poll_queue(&self, queue: usize) -> Result<()>;
+    fn completion_cached(&self, tag: usize) -> bool;
+}
+
 impl SdbTransferBackend {
     fn new(reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Self {
         Self { reg, dma }
     }
+}
 
+impl UfsTransferOps for SdbTransferBackend {
     fn queue_depth(&self) -> usize {
         self.reg.nutrs()
+    }
+
+    fn queue_map(&self) -> Result<UfsQueueMap> {
+        McqQueueLayout::sdb().queue_map()
+    }
+
+    fn is_poll_queue(&self, _queue: usize) -> bool {
+        false
     }
 
     fn compose_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
@@ -723,7 +755,7 @@ impl SdbTransferBackend {
         Ok(())
     }
 
-    fn submit_scsi(&self, _cmd: UfsSCSICmd, tag: usize) -> Result<()> {
+    fn submit_scsi(&self, _cmd: UfsSCSICmd, tag: usize, _hw_queue: Option<usize>) -> Result<()> {
         self.reg.ring_utrl_doorbell(tag);
         Ok(())
     }
@@ -754,6 +786,8 @@ impl SdbTransferBackend {
     fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult {
         self.dma.fetch_scsi_completion(tag)
     }
+
+    fn dump_state(&self, _tag: usize, _reason: &str) {}
 }
 
 impl McqTransferBackend {
@@ -778,24 +812,8 @@ impl McqTransferBackend {
         })
     }
 
-    fn max_queues(&self) -> usize {
-        self.layout.max_queues
-    }
-
-    fn nr_queues(&self) -> usize {
-        self.layout.total_queues
-    }
-
     fn queue_depth(&self) -> usize {
         self.queue_depth
-    }
-
-    fn default_queues(&self) -> usize {
-        self.layout.default_queues
-    }
-
-    fn poll_queues(&self) -> usize {
-        self.layout.poll_queues
     }
 
     fn is_poll_queue(&self, queue: usize) -> bool {
@@ -884,51 +902,21 @@ impl McqTransferBackend {
     }
 }
 
-impl UfsTransferBackend {
-    fn sdb(reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Self {
-        Self::Sdb(SdbTransferBackend::new(reg, dma))
-    }
-
+impl UfsTransferOps for McqTransferBackend {
     fn queue_depth(&self) -> usize {
-        match self {
-            Self::Sdb(backend) => backend.queue_depth(),
-            Self::Mcq(backend) => backend.queue_depth(),
-        }
+        McqTransferBackend::queue_depth(self)
     }
 
     fn queue_map(&self) -> Result<UfsQueueMap> {
-        match self {
-            Self::Sdb(_) => McqQueueLayout::sdb().queue_map(),
-            Self::Mcq(backend) => backend.layout.queue_map(),
-        }
-    }
-
-    fn default_queues(&self) -> usize {
-        match self {
-            Self::Sdb(_) => 1,
-            Self::Mcq(backend) => backend.default_queues(),
-        }
-    }
-
-    fn poll_queues(&self) -> usize {
-        match self {
-            Self::Sdb(_) => 0,
-            Self::Mcq(backend) => backend.poll_queues(),
-        }
+        self.layout.queue_map()
     }
 
     fn is_poll_queue(&self, queue: usize) -> bool {
-        match self {
-            Self::Sdb(_) => false,
-            Self::Mcq(backend) => backend.is_poll_queue(queue),
-        }
+        McqTransferBackend::is_poll_queue(self, queue)
     }
 
     fn compose_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
-        match self {
-            Self::Sdb(backend) => backend.compose_dev(cmd, tag),
-            Self::Mcq(backend) => backend.compose_dev(cmd, tag),
-        }
+        McqTransferBackend::compose_dev(self, cmd, tag)
     }
 
     fn compose_scsi(
@@ -937,72 +925,55 @@ impl UfsTransferBackend {
         tag: usize,
         rq: &mq::Request<UfsLuBlockOps>,
     ) -> Result<Option<UfsPrdtMapping>> {
-        match self {
-            Self::Sdb(backend) => backend.compose_scsi(cmd, tag, rq),
-            Self::Mcq(backend) => backend.compose_scsi(cmd, tag, rq),
-        }
+        McqTransferBackend::compose_scsi(self, cmd, tag, rq)
     }
 
     fn submit_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
-        match self {
-            Self::Sdb(backend) => backend.submit_dev(cmd, tag),
-            Self::Mcq(backend) => backend.submit_dev(cmd, tag),
-        }
+        McqTransferBackend::submit_dev(self, cmd, tag)
     }
 
     fn submit_scsi(&self, cmd: UfsSCSICmd, tag: usize, hw_queue: Option<usize>) -> Result<()> {
-        match self {
-            Self::Sdb(backend) => backend.submit_scsi(cmd, tag),
-            Self::Mcq(backend) => backend.submit_scsi(cmd, tag, hw_queue),
-        }
+        McqTransferBackend::submit_scsi(self, cmd, tag, hw_queue)
     }
 
     fn request_completed(&self, tag: usize) -> bool {
-        match self {
-            Self::Sdb(backend) => backend.request_completed(tag),
-            Self::Mcq(backend) => backend.request_completed(tag),
-        }
+        McqTransferBackend::request_completed(self, tag)
     }
 
     fn dump_state(&self, tag: usize, reason: &str) {
-        match self {
-            Self::Sdb(_) => {},
-            Self::Mcq(backend) => backend.dump_state(tag, reason),
-        }
+        McqTransferBackend::dump_state(self, tag, reason);
     }
 
     fn refresh_completions(&self) -> Result<()> {
-        match self {
-            Self::Sdb(backend) => backend.refresh_completions(),
-            Self::Mcq(backend) => backend.refresh_completions(),
-        }
+        McqTransferBackend::refresh_completions(self)
     }
 
     fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
-        match self {
-            Self::Sdb(backend) => backend.fetch_dev(cmd, tag),
-            Self::Mcq(backend) => backend.fetch_dev(cmd, tag),
-        }
+        McqTransferBackend::fetch_dev(self, cmd, tag)
     }
 
     fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult {
-        match self {
-            Self::Sdb(backend) => backend.fetch_scsi_completion(tag),
-            Self::Mcq(backend) => backend.fetch_scsi_completion(tag),
-        }
+        McqTransferBackend::fetch_scsi_completion(self, tag)
     }
 
     fn poll_queue(&self, queue: usize) -> Result<()> {
-        match self {
-            Self::Sdb(backend) => backend.poll_queue(queue),
-            Self::Mcq(backend) => backend.poll_queue(queue),
-        }
+        McqTransferBackend::poll_queue(self, queue)
     }
 
     fn completion_cached(&self, tag: usize) -> bool {
+        McqTransferBackend::completion_cached(self, tag)
+    }
+}
+
+impl UfsTransferBackend {
+    fn sdb(reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Self {
+        Self::Sdb(SdbTransferBackend::new(reg, dma))
+    }
+
+    fn ops(&self) -> &dyn UfsTransferOps {
         match self {
-            Self::Sdb(backend) => backend.completion_cached(tag),
-            Self::Mcq(backend) => backend.completion_cached(tag),
+            Self::Sdb(backend) => backend,
+            Self::Mcq(backend) => backend,
         }
     }
 }
@@ -1422,7 +1393,7 @@ impl UfsQueue {
         // reports the tag range that is legal for that transport.
         let slot = kvec![None; dma.transfer_slots()]?;
         let backend = UfsTransferBackend::sdb(reg, dma);
-        let queue_depth = backend.queue_depth();
+        let queue_depth = backend.ops().queue_depth();
 
         let queue = Arc::pin_init(
             try_pin_init!(Self {
@@ -1488,7 +1459,7 @@ impl UfsQueue {
     }
 
     pub(crate) fn queue_map(&self) -> Result<UfsQueueMap> {
-        self.backend.lock().queue_map()
+        self.backend.lock().ops().queue_map()
     }
 
     pub(crate) fn queue_depth(&self) -> usize {
@@ -1557,7 +1528,7 @@ impl UfsQueue {
 
     // Issuing
     fn compose_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
-        self.backend.lock().compose_dev(cmd, tag)
+        self.backend.lock().ops().compose_dev(cmd, tag)
     }
 
     fn compose_scsi(
@@ -1566,15 +1537,15 @@ impl UfsQueue {
         tag: usize,
         rq: &mq::Request<UfsLuBlockOps>,
     ) -> Result<Option<UfsPrdtMapping>> {
-        self.backend.lock().compose_scsi(cmd, tag, rq)
+        self.backend.lock().ops().compose_scsi(cmd, tag, rq)
     }
 
     fn submit_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
-        self.backend.lock().submit_dev(cmd, tag)
+        self.backend.lock().ops().submit_dev(cmd, tag)
     }
 
     fn submit_scsi(&self, cmd: UfsSCSICmd, tag: usize, hw_queue: Option<usize>) -> Result<()> {
-        self.backend.lock().submit_scsi(cmd, tag, hw_queue)
+        self.backend.lock().ops().submit_scsi(cmd, tag, hw_queue)
     }
 
     fn prepare_dev_wait(&self) {
@@ -1592,23 +1563,23 @@ impl UfsQueue {
     }
 
     fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
-        self.backend.lock().fetch_dev(cmd, tag)
+        self.backend.lock().ops().fetch_dev(cmd, tag)
     }
 
     fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult {
-        self.backend.lock().fetch_scsi_completion(tag)
+        self.backend.lock().ops().fetch_scsi_completion(tag)
     }
 
     fn request_completed(&self, tag: usize) -> bool {
-        self.backend.lock().request_completed(tag)
+        self.backend.lock().ops().request_completed(tag)
     }
 
     fn refresh_backend_completions(&self) -> Result<()> {
-        self.backend.lock().refresh_completions()
+        self.backend.lock().ops().refresh_completions()
     }
 
     fn dump_backend_state(&self, tag: usize, reason: &str) {
-        self.backend.lock().dump_state(tag, reason);
+        self.backend.lock().ops().dump_state(tag, reason);
     }
 
     pub(crate) fn timeout(&self, tag: usize) -> bool {
@@ -1624,15 +1595,15 @@ impl UfsQueue {
     }
 
     fn poll_backend_queue(&self, queue: usize) -> Result<()> {
-        self.backend.lock().poll_queue(queue)
+        self.backend.lock().ops().poll_queue(queue)
     }
 
     fn completion_cached(&self, tag: usize) -> bool {
-        self.backend.lock().completion_cached(tag)
+        self.backend.lock().ops().completion_cached(tag)
     }
 
     fn is_poll_queue(&self, queue: usize) -> bool {
-        self.backend.lock().is_poll_queue(queue)
+        self.backend.lock().ops().is_poll_queue(queue)
     }
 
     // Completion
