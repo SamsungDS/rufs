@@ -7,11 +7,14 @@
 use crate::ufs_dma::{DescBuffer, MAX_PRD_ENTRIES};
 use crate::ufs_queue::*;
 use kernel::alloc::mempool::MemPool;
-use kernel::block::mq;
+use kernel::block::error::BlkResult;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;
+use kernel::block::mq::{self, IdleRequest, Request};
 use kernel::error::{from_err_ptr, to_result};
 use kernel::sync::{Arc, Mutex};
 use kernel::time::{delay, Delta};
+use kernel::types::{ARef, Owned};
+use kernel::uapi::NUMA_NO_NODE;
 use kernel::{bindings, kvec, new_mutex, prelude::*};
 
 const NOP_OUT_TIMEOUT_MS: i64 = 50;
@@ -23,47 +26,47 @@ const FDEVICE_COMPL_TICK_US: i64 = 500;
 
 pub(crate) const QUERY_DESC_MAX_SIZE: usize = 255;
 
-const DRIVER_OUT: bindings::blk_opf_t = mq::Command::DriverOut.as_opf();
-const BLK_STS_NOTSUPP: bindings::blk_status_t = 1;
+struct TaskManagementOps {}
 
-unsafe extern "C" fn queue_tmf(
-    _hctx: *mut bindings::blk_mq_hw_ctx,
-    _data: *const bindings::blk_mq_queue_data,
-) -> bindings::blk_status_t {
-    pr_warn!("rufs: unexpected TMF queue_rq callback");
-    BLK_STS_NOTSUPP
+#[vtable]
+impl mq::Operations for TaskManagementOps {
+    type RequestData = ();
+    type QueueData = ();
+    type HwData = ();
+    type TagSetData = ();
+
+    fn new_request_data() -> impl PinInit<Self::RequestData> {
+        ()
+    }
+
+    fn queue_rq(
+        hw_data: (),
+        queue_data: (),
+        rq: Owned<IdleRequest<Self>>,
+        is_last: bool,
+    ) -> BlkResult {
+        todo!()
+    }
+
+    fn commit_rqs(hw_data: (), queue_data: ()) {
+        todo!()
+    }
+
+    fn init_hctx(tagset_data: (), hctx_idx: u32) -> Result<Self::HwData> {
+        Ok(())
+    }
+
+    fn complete(rq: ARef<Request<Self>>) {
+        todo!()
+    }
 }
-
-const TMF_OPS: bindings::blk_mq_ops = bindings::blk_mq_ops {
-    queue_rq: Some(queue_tmf),
-    queue_rqs: None,
-    commit_rqs: None,
-    get_budget: None,
-    put_budget: None,
-    set_rq_budget_token: None,
-    get_rq_budget_token: None,
-    timeout: None,
-    poll: None,
-    complete: None,
-    init_hctx: None,
-    exit_hctx: None,
-    init_request: None,
-    exit_request: None,
-    cleanup_rq: None,
-    busy: None,
-    map_queues: None,
-    #[cfg(CONFIG_BLK_DEBUG_FS)]
-    show_rq: None,
-};
 
 // This queue is scaffolding for future task-management/error-recovery support.
 // RUFS does not issue TMF requests yet; `queue_tmf()` is only a guard callback
 // so accidental dispatch is rejected instead of silently completing.
 struct TmfQueue {
-    tag_set: bindings::blk_mq_tag_set,
-    queue: *mut bindings::request_queue,
-    rqs: KVec<*mut bindings::request>,
-    tag_set_allocated: bool,
+    tag_set: Arc<mq::TagSet<TaskManagementOps>>,
+    queue: Owned<mq::RequestQueue<TaskManagementOps>>,
 }
 
 // SAFETY: `TmfQueue` owns the blk-mq tag set, request queue, and request pointer
@@ -71,72 +74,22 @@ struct TmfQueue {
 unsafe impl Send for TmfQueue {}
 
 impl TmfQueue {
-    fn new(depth: usize) -> Result<KBox<Self>> {
-        let rqs = kvec![core::ptr::null_mut(); depth]?;
-        let mut tmf = KBox::new(
-            Self {
-                // SAFETY: `blk_mq_tag_set` is initialized field-by-field before use.
-                tag_set: unsafe { core::mem::zeroed() },
-                queue: core::ptr::null_mut(),
-                rqs,
-                tag_set_allocated: false,
-            },
+    fn new(depth: usize) -> Result<Self> {
+        let tag_set = Arc::pin_init(
+            mq::TagSet::new(
+                1,
+                (),
+                depth.try_into()?,
+                1,
+                kernel::alloc::NumaNode::NO_NODE,
+                mq::tag_set::Flags::empty(),
+            ),
             GFP_KERNEL,
         )?;
 
-        tmf.tag_set.nr_hw_queues = 1;
-        tmf.tag_set.queue_depth = depth as u32;
-        tmf.tag_set.ops = &TMF_OPS;
+        let queue = mq::RequestQueue::new(tag_set.clone(), ())?;
 
-        to_result(unsafe { bindings::blk_mq_alloc_tag_set(&mut tmf.tag_set) })?;
-        tmf.tag_set_allocated = true;
-
-        tmf.queue = from_err_ptr(unsafe {
-            bindings::blk_mq_alloc_queue(
-                &mut tmf.tag_set,
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-            )
-        })?;
-
-        Ok(tmf)
-    }
-
-    fn alloc_request(&mut self) -> Result<*mut bindings::request> {
-        let req =
-            from_err_ptr(unsafe { bindings::blk_mq_alloc_request(self.queue, DRIVER_OUT, 0) })?;
-        let tag = unsafe { (*req).tag };
-        if tag < 0 || tag as usize >= self.rqs.len() {
-            unsafe { bindings::blk_mq_free_request(req) };
-            return Err(EINVAL);
-        }
-
-        self.rqs[tag as usize] = req;
-        Ok(req)
-    }
-
-    fn free_request(&mut self, req: *mut bindings::request) {
-        let tag = unsafe { (*req).tag };
-        if tag >= 0 && (tag as usize) < self.rqs.len() {
-            self.rqs[tag as usize] = core::ptr::null_mut();
-        }
-
-        unsafe { bindings::blk_mq_free_request(req) };
-    }
-}
-
-impl Drop for TmfQueue {
-    fn drop(&mut self) {
-        if !self.queue.is_null() {
-            unsafe {
-                bindings::blk_mq_destroy_queue(self.queue);
-                bindings::blk_put_queue(self.queue);
-            }
-        }
-
-        if self.tag_set_allocated {
-            unsafe { bindings::blk_mq_free_tag_set(&mut self.tag_set) };
-        }
+        Ok(Self { tag_set, queue })
     }
 }
 
@@ -720,7 +673,7 @@ pub(crate) struct UfsDev {
     request: Mutex<Option<Arc<UfsRequest>>>,
 
     #[pin]
-    tmf_queue: Mutex<Option<KBox<TmfQueue>>>,
+    tmf_queue: Mutex<Option<TmfQueue>>,
 
     dma_vec_pool: DmaMapMempool<MAX_PRD_ENTRIES>,
 }

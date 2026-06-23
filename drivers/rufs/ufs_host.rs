@@ -147,6 +147,7 @@ impl UfsHost {
             );
         }
         if host.reg.mcq_supported() {
+            pr_info!("MCQ supported\n");
             match host
                 .queue
                 .enable_mcq_backend(host.reg.clone(), host.dma.clone())
@@ -159,7 +160,10 @@ impl UfsHost {
                     );
                 }
             }
+        } else {
+            pr_info!("MCQ not supported, using SDB mode!\n");
         }
+
         host.dev.alloc_dev_request()?;
         host.dev.verify_dev_init()?;
         host.dev.complete_dev_init()?;
