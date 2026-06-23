@@ -3,53 +3,113 @@
 #![allow(dead_code)]
 
 use kernel::{pci, device::Core, devres::Devres, prelude::*, c_str, sync::Arc};
-use kernel::io::{Io, poll::read_poll_timeout};
+use kernel::io::{register, Io, poll::read_poll_timeout};
 use kernel::time::Delta;
 
 const UFS_BAR0_LEN: usize = 0x1000;
 type Bar0 = pci::Bar<UFS_BAR0_LEN>;
 
-const REG_CONTROLLER_CAPABILITIES:           usize = 0x00; // CAP[31:0]
-const REG_MCQCAP:                            usize = 0x04; // MCQCAP
-const REG_CONTROLLER_CAPABILITIES_H:         usize = 0x04; // CAP[63:32]
-const REG_UFS_VERSION:                       usize = 0x08; // VER
-const REG_INTERRUPT_STATUS:                  usize = 0x20; // IS
-const REG_INTERRUPT_ENABLE:                  usize = 0x24; // IE
-const REG_CONTROLLER_STATUS:                 usize = 0x30; // HCS
-const REG_CONTROLLER_ENABLE:                 usize = 0x34; // HCE
-
-// UIC Error
-const REG_UIC_ERROR_CODE_PHY_ADAPTER_LAYER: usize = 0x38;
-const REG_UIC_ERROR_CODE_DATA_LINK_LAYER:   usize = 0x3C;
-
-// Transfer Request List (UTRL)
-const REG_UTP_TRANSFER_REQ_LIST_BASE_L:      usize = 0x50; // UTRLBA
-const REG_UTP_TRANSFER_REQ_LIST_BASE_H:      usize = 0x54; // UTRLBAU
-const REG_UTP_TRANSFER_REQ_DOOR_BELL:        usize = 0x58; // UTRLDBR
-const REG_UTP_TRANSFER_REQ_LIST_CLEAR:       usize = 0x5C; // UTRLCLR
-const REG_UTP_TRANSFER_REQ_LIST_RUN_STOP:    usize = 0x60; // UTRLRSR
-
-// Task Management Request List (UTMRL)
-const REG_UTP_TASK_REQ_LIST_BASE_L:          usize = 0x70; // UTMRLBA
-const REG_UTP_TASK_REQ_LIST_BASE_H:          usize = 0x74; // UTMRLBAU
-const REG_UTP_TASK_REQ_DOOR_BELL:            usize = 0x78; // UTMRLDBR
-const REG_UTP_TASK_REQ_LIST_CLEAR:           usize = 0x7C; // UTMRLCLR
-const REG_UTP_TASK_REQ_LIST_RUN_STOP:        usize = 0x80; // UTMRLRSR
-                                                           //
-const UTP_TRANSFER_REQ_LIST_RUN_STOP_BIT:   u32 = 0x1;
-const UTP_TASK_REQ_LIST_RUN_STOP_BIT:       u32 = 0x1;
-
-// UIC command
-const REG_UIC_COMMAND:                       usize = 0x90; // UICCMD
-const REG_UIC_ARG1:                          usize = 0x94; // UICCMDARG1
-const REG_UIC_ARG2:                          usize = 0x98; // UICCMDARG2
-const REG_UIC_ARG3:                          usize = 0x9C; // UICCMDARG3
-
-// MCQ global registers
-const REG_UFS_MEM_CFG:                       usize = 0x300;
-const REG_UFS_MCQ_CFG:                       usize = 0x380;
-const REG_UFS_ESILBA:                        usize = 0x384;
-const REG_UFS_ESIUBA:                        usize = 0x388;
+register! {
+    CONTROLLER_CAPABILITIES(u32) @ 0x00 {
+        30:30 mcq_supported => bool;
+        23:23 auto_hibern8_supported => bool;
+        18:16 task_management_request_slots;
+        15:8 number_outstanding_rtt;
+        4:0 transfer_request_slots_sdb;
+    }
+    CONTROLLER_CAPABILITIES_MCQ(u32) => CONTROLLER_CAPABILITIES {
+        7:0 transfer_request_slots;
+    }
+    MCQCAP(u32) @ 0x04 {
+        23:16 queue_config_pointer;
+        7:0 max_queue_supported;
+    }
+    CONTROLLER_CAPABILITIES_H(u32) @ 0x04 {
+        31:0 value;
+    }
+    UFS_VERSION(u32) @ 0x08 {
+        31:0 value;
+    }
+    INTERRUPT_STATUS(u32) @ 0x20 {
+        31:0 value;
+    }
+    INTERRUPT_ENABLE(u32) @ 0x24 {
+        31:0 value;
+    }
+    CONTROLLER_STATUS(u32) @ 0x30 {
+        5:5 device_error_indicator => bool;
+        4:4 host_error_indicator => bool;
+        3:3 uic_command_ready => bool;
+        2:2 task_request_list_ready => bool;
+        1:1 transfer_request_list_ready => bool;
+        0:0 device_present => bool;
+    }
+    CONTROLLER_ENABLE_REG(u32) @ 0x34 {
+        1:1 crypto_general_enable => bool;
+        0:0 controller_enable => bool;
+    }
+    UIC_ERROR_CODE_PHY_ADAPTER_LAYER(u32) @ 0x38 {
+        31:0 value;
+    }
+    UIC_ERROR_CODE_DATA_LINK_LAYER(u32) @ 0x3C {
+        31:0 value;
+    }
+    UTP_TRANSFER_REQ_LIST_BASE_L(u32) @ 0x50 {
+        31:0 value;
+    }
+    UTP_TRANSFER_REQ_LIST_BASE_H(u32) @ 0x54 {
+        31:0 value;
+    }
+    UTP_TRANSFER_REQ_DOOR_BELL(u32) @ 0x58 {
+        31:0 value;
+    }
+    UTP_TRANSFER_REQ_LIST_CLEAR(u32) @ 0x5C {
+        31:0 value;
+    }
+    UTP_TRANSFER_REQ_LIST_RUN_STOP(u32) @ 0x60 {
+        31:0 value;
+    }
+    UTP_TASK_REQ_LIST_BASE_L(u32) @ 0x70 {
+        31:0 value;
+    }
+    UTP_TASK_REQ_LIST_BASE_H(u32) @ 0x74 {
+        31:0 value;
+    }
+    UTP_TASK_REQ_DOOR_BELL(u32) @ 0x78 {
+        31:0 value;
+    }
+    UTP_TASK_REQ_LIST_CLEAR(u32) @ 0x7C {
+        31:0 value;
+    }
+    UTP_TASK_REQ_LIST_RUN_STOP(u32) @ 0x80 {
+        31:0 value;
+    }
+    UIC_COMMAND(u32) @ 0x90 {
+        31:0 value;
+    }
+    UIC_ARG1(u32) @ 0x94 {
+        31:0 value;
+    }
+    UIC_ARG2(u32) @ 0x98 {
+        7:0 command_result;
+    }
+    UIC_ARG3(u32) @ 0x9C {
+        31:0 value;
+    }
+    UFS_MEM_CFG(u32) @ 0x300 {
+        1:1 esi_enable => bool;
+        0:0 mcq_mode_select => bool;
+    }
+    UFS_MCQ_CFG(u32) @ 0x380 {
+        16:8 max_active_cmds;
+    }
+    UFS_ESILBA(u32) @ 0x384 {
+        31:0 value;
+    }
+    UFS_ESIUBA(u32) @ 0x388 {
+        31:0 value;
+    }
+}
 
 // MCQ queue configuration registers. These offsets are relative to each
 // queue's 0x40-byte config block.
@@ -76,15 +136,6 @@ const REG_MCQ_CQTP:                          usize = 0x04;
 const REG_MCQ_CQIS:                          usize = 0x00;
 const REG_MCQ_CQIE:                          usize = 0x04;
 
-const MASK_UIC_COMMAND_RESULT:                  u32 = 0xFF;
-
-// MCQ capability/configuration masks
-const MASK_MCQ_MAX_QUEUE_SUP:                   u32 = 0x000000FF;
-const MASK_MCQ_QCFGPTR:                         u32 = 0x00FF0000;
-const SHIFT_MCQ_QCFGPTR:                        u32 = 16;
-const MASK_MCQ_CFG_MAC:                         u32 = 0x0001FF00;
-const SHIFT_MCQ_CFG_MAC:                        u32 = 8;
-
 const MCQ_QCFG_STRIDE:                          usize = 0x40;
 const MCQ_QCFGPTR_UNIT:                         usize = 0x200;
 const MCQ_ENTRY_SIZE_IN_DWORD:                  u32 = 8;
@@ -94,8 +145,6 @@ const MCQ_DEFAULT_OPR_STRIDE:                   usize = 48;
 const MCQ_POLL_INTERVAL_US:                     i64 = 20;
 const MCQ_POLL_TIMEOUT_US:                      i64 = 500000;
 
-const MCQ_MODE_SELECT:                          u32 = 1 << 0;
-const ESI_ENABLE:                               u32 = 1 << 1;
 const MCQ_CQIS_TAIL_ENT_PUSH_STS:               u32 = 0x1;
 
 const MCQ_SQ_START:                             u32 = 0x0;
@@ -105,20 +154,6 @@ const MCQ_SQ_STS:                               u32 = 0x1;
 const MCQ_SQ_CUS:                               u32 = 0x2;
 const MASK_MCQ_SQ_ICU_ERR_CODE:                 u32 = 0xF0;
 const SHIFT_MCQ_SQ_ICU_ERR_CODE:                u32 = 4;
-
-// Controller capability masks
-const MASK_TRANSFER_REQUESTS_SLOTS_SDB:          u32 = 0x0000001F;
-const MASK_TRANSFER_REQUESTS_SLOTS_MCQ:          u32 = 0x000000FF;
-const MASK_NUMBER_OUTSTANDING_RTT:               u32 = 0x0000FF00;
-const MASK_TASK_MANAGEMENT_REQUEST_SLOTS:        u32 = 0x00070000;
-const MASK_EHSLUTRD_SUPPORTED:                   u32 = 0x00400000;
-const MASK_AUTO_HIBERN8_SUPPORT:                 u32 = 0x00800000;
-const MASK_64_ADDRESSING_SUPPORT:                u32 = 0x01000000;
-const MASK_OUT_OF_ORDER_DATA_DELIVERY_SUPPORT:   u32 = 0x02000000;
-const MASK_UIC_DME_TEST_MODE_SUPPORT:            u32 = 0x04000000;
-const MASK_CRYPTO_SUPPORT:                       u32 = 0x10000000;
-const MASK_LSDB_SUPPORT:                         u32 = 0x20000000;
-const MASK_MCQ_SUPPORT:                          u32 = 0x40000000;
 
 // IS - Interrupt Status
 const UTP_TRANSFER_REQ_COMPL:                    u32 = 0x00000001;
@@ -147,24 +182,6 @@ const UTP_REQ_COMPL_MASK: u32 = UTP_TRANSFER_REQ_COMPL | UTP_TASK_REQ_COMPL;
 const ERROR_MASK: u32 = UIC_ERROR | UIC_LINK_LOST | DEVICE_FATAL_ERROR |
                         CONTROLLER_FATAL_ERROR | SYSTEM_BUS_FATAL_ERROR |
                         CRYPTO_ENGINE_FATAL_ERROR | UTP_ERROR;
-
-// HCS - Host Controller Status
-const DEVICE_PRESENT:                            u32 = 0x00000001;
-const UTP_TRANSFER_REQ_LIST_READY:               u32 = 0x00000002;
-const UTP_TASK_REQ_LIST_READY:                   u32 = 0x00000004;
-const UIC_COMMAND_READY:                         u32 = 0x00000008;
-const HOST_ERROR_INDICATOR:                      u32 = 0x00000010;
-const DEVICE_ERROR_INDICATOR:                    u32 = 0x00000020;
-const UIC_POWER_MODE_CHANGE_REQ_STATUS_MASK:     u32 = 0x00000700;
-
-const STATUS_READY: u32 = UTP_TRANSFER_REQ_LIST_READY |
-                          UTP_TASK_REQ_LIST_READY |
-                          UIC_COMMAND_READY;
-
-// HCE - Host Controller Enable
-const CONTROLLER_DISABLE:                        u32 = 0x00000000;
-const CONTROLLER_ENABLE:                         u32 = 0x00000001;
-const CRYPTO_GENERAL_ENABLE:                     u32 = 0x00000002;
 
 pub(crate) enum PowerMode {
     OK          = 0x00,
@@ -247,18 +264,6 @@ impl UfsReg {
     }
 
     #[inline(always)]
-    fn read(&self, offset: usize) -> u32 {
-        let access = self.bar.try_access().unwrap();
-        access.read32(offset)
-    }
-
-    #[inline(always)]
-    fn write(&self, offset: usize, value: u32) {
-        let access = self.bar.try_access().unwrap();
-        access.write32(value, offset);
-    }
-
-    #[inline(always)]
     fn try_read(&self, offset: usize) -> Result<u32> {
         let access = self.bar.try_access().ok_or(ENODEV)?;
         access.try_read32(offset)
@@ -268,11 +273,6 @@ impl UfsReg {
     fn try_write(&self, offset: usize, value: u32) -> Result<()> {
         let access = self.bar.try_access().ok_or(ENODEV)?;
         access.try_write32(value, offset)
-    }
-
-    #[inline(always)]
-    fn update(&self, offset: usize, mask: u32, value: u32) {
-        self.write(offset, (self.read(offset) & !mask) | (value & mask));
     }
 
     #[inline(always)]
@@ -288,223 +288,265 @@ impl UfsReg {
     // Basic Controller/Version/Interrupt
     #[inline]
     pub(crate) fn read_cap_lo(&self) -> u32 {
-        self.read(REG_CONTROLLER_CAPABILITIES)
+        let access = self.bar.try_access().unwrap();
+        access.read(CONTROLLER_CAPABILITIES).into_raw()
     }
 
     #[inline]
     pub(crate) fn read_cap_hi(&self) -> u32 {
-        self.read(REG_CONTROLLER_CAPABILITIES_H)
+        let access = self.bar.try_access().unwrap();
+        access.read(CONTROLLER_CAPABILITIES_H).value().get()
     }
 
     #[inline]
     pub(crate) fn read_version(&self) -> u32 {
-        self.read(REG_UFS_VERSION)
+        let access = self.bar.try_access().unwrap();
+        access.read(UFS_VERSION).value().get()
     }
 
     #[inline]
     pub(crate) fn read_is(&self) -> u32 {
-        self.read(REG_INTERRUPT_STATUS)
+        let access = self.bar.try_access().unwrap();
+        access.read(INTERRUPT_STATUS).value().get()
     }
 
     #[inline]
     pub(crate) fn write_is(&self, value: u32) {
-        self.write(REG_INTERRUPT_STATUS, value)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(INTERRUPT_STATUS::zeroed().with_value(value))
     }
 
     #[inline]
     pub(crate) fn read_ie(&self) -> u32 {
-        self.read(REG_INTERRUPT_ENABLE)
+        let access = self.bar.try_access().unwrap();
+        access.read(INTERRUPT_ENABLE).value().get()
     }
 
     #[inline]
     pub(crate) fn write_ie(&self, value: u32) {
-        self.write(REG_INTERRUPT_ENABLE, value)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(INTERRUPT_ENABLE::zeroed().with_value(value))
     }
 
     #[inline]
     pub(crate) fn read_hcs(&self) -> u32 {
-        self.read(REG_CONTROLLER_STATUS)
+        let access = self.bar.try_access().unwrap();
+        access.read(CONTROLLER_STATUS).into_raw()
     }
 
     #[inline]
     pub(crate) fn read_hce(&self) -> u32 {
-        self.read(REG_CONTROLLER_ENABLE)
+        let access = self.bar.try_access().unwrap();
+        access.read(CONTROLLER_ENABLE_REG).into_raw()
     }
 
     #[inline]
     pub(crate) fn write_hce(&self, value: u32) {
-        self.write(REG_CONTROLLER_ENABLE, value)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(CONTROLLER_ENABLE_REG::from_raw(value))
     }
 
     #[inline]
     pub(crate) fn read_uic_error_phy(&self) -> u32 {
-        self.read(REG_UIC_ERROR_CODE_PHY_ADAPTER_LAYER)
+        let access = self.bar.try_access().unwrap();
+        access.read(UIC_ERROR_CODE_PHY_ADAPTER_LAYER).value().get()
     }
 
     #[inline]
     pub(crate) fn write_uic_error_phy(&self, value: u32) {
-        self.write(REG_UIC_ERROR_CODE_PHY_ADAPTER_LAYER, value)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UIC_ERROR_CODE_PHY_ADAPTER_LAYER::zeroed().with_value(value))
     }
 
     // UTRL(Transfer)
     #[inline]
     pub(crate) fn write_utrlba(&self, low: u32) {
-        self.write(REG_UTP_TRANSFER_REQ_LIST_BASE_L, low)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UTP_TRANSFER_REQ_LIST_BASE_L::zeroed().with_value(low))
     }
 
     #[inline]
     pub(crate) fn write_utrlbau(&self, high: u32) {
-        self.write(REG_UTP_TRANSFER_REQ_LIST_BASE_H, high)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UTP_TRANSFER_REQ_LIST_BASE_H::zeroed().with_value(high))
     }
 
     #[inline]
     pub(crate) fn read_utrl_doorbell(&self) -> u32 {
-        self.read(REG_UTP_TRANSFER_REQ_DOOR_BELL)
+        let access = self.bar.try_access().unwrap();
+        access.read(UTP_TRANSFER_REQ_DOOR_BELL).value().get()
     }
 
     #[inline]
     pub(crate) fn ring_utrl_doorbell(&self, tag: usize) {
-        self.write(REG_UTP_TRANSFER_REQ_DOOR_BELL, 1 << tag)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UTP_TRANSFER_REQ_DOOR_BELL::zeroed().with_value(1u32 << tag))
     }
 
     #[inline]
     pub(crate) fn write_utrl_runstop(&self, value: u32) {
-        self.write(REG_UTP_TRANSFER_REQ_LIST_RUN_STOP, value)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UTP_TRANSFER_REQ_LIST_RUN_STOP::zeroed().with_value(value))
     }
 
     #[inline]
     pub(crate) fn clear_utrl_slots(&self, mask: u32) {
-        self.write(REG_UTP_TRANSFER_REQ_LIST_CLEAR, mask)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UTP_TRANSFER_REQ_LIST_CLEAR::zeroed().with_value(mask))
     }
 
     // UTMRL(Task Management)
     #[inline]
     pub(crate) fn write_utmrlba(&self, low: u32) {
-        self.write(REG_UTP_TASK_REQ_LIST_BASE_L, low)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UTP_TASK_REQ_LIST_BASE_L::zeroed().with_value(low))
     }
 
     #[inline]
     pub(crate) fn write_utmrlbau(&self, high: u32) {
-        self.write(REG_UTP_TASK_REQ_LIST_BASE_H, high)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UTP_TASK_REQ_LIST_BASE_H::zeroed().with_value(high))
     }
 
     #[inline]
     pub(crate) fn read_utmrl_doorbell(&self) -> u32 {
-        self.read(REG_UTP_TASK_REQ_DOOR_BELL)
+        let access = self.bar.try_access().unwrap();
+        access.read(UTP_TASK_REQ_DOOR_BELL).value().get()
     }
 
     #[inline]
     pub(crate) fn ring_utmrl_doorbell(&self, mask: u32) {
-        self.write(REG_UTP_TASK_REQ_DOOR_BELL, mask)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UTP_TASK_REQ_DOOR_BELL::zeroed().with_value(mask))
     }
 
     #[inline]
     pub(crate) fn write_utmrl_runstop(&self, value: u32) {
-        self.write(REG_UTP_TASK_REQ_LIST_RUN_STOP, value)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UTP_TASK_REQ_LIST_RUN_STOP::zeroed().with_value(value))
     }
 
     #[inline]
     pub(crate) fn clear_utmrl_slots(&self, mask: u32) {
-        self.write(REG_UTP_TASK_REQ_LIST_CLEAR, mask)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UTP_TASK_REQ_LIST_CLEAR::zeroed().with_value(mask))
     }
 
     // UIC command
     #[inline]
     pub(crate) fn read_uic_cmd(&self) -> u32 {
-        self.read(REG_UIC_COMMAND)
+        let access = self.bar.try_access().unwrap();
+        access.read(UIC_COMMAND).value().get()
     }
 
     #[inline]
     pub(crate) fn write_uic_cmd(&self, value: u32) {
-        self.write(REG_UIC_COMMAND, value)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UIC_COMMAND::zeroed().with_value(value))
     }
 
     #[inline]
     pub(crate) fn read_uic_arg1(&self) -> u32 {
-        self.read(REG_UIC_ARG1)
+        let access = self.bar.try_access().unwrap();
+        access.read(UIC_ARG1).value().get()
     }
 
     #[inline]
     pub(crate) fn write_uic_arg1(&self, value: u32) {
-        self.write(REG_UIC_ARG1, value)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UIC_ARG1::zeroed().with_value(value))
     }
 
     #[inline]
     pub(crate) fn read_uic_arg2(&self) -> u32 {
-        self.read(REG_UIC_ARG2)
+        let access = self.bar.try_access().unwrap();
+        access.read(UIC_ARG2).into_raw()
     }
 
     #[inline]
     pub(crate) fn write_uic_arg2(&self, value: u32) {
-        self.write(REG_UIC_ARG2, value)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UIC_ARG2::from_raw(value))
     }
 
     #[inline]
     pub(crate) fn read_uic_arg3(&self) -> u32 {
-        self.read(REG_UIC_ARG3)
+        let access = self.bar.try_access().unwrap();
+        access.read(UIC_ARG3).value().get()
     }
 
     #[inline]
     pub(crate) fn write_uic_arg3(&self, value: u32) {
-        self.write(REG_UIC_ARG3, value)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UIC_ARG3::zeroed().with_value(value))
     }
 
     // MCQ global configuration
     #[inline]
     pub(crate) fn read_mcq_cap(&self) -> u32 {
-        self.read(REG_MCQCAP)
+        let access = self.bar.try_access().unwrap();
+        access.read(MCQCAP).into_raw()
     }
 
     #[inline]
     pub(crate) fn mcq_max_queues(&self) -> usize {
-        (self.read_mcq_cap() & MASK_MCQ_MAX_QUEUE_SUP) as usize + 1
+        let access = self.bar.try_access().unwrap();
+        access.read(MCQCAP).max_queue_supported().get() as usize + 1
     }
 
     #[inline]
     pub(crate) fn mcq_queue_cfg_base(&self) -> usize {
-        (((self.read_mcq_cap() & MASK_MCQ_QCFGPTR) >> SHIFT_MCQ_QCFGPTR) as usize)
-            * MCQ_QCFGPTR_UNIT
+        let access = self.bar.try_access().unwrap();
+        access.read(MCQCAP).queue_config_pointer().get() as usize * MCQ_QCFGPTR_UNIT
     }
 
     #[inline]
     pub(crate) fn read_ufs_mem_cfg(&self) -> u32 {
-        self.read(REG_UFS_MEM_CFG)
+        let access = self.bar.try_access().unwrap();
+        access.read(UFS_MEM_CFG).into_raw()
     }
 
     #[inline]
     pub(crate) fn write_ufs_mem_cfg(&self, value: u32) {
-        self.write(REG_UFS_MEM_CFG, value)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UFS_MEM_CFG::from_raw(value))
     }
 
     #[inline]
     pub(crate) fn enable_mcq_mode(&self) {
-        self.update(REG_UFS_MEM_CFG, MCQ_MODE_SELECT, MCQ_MODE_SELECT);
+        let access = self.bar.try_access().unwrap();
+        access.update(UFS_MEM_CFG, |reg| reg.with_mcq_mode_select(true));
     }
 
     #[inline]
     pub(crate) fn disable_mcq_mode(&self) {
-        self.update(REG_UFS_MEM_CFG, MCQ_MODE_SELECT, 0);
+        let access = self.bar.try_access().unwrap();
+        access.update(UFS_MEM_CFG, |reg| reg.with_mcq_mode_select(false));
     }
 
     #[inline]
     pub(crate) fn enable_mcq_esi(&self) {
-        self.update(REG_UFS_MEM_CFG, ESI_ENABLE, ESI_ENABLE);
+        let access = self.bar.try_access().unwrap();
+        access.update(UFS_MEM_CFG, |reg| reg.with_esi_enable(true));
     }
 
     #[inline]
     pub(crate) fn config_mcq_esi(&self, addr: u64) {
-        self.write(REG_UFS_ESILBA, Self::dma_addr_lo(addr));
-        self.write(REG_UFS_ESIUBA, Self::dma_addr_hi(addr));
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UFS_ESILBA::zeroed().with_value(Self::dma_addr_lo(addr)));
+        access.write_reg(UFS_ESIUBA::zeroed().with_value(Self::dma_addr_hi(addr)));
     }
 
     #[inline]
     pub(crate) fn read_mcq_cfg(&self) -> u32 {
-        self.read(REG_UFS_MCQ_CFG)
+        let access = self.bar.try_access().unwrap();
+        access.read(UFS_MCQ_CFG).into_raw()
     }
 
     #[inline]
     pub(crate) fn write_mcq_cfg(&self, value: u32) {
-        self.write(REG_UFS_MCQ_CFG, value)
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UFS_MCQ_CFG::from_raw(value))
     }
 
     pub(crate) fn config_mcq_max_active_cmds(&self, max_active_cmds: u32) -> Result<()> {
@@ -512,11 +554,11 @@ impl UfsReg {
             return Err(EINVAL);
         }
 
-        self.update(
-            REG_UFS_MCQ_CFG,
-            MASK_MCQ_CFG_MAC,
-            (max_active_cmds - 1) << SHIFT_MCQ_CFG_MAC,
-        );
+        let access = self.bar.try_access().ok_or(ENODEV)?;
+        let value = access
+            .read(UFS_MCQ_CFG)
+            .try_with_max_active_cmds(max_active_cmds - 1)?;
+        access.write_reg(value);
         Ok(())
     }
 
@@ -834,33 +876,50 @@ impl UfsReg {
     // Helpers
     #[inline]
     pub(crate) fn nutrs(&self) -> usize {
-        (self.read_cap_lo() & MASK_TRANSFER_REQUESTS_SLOTS_SDB) as usize + 1
+        let access = self.bar.try_access().unwrap();
+        access
+            .read(CONTROLLER_CAPABILITIES)
+            .transfer_request_slots_sdb()
+            .get() as usize
+            + 1
     }
 
     #[inline]
     pub(crate) fn mcq_supported(&self) -> bool {
-        (self.read_cap_lo() & MASK_MCQ_SUPPORT) != 0
+        let access = self.bar.try_access().unwrap();
+        access.read(CONTROLLER_CAPABILITIES).mcq_supported()
     }
 
     #[inline]
     pub(crate) fn nutrs_mcq(&self) -> usize {
-        (self.read_cap_lo() & MASK_TRANSFER_REQUESTS_SLOTS_MCQ) as usize + 1
+        let access = self.bar.try_access().unwrap();
+        access
+            .read(CONTROLLER_CAPABILITIES_MCQ)
+            .transfer_request_slots()
+            .get() as usize
+            + 1
     }
 
     #[inline]
     pub(crate) fn nutmrs(&self) -> usize {
-        ((self.read_cap_lo() &
-          MASK_TASK_MANAGEMENT_REQUEST_SLOTS) >> 16) as usize + 1
+        let access = self.bar.try_access().unwrap();
+        access
+            .read(CONTROLLER_CAPABILITIES)
+            .task_management_request_slots()
+            .get() as usize
+            + 1
     }
 
     #[inline]
     pub(crate) fn autoh8(&self) -> bool {
-        (self.read_cap_lo() & MASK_AUTO_HIBERN8_SUPPORT) != 0
+        let access = self.bar.try_access().unwrap();
+        access.read(CONTROLLER_CAPABILITIES).auto_hibern8_supported()
     }
 
     #[inline]
     pub(crate) fn ctrl_enable(&self) {
-        self.write_hce(self.read_hce() | CONTROLLER_ENABLE);
+        let access = self.bar.try_access().unwrap();
+        access.update(CONTROLLER_ENABLE_REG, |reg| reg.with_controller_enable(true));
     }
 
     #[inline]
@@ -897,8 +956,11 @@ impl UfsReg {
 
         pr_info!("[RUFS] drivers/rufs/ufs_reg: wait_for_ctrl_enable");
         match read_poll_timeout(
-            || Ok(self.read_hce()),
-            |v: &u32| (*v & CONTROLLER_ENABLE) == CONTROLLER_ENABLE,
+            || {
+                let access = self.bar.try_access().ok_or(ENODEV)?;
+                Ok(access.read(CONTROLLER_ENABLE_REG))
+            },
+            |v: &CONTROLLER_ENABLE_REG| v.controller_enable(),
             Delta::from_micros(interval_us),
             Delta::from_millis(timeout_ms),
         ) {
@@ -920,7 +982,8 @@ impl UfsReg {
     }
 
     pub(crate) fn get_uic_cmd_result(&self) -> u32 {
-        self.read_uic_arg2() & MASK_UIC_COMMAND_RESULT
+        let access = self.bar.try_access().unwrap();
+        access.read(UIC_ARG2).command_result().get()
     }
 
     pub(crate) fn get_dme_attr_val(&self) -> u32 {
@@ -933,8 +996,11 @@ impl UfsReg {
         timeout_ms: i64,
     ) -> Result<()> {
         match read_poll_timeout(
-            || Ok(self.read_hcs()),
-            |v: &u32| (*v & UIC_COMMAND_READY) == UIC_COMMAND_READY,
+            || {
+                let access = self.bar.try_access().ok_or(ENODEV)?;
+                Ok(access.read(CONTROLLER_STATUS))
+            },
+            |v: &CONTROLLER_STATUS| v.uic_command_ready(),
             Delta::from_micros(interval_us),
             Delta::from_millis(timeout_ms),
         ) {
@@ -965,8 +1031,15 @@ impl UfsReg {
         timeout_ms: i64,
     ) -> Result<()> {
         match read_poll_timeout(
-            || Ok(self.read_hcs()),
-            |v: &u32| (*v & STATUS_READY) == STATUS_READY,
+            || {
+                let access = self.bar.try_access().ok_or(ENODEV)?;
+                Ok(access.read(CONTROLLER_STATUS))
+            },
+            |v: &CONTROLLER_STATUS| {
+                v.transfer_request_list_ready()
+                    && v.task_request_list_ready()
+                    && v.uic_command_ready()
+            },
             Delta::from_micros(interval_us),
             Delta::from_millis(timeout_ms),
         ) {
@@ -976,8 +1049,8 @@ impl UfsReg {
     }
 
     pub(crate) fn enable_run_stop(&self) {
-        self.write_utmrl_runstop(UTP_TASK_REQ_LIST_RUN_STOP_BIT);
-        self.write_utrl_runstop(UTP_TRANSFER_REQ_LIST_RUN_STOP_BIT);
+        self.write_utmrl_runstop(1);
+        self.write_utrl_runstop(1);
     }
 }
 
