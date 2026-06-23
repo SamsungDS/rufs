@@ -4,15 +4,24 @@
 
 #![allow(dead_code)]
 
+use crate::ufs_dma::MAX_PRD_ENTRIES;
 use crate::ufs_queue::*;
 use kernel::bindings;
-use kernel::block::{
-    error::{code, BlkResult},
-    mq::{self, gen_disk::GenDisk, gen_disk::GenDiskBuilder, IdleRequest, Operations, TagSet},
-    SECTOR_SIZE,
-};
 use kernel::sync::{Arc, ArcBorrow, Mutex, SpinLock};
 use kernel::types::{ARef, OwnableRefCounted, Owned};
+use kernel::{
+    alloc::mempool::MemPool,
+    block::{
+        error::{code, BlkResult},
+        mq::{
+            self,
+            dma_map_iter::DmaMapMempool,
+            gen_disk::{GenDisk, GenDiskBuilder},
+            IdleRequest, Operations, TagSet,
+        },
+        SECTOR_SIZE,
+    },
+};
 use kernel::{new_mutex, new_spinlock, prelude::*};
 
 const SECTOR_SIZE_U64: u64 = SECTOR_SIZE as u64;
@@ -135,6 +144,7 @@ pub(crate) struct UfsLu {
     geometry: UfsLuGeometry,
     hw_queue_depth: usize,
     queue_depth: usize,
+    dma_vec_mempool: DmaMapMempool<MAX_PRD_ENTRIES>,
 
     #[pin]
     state: SpinLock<UfsLuState>,
@@ -152,7 +162,7 @@ impl UfsLu {
         queue_depth: usize,
     ) -> Result<Arc<Self>> {
         Arc::pin_init(
-            pin_init!(Self {
+            try_pin_init!(Self {
                 queue,
                 lun,
                 geometry,
@@ -160,6 +170,7 @@ impl UfsLu {
                 queue_depth,
                 state <- new_spinlock!(UfsLuState::Reset),
                 disk <- new_mutex!(None),
+                dma_vec_mempool: MemPool::new(1)?,
             }),
             GFP_KERNEL,
         )
@@ -442,7 +453,7 @@ impl Operations for UfsLuBlockOps {
         // reclaims unique ownership of this single reference, so the driver
         // must never keep a second one while the command is in flight.
         let rq = OwnableRefCounted::into_shared(rq.start());
-        if let Err(e) = request.compose_block_request(rq, cmd, hw_queue) {
+        if let Err(e) = request.compose_block_request(&rq, cmd, hw_queue, &lu.dma_vec_mempool) {
             complete_unsubmitted(&request, e);
             return Ok(());
         }

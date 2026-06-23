@@ -9,6 +9,7 @@ use crate::ufs_irq::*;
 use crate::ufs_lu::UfsLuBlockOps;
 use crate::ufs_reg::*;
 use kernel::block::mq;
+use kernel::block::mq::dma_map_iter::DmaMapMempool;
 use kernel::cpu;
 use kernel::sync::atomic::{Atomic, Relaxed};
 use kernel::sync::{barrier, Arc, Completion, SpinLock};
@@ -706,7 +707,8 @@ trait UfsTransferOps {
         &self,
         cmd: UfsSCSICmd,
         tag: usize,
-        rq: &mq::Request<UfsLuBlockOps>,
+        rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>>;
     fn submit_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()>;
     fn submit_scsi(&self, cmd: UfsSCSICmd, tag: usize, hw_queue: Option<usize>) -> Result<()>;
@@ -746,9 +748,10 @@ impl UfsTransferOps for SdbTransferBackend {
         &self,
         cmd: UfsSCSICmd,
         tag: usize,
-        rq: &mq::Request<UfsLuBlockOps>,
+        rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>> {
-        self.dma.compose_scsi_upiu(cmd, tag, rq.as_raw())
+        self.dma.compose_scsi_upiu(cmd, tag, rq, mempool)
     }
 
     fn submit_dev(&self, _cmd: UfsDevCmd, tag: usize) -> Result<()> {
@@ -842,9 +845,10 @@ impl McqTransferBackend {
         &self,
         cmd: UfsSCSICmd,
         tag: usize,
-        rq: &mq::Request<UfsLuBlockOps>,
+        rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>> {
-        self.dma.compose_scsi_upiu(cmd, tag, rq.as_raw())
+        self.dma.compose_scsi_upiu(cmd, tag, rq, mempool)
     }
 
     fn submit_dev(&self, _cmd: UfsDevCmd, tag: usize) -> Result<()> {
@@ -925,9 +929,10 @@ impl UfsTransferOps for McqTransferBackend {
         &self,
         cmd: UfsSCSICmd,
         tag: usize,
-        rq: &mq::Request<UfsLuBlockOps>,
+        rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>> {
-        McqTransferBackend::compose_scsi(self, cmd, tag, rq)
+        McqTransferBackend::compose_scsi(self, cmd, tag, rq, mempool)
     }
 
     fn submit_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
@@ -1008,14 +1013,22 @@ impl UfsRequest {
         )
     }
 
-    pub(crate) fn issue(&self, cmd: UfsCmd) -> Result<UfsCmd> {
-        self.compose(cmd)?;
+    pub(crate) fn issue(
+        &self,
+        cmd: UfsCmd,
+        mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
+    ) -> Result<UfsCmd> {
+        self.compose(cmd, mempool)?;
         self.submit()?;
         self.wait()?;
         self.fetch()
     }
 
-    pub(crate) fn compose(&self, cmd: UfsCmd) -> Result<()> {
+    pub(crate) fn compose(
+        &self,
+        cmd: UfsCmd,
+        mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
+    ) -> Result<()> {
         match cmd {
             UfsCmd::Device(cmd) => {
                 {
@@ -1036,14 +1049,18 @@ impl UfsRequest {
                 inner.block_rq = None;
                 inner.cmd = Some(UfsCmd::Device(cmd));
             }
-            UfsCmd::SCSI(cmd) => return self.compose_scsi_cmd(cmd),
+            UfsCmd::SCSI(cmd) => return self.compose_scsi_cmd(cmd, &mempool),
         }
 
         Ok(())
     }
 
     #[inline(never)]
-    fn compose_scsi_cmd(&self, cmd: UfsSCSICmd) -> Result<()> {
+    fn compose_scsi_cmd(
+        &self,
+        cmd: UfsSCSICmd,
+        mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
+    ) -> Result<()> {
         let block_rq = {
             let mut inner = self.inner.lock();
             if inner.state != RequestState::Idle {
@@ -1055,7 +1072,7 @@ impl UfsRequest {
             block_rq
         };
 
-        let prdt = match self.queue.compose_scsi(cmd, self.tag, &block_rq) {
+        let prdt = match self.queue.compose_scsi(cmd, self.tag, &block_rq, mempool) {
             Ok(prdt) => prdt,
             Err(e) => {
                 // Keep the stored block request so the submitter can reclaim it
@@ -1073,20 +1090,21 @@ impl UfsRequest {
 
     pub(crate) fn compose_block_request(
         &self,
-        rq: ARef<mq::Request<UfsLuBlockOps>>,
+        rq: &ARef<mq::Request<UfsLuBlockOps>>,
         cmd: UfsSCSICmd,
         hw_queue: usize,
+        mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<()> {
         {
             let mut inner = self.inner.lock();
             if inner.state != RequestState::Idle {
                 return Err(EBUSY);
             }
-            inner.block_rq = Some(rq);
+            inner.block_rq = Some(rq.clone());
             inner.hw_queue = Some(hw_queue);
         }
 
-        if let Err(e) = self.compose_scsi_cmd(cmd) {
+        if let Err(e) = self.compose_scsi_cmd(cmd, mempool) {
             // Keep the stored block request so the submitter can reclaim it and
             // hand it back to the block layer.
             self.clear_keep_block_request();
@@ -1205,7 +1223,6 @@ impl UfsRequest {
     pub(crate) fn clear(&self) {
         let mut inner = self.inner.lock();
         inner.prdt = None;
-        inner.block_rq = None;
         inner.hw_queue = None;
         inner.scsi_completion = None;
         inner.cmd = None;
@@ -1527,9 +1544,13 @@ impl UfsQueue {
         &self,
         cmd: UfsSCSICmd,
         tag: usize,
-        rq: &mq::Request<UfsLuBlockOps>,
+        rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>> {
-        self.backend.lock().ops().compose_scsi(cmd, tag, rq)
+        self.backend
+            .lock()
+            .ops()
+            .compose_scsi(cmd, tag, rq, mempool)
     }
 
     fn submit_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {

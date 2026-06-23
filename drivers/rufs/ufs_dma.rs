@@ -4,13 +4,17 @@
 #![allow(unused_variables)]
 
 use crate::ufs_dev::*;
+use crate::ufs_lu::UfsLuBlockOps;
 use crate::ufs_queue::*;
 use crate::ufs_reg::*;
 use kernel::bits::genmask_u8;
+use kernel::block::mq::dma_map_iter::DmaMapIterMapped;
+use kernel::block::mq::dma_map_iter::DmaMapMempool;
 use kernel::sync::{aref::ARef, Arc, SpinLock};
 use kernel::{
-    bindings, device,
-    device::{Bound, Core},
+    bindings,
+    block::mq,
+    device::{self, Bound, Core},
     new_spinlock, pci,
     prelude::*,
 };
@@ -20,7 +24,7 @@ const PRDT_DATA_BYTE_COUNT_MAX: u32 = 0x00040000; // SZ_256K
 const PRDT_DATA_BYTE_COUNT_PAD: usize = 4;
 const UNMAP_PARAM_LIST_SIZE: usize = 24;
 const ALIGNED_UPIU_SIZE: usize = 512;
-const MAX_PRD_ENTRIES: usize = 256;
+pub(crate) const MAX_PRD_ENTRIES: usize = 256;
 const UFS_CDB_SIZE: usize = 16;
 const UFS_SENSE_SIZE: usize = 18;
 const MASK_OCS: u8 = 0x0F;
@@ -1546,15 +1550,8 @@ pub(crate) struct UfsDma {
 unsafe impl Send for UfsDma {}
 
 pub(crate) enum UfsPrdtMapping {
-    Sg(UfsSgMapping),
+    Sg(DmaMapIterMapped<MAX_PRD_ENTRIES, UfsLuBlockOps>),
     Unmap(UfsUnmapMapping),
-}
-
-pub(crate) struct UfsSgMapping {
-    dev: ARef<device::Device>,
-    sg: KVec<bindings::scatterlist>,
-    nents: i32,
-    dma_dir: bindings::dma_data_direction,
 }
 
 pub(crate) struct UfsUnmapMapping {
@@ -1571,22 +1568,6 @@ unsafe impl Send for UfsUnmapMapping {}
 struct UfsPrdt {
     mapping: Option<UfsPrdtMapping>,
     entries: KVec<PrdEntry>,
-}
-
-impl Drop for UfsSgMapping {
-    fn drop(&mut self) {
-        // SAFETY: `sg` was mapped by `dma_map_sg_attrs` with this device,
-        // entry count, direction, and attributes.
-        unsafe {
-            bindings::dma_unmap_sg_attrs(
-                self.dev.as_raw(),
-                self.sg.as_mut_ptr(),
-                self.nents,
-                self.dma_dir,
-                0,
-            )
-        };
-    }
 }
 
 impl Drop for UfsUnmapMapping {
@@ -1703,9 +1684,10 @@ impl UfsDma {
         &self,
         cmd: UfsSCSICmd,
         tag: usize,
-        rq: *mut bindings::request,
+        rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>> {
-        let prdt = self.map_request_prdt(tag, cmd, rq)?;
+        let prdt = self.map_request_prdt(tag, cmd, rq, mempool)?;
         let inner = self.inner.lock();
 
         dma_write!(inner.ucdl, [tag]?.cmd_upiu, Upiu::command(cmd, tag));
@@ -1764,7 +1746,8 @@ impl UfsDma {
         &self,
         tag: usize,
         cmd: UfsSCSICmd,
-        rq: *mut bindings::request,
+        rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<UfsPrdt> {
         let entries = KVec::new();
         if cmd.data_len() == 0 {
@@ -1782,86 +1765,37 @@ impl UfsDma {
             return self.map_unmap_prdt(cmd);
         }
 
-        if rq.is_null() {
-            return Err(EINVAL);
-        }
-
-        // SAFETY: `rq` is a live blk-mq request owned by the queue_rq callback.
-        let nr_segments = unsafe { (*rq).nr_phys_segments as usize };
-        if nr_segments == 0 || nr_segments > MAX_PRD_ENTRIES {
-            return Err(EINVAL);
-        }
-
-        let mut sg = KVec::with_capacity(nr_segments, GFP_ATOMIC)?;
-        for _ in 0..nr_segments {
-            sg.push(bindings::scatterlist::default(), GFP_ATOMIC)?;
-        }
-
-        // SAFETY: `sg` has `nr_segments` initialized entries.
-        unsafe { bindings::sg_init_table(sg.as_mut_ptr(), nr_segments as u32) };
-
-        let mut last_sg: *mut bindings::scatterlist = core::ptr::null_mut();
-
-        // SAFETY: `rq` is valid and `sg` points to a scatterlist table with enough entries.
-        let nents = unsafe { bindings::__blk_rq_map_sg(rq, sg.as_mut_ptr(), &mut last_sg) };
-        if nents <= 0 {
-            return Err(EIO);
-        }
-
-        let dma_dir = match cmd.direction() {
-            UfsScsiDataDirection::Read => bindings::dma_data_direction_DMA_FROM_DEVICE,
-            UfsScsiDataDirection::Write => bindings::dma_data_direction_DMA_TO_DEVICE,
-            UfsScsiDataDirection::None => bindings::dma_data_direction_DMA_NONE,
-        };
-
-        // SAFETY: `self.dev` is a valid DMA device and the scatterlist was populated above.
-        let mapped = unsafe {
-            bindings::dma_map_sg_attrs(self.dev.as_raw(), sg.as_mut_ptr(), nents, dma_dir, 0)
-        };
-        if mapped <= 0 {
-            return Err(ENOMEM);
-        }
-
-        let mut mapping = UfsSgMapping {
-            dev: self.dev.clone(),
-            sg,
-            nents,
-            dma_dir,
-        };
-
-        let mut entries = KVec::with_capacity(mapped as usize, GFP_ATOMIC)?;
-        let mut sgp = mapping.sg.as_mut_ptr();
-        for _ in 0..mapped as usize {
-            if sgp.is_null() {
-                return Err(EIO);
+        let iter = rq
+            .clone()
+            .dma_map_iter(&self.dev, mempool.clone())
+            .map_err(|_error| ENOMEM)?;
+        let mut remaining = cmd.data_len();
+        let mut entries = KVec::new();
+        loop {
+            let segment_address = iter.address();
+            let segment_length = iter.length();
+            entries.push(
+                PrdEntry {
+                    addr: segment_address.to_le(),
+                    reserved: 0,
+                    size: (segment_length - 1).to_le(),
+                },
+                GFP_ATOMIC,
+            )?;
+            remaining = remaining.saturating_sub(segment_length);
+            if remaining == 0 {
+                break;
             }
-
-            // SAFETY: `sgp` is a valid mapped scatterlist entry.
-            let addr = unsafe { bindings::sg_dma_address(sgp) };
-            // SAFETY: `sgp` is a valid mapped scatterlist entry.
-            let len = unsafe { bindings::sg_dma_len(sgp) };
-            if len == 0 || len > PRDT_DATA_BYTE_COUNT_MAX {
-                return Err(EINVAL);
-            }
-
-            let entry = PrdEntry {
-                addr: addr.to_le(),
-                reserved: 0,
-                size: (len - 1).to_le(),
-            };
-
-            entries.push(entry, GFP_ATOMIC)?;
-
-            // SAFETY: `sgp` is a valid scatterlist entry.
-            sgp = unsafe { bindings::sg_next(sgp) };
         }
+        let iter = iter.finish();
 
         Ok(UfsPrdt {
-            mapping: Some(UfsPrdtMapping::Sg(mapping)),
+            mapping: Some(UfsPrdtMapping::Sg(iter)),
             entries,
         })
     }
 
+    // TODO: Use `Coherent`
     fn map_unmap_prdt(&self, cmd: UfsSCSICmd) -> Result<UfsPrdt> {
         if cmd.unmap_blocks() == 0 {
             return Err(EINVAL);

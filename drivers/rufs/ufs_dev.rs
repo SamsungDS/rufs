@@ -4,9 +4,11 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use crate::ufs_dma::DescBuffer;
+use crate::ufs_dma::{DescBuffer, MAX_PRD_ENTRIES};
 use crate::ufs_queue::*;
+use kernel::alloc::mempool::MemPool;
 use kernel::block::mq;
+use kernel::block::mq::dma_map_iter::DmaMapMempool;
 use kernel::error::{from_err_ptr, to_result};
 use kernel::sync::{Arc, Mutex};
 use kernel::time::{delay, Delta};
@@ -719,6 +721,8 @@ pub(crate) struct UfsDev {
 
     #[pin]
     tmf_queue: Mutex<Option<KBox<TmfQueue>>>,
+
+    dma_vec_pool: DmaMapMempool<MAX_PRD_ENTRIES>,
 }
 
 impl UfsDev {
@@ -729,6 +733,7 @@ impl UfsDev {
                 info <- new_mutex!(UfsDevInfo::default()),
                 request <- new_mutex!(None),
                 tmf_queue <- new_mutex!(None),
+                dma_vec_pool: MemPool::new(1)?,
             }),
             GFP_KERNEL,
         )
@@ -761,7 +766,10 @@ impl UfsDev {
 
     fn issue(&self, cmd: UfsCmd) -> Result<UfsCmd> {
         let request = self.request.lock();
-        request.as_ref().ok_or(EINVAL)?.issue(cmd)
+        request
+            .as_ref()
+            .ok_or(EINVAL)?
+            .issue(cmd, &self.dma_vec_pool)
     }
 
     fn nop(&self) -> Result<()> {
