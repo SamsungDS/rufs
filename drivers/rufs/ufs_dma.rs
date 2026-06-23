@@ -1681,6 +1681,7 @@ impl UfsDma {
             // bounded by MAX_PRD_ENTRIES in `map_request_prdt`, and PRDT lives
             // in a packed UCD so unaligned writes are required.
             unsafe {
+                // TODO: Use IO projections when available.
                 let ucd = inner.ucdl.as_mut_ptr().cast::<Ucd>().add(tag);
                 let table = core::ptr::addr_of_mut!((*ucd).prdt).cast::<PrdEntry>();
                 core::ptr::write_unaligned(table.add(i), *entry);
@@ -1791,6 +1792,7 @@ impl UfsDma {
         data[8..16].copy_from_slice(&cmd.unmap_lba().to_be_bytes());
         data[16..20].copy_from_slice(&cmd.unmap_blocks().to_be_bytes());
 
+        // TODO: Consider using a dma pool instead of allocating for each unmap
         let buffer: Coherent<[u8]> = Coherent::from_slice(self.dev(), &data, GFP_ATOMIC)?;
 
         let mapping = UfsUnmapMapping {
