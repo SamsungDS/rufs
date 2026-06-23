@@ -4,6 +4,7 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
+use kernel::block::mq;
 use kernel::time::{Delta, delay};
 use kernel::{bindings, kvec, new_mutex, prelude::*};
 use kernel::error::{from_err_ptr, to_result};
@@ -20,7 +21,7 @@ const FDEVICE_COMPL_TICK_US: i64 = 500;
 
 pub(crate) const QUERY_DESC_MAX_SIZE: usize = 255;
 
-const REQ_OP_DRV_OUT: bindings::blk_opf_t = bindings::req_op_REQ_OP_DRV_OUT;
+const DRIVER_OUT: bindings::blk_opf_t = mq::Command::DriverOut.as_opf();
 const BLK_STS_NOTSUPP: bindings::blk_status_t = 1;
 
 unsafe extern "C" fn queue_tmf(
@@ -101,7 +102,7 @@ impl TmfQueue {
 
     fn alloc_request(&mut self) -> Result<*mut bindings::request> {
         let req = from_err_ptr(unsafe {
-            bindings::blk_mq_alloc_request(self.queue, REQ_OP_DRV_OUT, 0)
+            bindings::blk_mq_alloc_request(self.queue, DRIVER_OUT, 0)
         })?;
         let tag = unsafe { (*req).tag };
         if tag < 0 || tag as usize >= self.rqs.len() {

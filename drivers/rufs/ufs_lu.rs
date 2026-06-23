@@ -206,7 +206,7 @@ impl UfsLu {
         self.state() == UfsLuState::Operational
     }
 
-    fn build_scsi_cmd(&self, op: bindings::req_op, lba: u64, blocks: u64) -> Result<UfsSCSICmd> {
+    fn build_scsi_cmd(&self, command: mq::Command, lba: u64, blocks: u64) -> Result<UfsSCSICmd> {
         let blocks = u32::try_from(blocks).map_err(|_| EINVAL)?;
         let data_len = u32::try_from(
             u64::from(self.geometry.logical_block_size())
@@ -215,15 +215,15 @@ impl UfsLu {
         )
         .map_err(|_| EOVERFLOW)?;
 
-        match op {
-            bindings::req_op_REQ_OP_READ => {
+        match command {
+            mq::Command::Read => {
                 Ok(UfsSCSICmd::read_write(self.lun, false, lba, blocks, data_len, false))
             }
-            bindings::req_op_REQ_OP_WRITE => {
+            mq::Command::Write => {
                 Ok(UfsSCSICmd::read_write(self.lun, true, lba, blocks, data_len, false))
             }
-            bindings::req_op_REQ_OP_FLUSH => Ok(UfsSCSICmd::flush(self.lun)),
-            bindings::req_op_REQ_OP_DISCARD => {
+            mq::Command::Flush => Ok(UfsSCSICmd::flush(self.lun)),
+            mq::Command::Discard => {
                 Ok(UfsSCSICmd::unmap(self.lun, lba, blocks))
             }
             _ => Err(ENOTSUPP),
@@ -306,7 +306,7 @@ impl Operations for UfsLuBlockOps {
         rq: Owned<IdleRequest<Self>>,
         _is_last: bool,
     ) -> BlkResult {
-        let op = rq.command() as bindings::req_op;
+        let command = rq.command();
         let sector = rq.sector();
         let sectors = rq.sectors();
         let geometry = lu.geometry();
@@ -314,8 +314,8 @@ impl Operations for UfsLuBlockOps {
         let tag = usize::try_from(rq.tag()).map_err(|_| EINVAL)?;
         let hw_queue = usize::try_from(rq.queue_index()).map_err(|_| EINVAL)?;
 
-        let cmd = match op {
-            bindings::req_op_REQ_OP_READ | bindings::req_op_REQ_OP_WRITE => {
+        let cmd = match command {
+            mq::Command::Read | mq::Command::Write => {
                 if sectors == 0 {
                     pr_debug!("[RUFS] ufs_lu: zero-length request on LU {}\n", lu.lun());
                     rq.start().end_ok();
@@ -349,23 +349,23 @@ impl Operations for UfsLuBlockOps {
 
                 let lba = geometry.sectors_to_logical(sector);
                 let blocks = geometry.sectors_to_logical(u64::from(sectors));
-                let cmd = lu.build_scsi_cmd(op, lba, blocks)?;
+                let cmd = lu.build_scsi_cmd(command, lba, blocks)?;
 
                 pr_debug!(
-                    "[RUFS] ufs_lu: LU {} op={} lba={} blocks={}\n",
+                    "[RUFS] ufs_lu: LU {} command={:?} lba={} blocks={}\n",
                     lu.lun(),
-                    op,
+                    command,
                     lba,
                     blocks,
                 );
 
                 cmd
             }
-            bindings::req_op_REQ_OP_FLUSH => {
+            mq::Command::Flush => {
                 pr_debug!("[RUFS] ufs_lu: flush request on LU {}\n", lu.lun());
-                lu.build_scsi_cmd(op, 0, 0)?
+                lu.build_scsi_cmd(command, 0, 0)?
             }
-            bindings::req_op_REQ_OP_DISCARD => {
+            mq::Command::Discard => {
                 if sectors == 0 {
                     pr_debug!("[RUFS] ufs_lu: zero-length discard on LU {}\n", lu.lun());
                     rq.start().end_ok();
@@ -399,7 +399,7 @@ impl Operations for UfsLuBlockOps {
 
                 let lba = geometry.sectors_to_logical(sector);
                 let blocks = geometry.sectors_to_logical(u64::from(sectors));
-                let cmd = lu.build_scsi_cmd(op, lba, blocks)?;
+                let cmd = lu.build_scsi_cmd(command, lba, blocks)?;
 
                 pr_debug!(
                     "[RUFS] ufs_lu: discard LU {} lba={} blocks={}\n",
@@ -412,8 +412,8 @@ impl Operations for UfsLuBlockOps {
             }
             _ => {
                 pr_warn!(
-                    "[RUFS] ufs_lu: unsupported request op={} on LU {}\n",
-                    op,
+                    "[RUFS] ufs_lu: unsupported request command={:?} on LU {}\n",
+                    command,
                     lu.lun(),
                 );
                 rq.start().end(bindings::BLK_STS_NOTSUPP as u8);
