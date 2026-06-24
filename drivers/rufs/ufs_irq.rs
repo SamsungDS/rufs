@@ -2,14 +2,14 @@
 
 #![allow(dead_code)]
 
-use kernel::{pci, prelude::*, c_str, new_mutex, new_spinlock};
-use kernel::device::{Device, Core, Bound};
-use kernel::sync::{Arc, Mutex, SpinLock};
-use kernel::sync::atomic::{Atomic, Acquire, Release};
-use kernel::irq::{self, Flags, IrqReturn, ThreadedIrqReturn};
+use crate::ufs_queue::*;
 use crate::ufs_reg::*;
 use crate::ufs_uic::*;
-use crate::ufs_queue::*;
+use kernel::device::{Bound, Core, Device};
+use kernel::irq::{self, Flags, IrqReturn, ThreadedIrqReturn};
+use kernel::sync::atomic::{Acquire, Atomic, Release};
+use kernel::sync::{Arc, Mutex, SpinLock};
+use kernel::{c_str, new_mutex, new_spinlock, pci, prelude::*};
 
 #[pin_data]
 struct UfsUicHandler {
@@ -81,7 +81,8 @@ impl UfsIrq {
             try_pin_init!(Self {
                 uic <- new_mutex!(None),
                 queue <- new_spinlock!(KVec::new()),
-            }), GFP_KERNEL,
+            }),
+            GFP_KERNEL,
         )
     }
 
@@ -98,12 +99,7 @@ impl UfsIrq {
             interrupt_status: Atomic::new(0),
         });
 
-        let irq = pdev.request_threaded_irq(
-            vector,
-            Flags::SHARED,
-            c_str!("ufshcd-uic"),
-            handler,
-        );
+        let irq = pdev.request_threaded_irq(vector, Flags::SHARED, c_str!("ufshcd-uic"), handler);
 
         let reg = Arc::pin_init(irq, GFP_KERNEL)?;
         self.uic.lock().replace(reg);
@@ -154,12 +150,7 @@ impl UfsIrq {
             placeholder <- new_spinlock!(0),
         });
 
-        let irq = pdev.request_threaded_irq(
-            vector,
-            Flags::SHARED,
-            c_str!("ufshcd-queue"),
-            handler,
-        );
+        let irq = pdev.request_threaded_irq(vector, Flags::SHARED, c_str!("ufshcd-queue"), handler);
 
         let irq = Arc::pin_init(irq, GFP_KERNEL)?;
         irqs.push(irq, GFP_KERNEL)?;

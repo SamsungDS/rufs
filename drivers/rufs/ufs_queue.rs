@@ -3,17 +3,17 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
+use crate::ufs_dev::*;
+use crate::ufs_dma::*;
+use crate::ufs_irq::*;
+use crate::ufs_lu::UfsLuBlockOps;
+use crate::ufs_reg::*;
 use kernel::block::mq;
 use kernel::cpu;
-use kernel::{bindings, prelude::*, kvec, new_spinlock};
 use kernel::sync::atomic::{Atomic, Relaxed};
 use kernel::sync::{barrier, Arc, Completion, SpinLock};
 use kernel::types::{ARef, OwnableRefCounted};
-use crate::ufs_reg::*;
-use crate::ufs_dma::*;
-use crate::ufs_irq::*;
-use crate::ufs_dev::*;
-use crate::ufs_lu::UfsLuBlockOps;
+use kernel::{bindings, kvec, new_spinlock, prelude::*};
 
 const READ_10: u8 = 0x28;
 const WRITE_10: u8 = 0x2a;
@@ -236,9 +236,7 @@ fn boot_unit_attention(sense: Option<&ScsiSense>) -> bool {
 fn should_requeue_scsi(completion: UfsScsiCompletion, sense: Option<&ScsiSense>) -> bool {
     matches!(
         completion,
-        UfsScsiCompletion::Busy
-            | UfsScsiCompletion::TaskSetFull
-            | UfsScsiCompletion::Requeue
+        UfsScsiCompletion::Busy | UfsScsiCompletion::TaskSetFull | UfsScsiCompletion::Requeue
     ) || (matches!(completion, UfsScsiCompletion::CheckCondition)
         && retryable_check_condition(sense))
 }
@@ -295,13 +293,13 @@ impl UfsSCSICmd {
                 cdb[1] = flags;
                 cdb[2..6].copy_from_slice(&lba.to_be_bytes());
                 cdb[7..9].copy_from_slice(&blocks.to_be_bytes());
-            },
+            }
             _ => {
                 cdb[0] = if write { WRITE_16 } else { READ_16 };
                 cdb[1] = flags;
                 cdb[2..10].copy_from_slice(&lba.to_be_bytes());
                 cdb[10..14].copy_from_slice(&blocks.to_be_bytes());
-            },
+            }
         }
 
         Self {
@@ -371,7 +369,6 @@ impl UfsSCSICmd {
     pub(crate) fn unmap_blocks(&self) -> u32 {
         self.unmap_blocks
     }
-
 }
 
 #[derive(Copy, Clone)]
@@ -387,7 +384,6 @@ impl UfsCmd {
             _ => Err(EINVAL),
         }
     }
-
 }
 
 #[derive(PartialEq, Copy, Clone)]
@@ -535,7 +531,12 @@ impl McqQueueSet {
         Ok(())
     }
 
-    fn poll_completions_for_queue(&self, reg: &UfsReg, dma: &UfsDma, queue_id: usize) -> Result<()> {
+    fn poll_completions_for_queue(
+        &self,
+        reg: &UfsReg,
+        dma: &UfsDma,
+        queue_id: usize,
+    ) -> Result<()> {
         let mut guard = self.queues.lock();
         // SAFETY: While holding the lock, this method only mutates queue state
         // in place and never moves queues out of the vector or grows it.
@@ -880,7 +881,8 @@ impl McqTransferBackend {
             return Err(EINVAL);
         }
 
-        self.queues.poll_completions_for_queue(&self.reg, &self.dma, queue)
+        self.queues
+            .poll_completions_for_queue(&self.reg, &self.dma, queue)
     }
 
     fn completion_cached(&self, tag: usize) -> bool {
@@ -1033,7 +1035,7 @@ impl UfsRequest {
                 inner.prdt = None;
                 inner.block_rq = None;
                 inner.cmd = Some(UfsCmd::Device(cmd));
-            },
+            }
             UfsCmd::SCSI(cmd) => return self.compose_scsi_cmd(cmd),
         }
 
@@ -1101,7 +1103,7 @@ impl UfsRequest {
             UfsCmd::Device(cmd) => {
                 self.queue.prepare_dev_wait();
                 self.queue.submit_dev(cmd, self.tag)
-            },
+            }
             UfsCmd::SCSI(cmd) => self.queue.submit_scsi(cmd, self.tag, hw_queue),
         };
 
@@ -1144,7 +1146,7 @@ impl UfsRequest {
             Err(e) => {
                 self.clear();
                 Err(e)
-            },
+            }
             Ok(()) => Ok(()),
         }
     }
@@ -1169,11 +1171,11 @@ impl UfsRequest {
             Err(e) => {
                 self.clear();
                 Err(e)
-            },
+            }
             Ok(cmd) => {
                 self.clear();
                 Ok(cmd)
-            },
+            }
         }
     }
 
@@ -1269,7 +1271,7 @@ impl UfsRequest {
                 block_rq.end(bindings::BLK_STS_IOERR as u8);
                 drop(prdt);
                 true
-            },
+            }
             Err(block_rq) => {
                 let mut inner = self.inner.lock();
                 inner.cmd = cmd;
@@ -1278,7 +1280,7 @@ impl UfsRequest {
                 inner.hw_queue = hw_queue;
                 inner.state = RequestState::Completed;
                 false
-            },
+            }
         }
     }
 
@@ -1313,7 +1315,7 @@ impl UfsRequest {
                 self.inner.lock().state = RequestState::Completed;
                 self.queue.complete_dev(cmd, self.tag);
                 true
-            },
+            }
             UfsCmd::SCSI(cmd) => {
                 let result = self.scsi_completion_result();
                 let (block_rq, prdt) = {
@@ -1331,11 +1333,14 @@ impl UfsRequest {
 
                 drop(prdt);
 
-                match self.queue.complete_scsi(cmd, self.tag, result, block_rq, target) {
+                match self
+                    .queue
+                    .complete_scsi(cmd, self.tag, result, block_rq, target)
+                {
                     Ok(()) => {
                         self.clear();
                         true
-                    },
+                    }
                     Err(block_rq) => {
                         pr_debug!(
                             "[RUFS] ufs_queue: SCSI completion retry pending tag={}\n",
@@ -1345,9 +1350,9 @@ impl UfsRequest {
                         inner.block_rq = Some(block_rq);
                         inner.state = RequestState::Completed;
                         false
-                    },
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -1377,11 +1382,7 @@ pub(crate) struct UfsQueue {
 }
 
 impl UfsQueue {
-    pub(crate) fn new(
-        reg: Arc<UfsReg>,
-        irq: Arc<UfsIrq>,
-        dma: Arc<UfsDma>,
-    ) -> Result<Arc<Self>> {
+    pub(crate) fn new(reg: Arc<UfsReg>, irq: Arc<UfsIrq>, dma: Arc<UfsDma>) -> Result<Arc<Self>> {
         if reg.mcq_supported() {
             pr_info!(
                 "[RUFS] ufs_queue: MCQ supported by controller mcq_depth={}\n",
@@ -1426,18 +1427,12 @@ impl UfsQueue {
         Ok(())
     }
 
-    pub(crate) fn enable_mcq_backend(
-        &self,
-        reg: Arc<UfsReg>,
-        dma: Arc<UfsDma>,
-    ) -> Result<()> {
+    pub(crate) fn enable_mcq_backend(&self, reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Result<()> {
         let backend = McqTransferBackend::new(reg, dma)?;
         backend.prepare()?;
-        backend
-            .reg
-            .config_mcq_max_active_cmds(
-                u32::try_from(backend.queue_depth()).map_err(|_| EOVERFLOW)?,
-            )?;
+        backend.reg.config_mcq_max_active_cmds(
+            u32::try_from(backend.queue_depth()).map_err(|_| EOVERFLOW)?,
+        )?;
         backend.enable();
         backend.reg.enable_mcq_interrupts();
 
@@ -1496,10 +1491,7 @@ impl UfsQueue {
             .ok_or(ENOMEM)
     }
 
-    pub(crate) fn acquire(
-        self: &Arc<Self>,
-        tag: usize,
-    ) -> Result<Arc<UfsRequest>> {
+    pub(crate) fn acquire(self: &Arc<Self>, tag: usize) -> Result<Arc<UfsRequest>> {
         self.validate_tag_depth(tag)?;
 
         let request = {
@@ -1510,7 +1502,7 @@ impl UfsQueue {
                 None => {
                     pr_err!("[RUFS] ufs_queue: no slot for tag={}\n", tag);
                     return Err(EINVAL);
-                },
+                }
             }
         };
 
@@ -1557,7 +1549,7 @@ impl UfsQueue {
             0 => {
                 self.dump_backend_state(tag, "device request timeout");
                 Err(ETIMEDOUT)
-            },
+            }
             _ => Ok(()),
         }
     }
@@ -1614,8 +1606,12 @@ impl UfsQueue {
     fn next_request(&self, mut tag: usize) -> Option<Arc<UfsRequest>> {
         while let Some(slot) = self.slot.lock().get_mut(tag) {
             match slot {
-                Some(request) => { return Some(request.clone()); },
-                None => { tag += 1; },
+                Some(request) => {
+                    return Some(request.clone());
+                }
+                None => {
+                    tag += 1;
+                }
             }
         }
         None
@@ -1654,7 +1650,7 @@ impl UfsQueue {
                 match inner.state {
                     RequestState::Submitted | RequestState::Completed => {
                         inner.hw_queue == Some(hw_queue)
-                    },
+                    }
                     _ => false,
                 }
             };
@@ -1883,7 +1879,7 @@ impl UfsQueue {
                 } else {
                     bindings::BLK_STS_IOERR
                 }
-            },
+            }
             UfsScsiCompletion::Error => bindings::BLK_STS_IOERR,
         };
 

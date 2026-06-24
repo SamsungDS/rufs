@@ -4,24 +4,17 @@
 
 #![allow(dead_code)]
 
-use kernel::{
-    block::mq::TagSet,
-    device::Core,
-    pci,
-    prelude::*,
-    new_mutex,
-    new_spinlock,
-};
-use kernel::time::{Delta, delay::*};
 use kernel::sync::{Arc, Mutex, SpinLock};
+use kernel::time::{delay::*, Delta};
+use kernel::{block::mq::TagSet, device::Core, new_mutex, new_spinlock, pci, prelude::*};
 
-use crate::ufs_reg::*;
+use crate::ufs_dev::*;
 use crate::ufs_dma::*;
 use crate::ufs_irq::*;
-use crate::ufs_uic::*;
-use crate::ufs_queue::*;
-use crate::ufs_dev::*;
 use crate::ufs_lu::*;
+use crate::ufs_queue::*;
+use crate::ufs_reg::*;
+use crate::ufs_uic::*;
 
 const HBA_ENABLE_DELAY_US: i64 = 1000;
 
@@ -71,13 +64,17 @@ impl UfsHost {
                     e.to_errno(),
                 );
                 1
-            },
+            }
         };
         let msi_irq_types = pci::IrqTypes::default()
             .with(pci::IrqType::MsiX)
             .with(pci::IrqType::Msi);
         let irq_vectors = if requested_irq_vectors > 1 {
-            match pdev.alloc_irq_vectors(requested_irq_vectors, requested_irq_vectors, msi_irq_types) {
+            match pdev.alloc_irq_vectors(
+                requested_irq_vectors,
+                requested_irq_vectors,
+                msi_irq_types,
+            ) {
                 Ok(irq_vectors) => irq_vectors,
                 Err(e) => {
                     pr_warn!(
@@ -86,7 +83,7 @@ impl UfsHost {
                         e.to_errno(),
                     );
                     pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?
-                },
+                }
             }
         } else {
             pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?
@@ -106,11 +103,7 @@ impl UfsHost {
 
         let irq = UfsIrq::new()?;
         let uic = UfsUic::new(reg.clone(), irq.clone())?;
-        let queue = UfsQueue::new(
-            reg.clone(),
-            irq.clone(),
-            dma.clone(),
-        )?;
+        let queue = UfsQueue::new(reg.clone(), irq.clone(), dma.clone())?;
         let dev = UfsDev::new(queue.clone())?;
         let host = Arc::pin_init(
             pin_init!(Self {
@@ -124,7 +117,8 @@ impl UfsHost {
                 state <- new_spinlock!(HostState::Reset),
                 max_hw_queues: 1,
                 max_prdt_entries: 256,
-            }), GFP_KERNEL,
+            }),
+            GFP_KERNEL,
         )?;
 
         host.reg.ctrl_enable();
@@ -132,12 +126,8 @@ impl UfsHost {
         host.reg.wait_for_ctrl_enable(1000, 50)?;
 
         /* ufshcd_link_startup() */
-        host.irq.request_uic_irq(
-            pdev,
-            first_irq_vector,
-            host.reg.clone(),
-            host.uic.clone(),
-        )?;
+        host.irq
+            .request_uic_irq(pdev, first_irq_vector, host.reg.clone(), host.uic.clone())?;
         host.uic.link_startup()?;
         host.dma.make_hba_operational()?;
 
@@ -157,14 +147,17 @@ impl UfsHost {
             );
         }
         if host.reg.mcq_supported() {
-            match host.queue.enable_mcq_backend(host.reg.clone(), host.dma.clone()) {
-                Ok(()) => {},
+            match host
+                .queue
+                .enable_mcq_backend(host.reg.clone(), host.dma.clone())
+            {
+                Ok(()) => {}
                 Err(e) => {
                     pr_warn!(
                         "[RUFS] ufs_host: MCQ setup failed errno={}, keep SDB backend\n",
                         e.to_errno(),
                     );
-                },
+                }
             }
         }
         host.dev.alloc_dev_request()?;
@@ -246,13 +239,34 @@ impl UfsHost {
     }
 
     // getter
-    #[inline] pub(crate) fn state(&self) -> HostState { *self.state.lock() }
+    #[inline]
+    pub(crate) fn state(&self) -> HostState {
+        *self.state.lock()
+    }
 
     // state
-    #[inline] fn set_state(&self, state: HostState) { *self.state.lock() = state; }
-    #[inline] fn enter_eh_nonfatal(&self) { *self.state.lock() = HostState::EhNonFatal; }
-    #[inline] fn enter_eh_fatal(&self) { *self.state.lock() = HostState::EhFatal; }
-    #[inline] fn enter_error(&self) { *self.state.lock() = HostState::Error; }
-    #[inline] fn promote_to_operational(&self) { *self.state.lock() = HostState::Operational; }
-    #[inline] fn fallback_to_reset(&self) { *self.state.lock() = HostState::Reset; }
+    #[inline]
+    fn set_state(&self, state: HostState) {
+        *self.state.lock() = state;
+    }
+    #[inline]
+    fn enter_eh_nonfatal(&self) {
+        *self.state.lock() = HostState::EhNonFatal;
+    }
+    #[inline]
+    fn enter_eh_fatal(&self) {
+        *self.state.lock() = HostState::EhFatal;
+    }
+    #[inline]
+    fn enter_error(&self) {
+        *self.state.lock() = HostState::Error;
+    }
+    #[inline]
+    fn promote_to_operational(&self) {
+        *self.state.lock() = HostState::Operational;
+    }
+    #[inline]
+    fn fallback_to_reset(&self) {
+        *self.state.lock() = HostState::Reset;
+    }
 }

@@ -4,13 +4,13 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use kernel::block::mq;
-use kernel::time::{Delta, delay};
-use kernel::{bindings, kvec, new_mutex, prelude::*};
-use kernel::error::{from_err_ptr, to_result};
-use kernel::sync::{Arc, Mutex};
 use crate::ufs_dma::DescBuffer;
 use crate::ufs_queue::*;
+use kernel::block::mq;
+use kernel::error::{from_err_ptr, to_result};
+use kernel::sync::{Arc, Mutex};
+use kernel::time::{delay, Delta};
+use kernel::{bindings, kvec, new_mutex, prelude::*};
 
 const NOP_OUT_TIMEOUT_MS: i64 = 50;
 const QUERY_DEFAULT_TIMEOUT_MS: i64 = 1500;
@@ -101,9 +101,8 @@ impl TmfQueue {
     }
 
     fn alloc_request(&mut self) -> Result<*mut bindings::request> {
-        let req = from_err_ptr(unsafe {
-            bindings::blk_mq_alloc_request(self.queue, DRIVER_OUT, 0)
-        })?;
+        let req =
+            from_err_ptr(unsafe { bindings::blk_mq_alloc_request(self.queue, DRIVER_OUT, 0) })?;
         let tag = unsafe { (*req).tag };
         if tag < 0 || tag as usize >= self.rqs.len() {
             unsafe { bindings::blk_mq_free_request(req) };
@@ -141,17 +140,17 @@ impl Drop for TmfQueue {
 
 #[derive(Copy, Clone)]
 pub(crate) enum DescIdn {
-    Device          = 0x0,
-    Config          = 0x1,
-    Unit            = 0x2,
-    RFU0            = 0x3,
-    Interconn       = 0x4,
-    String          = 0x5,
-    RFU1            = 0x6,
-    Geometry        = 0x7,
-    Power           = 0x8,
-    Health          = 0x9,
-    Reserved        = 0xFF,
+    Device = 0x0,
+    Config = 0x1,
+    Unit = 0x2,
+    RFU0 = 0x3,
+    Interconn = 0x4,
+    String = 0x5,
+    RFU1 = 0x6,
+    Geometry = 0x7,
+    Power = 0x8,
+    Health = 0x9,
+    Reserved = 0xFF,
 }
 
 impl From<u8> for DescIdn {
@@ -429,7 +428,7 @@ pub(crate) enum AttrIdn {
     SecondsPassed = 0x0F,
     CntxConf = 0x10,
     CorrPrgBlkNum = 0x11,
-    FFUStatus =0x14,
+    FFUStatus = 0x14,
     PSAState = 0x15,
     PSADataSize = 0x16,
     RefClkGatingWaitTime = 0x17,
@@ -510,28 +509,33 @@ pub(crate) struct UfsAttrCmd {
 
 impl UfsAttrCmd {
     fn build(idn: AttrIdn, index: u8, selector: u8, value: u64) -> Self {
-        Self { idn, index, selector, value }
+        Self {
+            idn,
+            index,
+            selector,
+            value,
+        }
     }
 }
 
 #[derive(Copy, Clone)]
 pub(crate) enum FlagIdn {
-    Reserved                    = 0x00,
-    FDeviceInit                 = 0x01,
-    PermanentWPE                = 0x02,
-    PwrOnWPE                    = 0x03,
-    BkOpsEn                     = 0x04,
-    LifeSpanModeEnable          = 0x05,
-    PurgeEnable                 = 0x06,
-    FPhyResourceRemoval         = 0x08,
-    BusyRTC                     = 0x09,
-    PermanentlyDisableFWUpdate  = 0x0B,
-    WBEn                        = 0x0E,
-    WBBuffFlushEn               = 0x0F,
-    WBBuffFlushDuringHibern8    = 0x10,
-    HPBReset                    = 0x11,
-    HPBEn                       = 0x12,
-    UnpinEn                     = 0x13,
+    Reserved = 0x00,
+    FDeviceInit = 0x01,
+    PermanentWPE = 0x02,
+    PwrOnWPE = 0x03,
+    BkOpsEn = 0x04,
+    LifeSpanModeEnable = 0x05,
+    PurgeEnable = 0x06,
+    FPhyResourceRemoval = 0x08,
+    BusyRTC = 0x09,
+    PermanentlyDisableFWUpdate = 0x0B,
+    WBEn = 0x0E,
+    WBBuffFlushEn = 0x0F,
+    WBBuffFlushDuringHibern8 = 0x10,
+    HPBReset = 0x11,
+    HPBEn = 0x12,
+    UnpinEn = 0x13,
 }
 
 impl From<u8> for FlagIdn {
@@ -567,7 +571,12 @@ pub(crate) struct UfsFlagCmd {
 
 impl UfsFlagCmd {
     fn build(idn: FlagIdn, index: u8, selector: u8) -> Self {
-        Self { idn, index, selector, value: 0 }
+        Self {
+            idn,
+            index,
+            selector,
+            value: 0,
+        }
     }
 }
 
@@ -585,7 +594,9 @@ pub(crate) enum UfsQueryCmd {
 }
 
 impl Default for UfsQueryCmd {
-    fn default() -> Self { Self::Nop }
+    fn default() -> Self {
+        Self::Nop
+    }
 }
 
 impl UfsQueryCmd {
@@ -599,13 +610,7 @@ impl UfsQueryCmd {
         UfsCmd::Device(UfsDevCmd::Query(Self::ReadAttr(cmd)))
     }
 
-    fn write_attr(
-        &self,
-        idn: AttrIdn,
-        index: u8,
-        selector: u8,
-        value: u64,
-    ) -> UfsCmd {
+    fn write_attr(&self, idn: AttrIdn, index: u8, selector: u8, value: u64) -> UfsCmd {
         let cmd = UfsAttrCmd::build(idn, index, selector, value);
         UfsCmd::Device(UfsDevCmd::Query(Self::WriteAttr(cmd)))
     }
@@ -667,8 +672,12 @@ pub(crate) enum UfsDevCmd {
 }
 
 impl UfsDevCmd {
-    fn nop() -> UfsCmd { UfsCmd::Device(Self::Nop) }
-    fn query() -> UfsQueryCmd { UfsQueryCmd::default() }
+    fn nop() -> UfsCmd {
+        UfsCmd::Device(Self::Nop)
+    }
+    fn query() -> UfsQueryCmd {
+        UfsQueryCmd::default()
+    }
 
     pub(crate) fn timeout(&self) -> Delta {
         match *self {
@@ -712,7 +721,7 @@ pub(crate) struct UfsDev {
     tmf_queue: Mutex<Option<KBox<TmfQueue>>>,
 }
 
-impl UfsDev{
+impl UfsDev {
     pub(crate) fn new(queue: Arc<UfsQueue>) -> Result<Arc<Self>> {
         Arc::pin_init(
             try_pin_init!(Self {
@@ -784,13 +793,7 @@ impl UfsDev{
         self.info.lock().num_lu
     }
 
-    fn write_attr(
-        &self,
-        idn: AttrIdn,
-        index: u8,
-        selector: u8,
-        value: u64,
-    ) -> Result<()> {
+    fn write_attr(&self, idn: AttrIdn, index: u8, selector: u8, value: u64) -> Result<()> {
         let cmd = self.issue(UfsDevCmd::query().write_attr(idn, index, selector, value))?;
         if cmd.get_device()?.get_query()?.get_attr_value()? == value {
             Ok(())
@@ -830,7 +833,7 @@ impl UfsDev{
                 0 => {
                     pr_info!("[RUFS] ufs_dev: device initialized");
                     return Ok(());
-                },
+                }
                 _ => {
                     pr_info!("[RUFS] ufs_dev: device not initialized... try again");
                     timeout -= tick;
@@ -851,8 +854,12 @@ impl UfsDev{
     fn get_geometry_info(&self) -> Result<()> {
         let desc = self.read_desc(DescIdn::Geometry, 0, 0)?.get_geometry()?;
         match desc.max_number_lu {
-            1 => { self.info.lock().max_lu = 32; },
-            _ => { self.info.lock().max_lu = 8; },
+            1 => {
+                self.info.lock().max_lu = 32;
+            }
+            _ => {
+                self.info.lock().max_lu = 8;
+            }
         }
 
         Ok(())

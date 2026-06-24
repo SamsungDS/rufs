@@ -2,27 +2,27 @@
 
 #![allow(dead_code)]
 
-use kernel::{prelude::*, new_mutex, new_spinlock};
-use kernel::sync::{Arc, Mutex, SpinLock, Completion};
-use kernel::time::Delta;
-use crate::ufs_reg::*;
 use crate::ufs_irq::*;
+use crate::ufs_reg::*;
+use kernel::sync::{Arc, Completion, Mutex, SpinLock};
+use kernel::time::Delta;
+use kernel::{new_mutex, new_spinlock, prelude::*};
 
 #[derive(Copy, Clone)]
 enum UicCmdDme {
-    Get         = 0x01,
-    Set         = 0x02,
-    PeerGet     = 0x03,
-    PeerSet     = 0x04,
-    PowerOn     = 0x10,
-    PowerOff    = 0x11,
-    Enable      = 0x12,
-    Reset       = 0x14,
-    EndPtRst    = 0x15,
+    Get = 0x01,
+    Set = 0x02,
+    PeerGet = 0x03,
+    PeerSet = 0x04,
+    PowerOn = 0x10,
+    PowerOff = 0x11,
+    Enable = 0x12,
+    Reset = 0x14,
+    EndPtRst = 0x15,
     LinkStartup = 0x16,
     HibernEnter = 0x17,
-    HibernExit  = 0x18,
-    TestMode    = 0x1A,
+    HibernExit = 0x18,
+    TestMode = 0x1A,
 }
 
 enum UicCmdTimeoutMs {
@@ -91,10 +91,7 @@ pub(crate) struct UfsUic {
 }
 
 impl UfsUic {
-    pub(crate) fn new(
-        reg: Arc<UfsReg>,
-        irq: Arc<UfsIrq>,
-    ) -> Result<Arc<Self>> {
+    pub(crate) fn new(reg: Arc<UfsReg>, irq: Arc<UfsIrq>) -> Result<Arc<Self>> {
         Arc::pin_init(
             try_pin_init!(Self {
                 reg,
@@ -118,7 +115,8 @@ impl UfsUic {
         self.cmd.lock().replace(cmd);
 
         self.reg.enable_uic_interrupts();
-        self.reg.wait_for_uic_cmd_ready(500, UicCmdTimeoutMs::DEFAULT as i64)?;
+        self.reg
+            .wait_for_uic_cmd_ready(500, UicCmdTimeoutMs::DEFAULT as i64)?;
 
         self.dispatch_uic_cmd(cmd);
         self.wait_for_uic_cmd()?;
@@ -146,7 +144,7 @@ impl UfsUic {
                     Some(_) => Err(EIO),
                     None => Err(ENOMEM),
                 }
-            },
+            }
         }
     }
 
@@ -157,7 +155,6 @@ impl UfsUic {
                 value: self.reg.get_dme_attr_val(),
             };
             self.rsp.lock().replace(rsp);
-
         } else if is_uic_power_mode(interrupt_status) {
             let rsp = UfsUicRsp {
                 result: UicCmdResult::Success,

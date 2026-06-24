@@ -2,9 +2,9 @@
 
 #![allow(dead_code)]
 
-use kernel::{pci, device::Core, devres::Devres, prelude::*, c_str, sync::Arc};
-use kernel::io::{register, Io, poll::read_poll_timeout};
+use kernel::io::{poll::read_poll_timeout, register, Io};
 use kernel::time::Delta;
+use kernel::{c_str, device::Core, devres::Devres, pci, prelude::*, sync::Arc};
 
 const UFS_BAR0_LEN: usize = 0x1000;
 type Bar0 = pci::Bar<UFS_BAR0_LEN>;
@@ -113,83 +113,87 @@ register! {
 
 // MCQ queue configuration registers. These offsets are relative to each
 // queue's 0x40-byte config block.
-const REG_MCQ_SQATTR:                        usize = 0x00;
-const REG_MCQ_SQLBA:                         usize = 0x04;
-const REG_MCQ_SQUBA:                         usize = 0x08;
-const REG_MCQ_SQDAO:                         usize = 0x0C;
-const REG_MCQ_SQISAO:                        usize = 0x10;
-const REG_MCQ_CQATTR:                        usize = 0x20;
-const REG_MCQ_CQLBA:                         usize = 0x24;
-const REG_MCQ_CQUBA:                         usize = 0x28;
-const REG_MCQ_CQDAO:                         usize = 0x2C;
-const REG_MCQ_CQISAO:                        usize = 0x30;
+const REG_MCQ_SQATTR: usize = 0x00;
+const REG_MCQ_SQLBA: usize = 0x04;
+const REG_MCQ_SQUBA: usize = 0x08;
+const REG_MCQ_SQDAO: usize = 0x0C;
+const REG_MCQ_SQISAO: usize = 0x10;
+const REG_MCQ_CQATTR: usize = 0x20;
+const REG_MCQ_CQLBA: usize = 0x24;
+const REG_MCQ_CQUBA: usize = 0x28;
+const REG_MCQ_CQDAO: usize = 0x2C;
+const REG_MCQ_CQISAO: usize = 0x30;
 
 // MCQ operation/runtime registers. These offsets are relative to each SQD,
 // SQIS, CQD, or CQIS operation region.
-const REG_MCQ_SQHP:                          usize = 0x00;
-const REG_MCQ_SQTP:                          usize = 0x04;
-const REG_MCQ_SQRTC:                         usize = 0x08;
-const REG_MCQ_SQCTI:                         usize = 0x0C;
-const REG_MCQ_SQRTS:                         usize = 0x10;
-const REG_MCQ_CQHP:                          usize = 0x00;
-const REG_MCQ_CQTP:                          usize = 0x04;
-const REG_MCQ_CQIS:                          usize = 0x00;
-const REG_MCQ_CQIE:                          usize = 0x04;
+const REG_MCQ_SQHP: usize = 0x00;
+const REG_MCQ_SQTP: usize = 0x04;
+const REG_MCQ_SQRTC: usize = 0x08;
+const REG_MCQ_SQCTI: usize = 0x0C;
+const REG_MCQ_SQRTS: usize = 0x10;
+const REG_MCQ_CQHP: usize = 0x00;
+const REG_MCQ_CQTP: usize = 0x04;
+const REG_MCQ_CQIS: usize = 0x00;
+const REG_MCQ_CQIE: usize = 0x04;
 
-const MCQ_QCFG_STRIDE:                          usize = 0x40;
-const MCQ_QCFGPTR_UNIT:                         usize = 0x200;
-const MCQ_ENTRY_SIZE_IN_DWORD:                  u32 = 8;
-const MCQ_QUEUE_EN:                             u32 = 1 << 31;
-const MCQ_QUEUE_ID_SHIFT:                       u32 = 16;
-const MCQ_DEFAULT_OPR_STRIDE:                   usize = 48;
-const MCQ_POLL_INTERVAL_US:                     i64 = 20;
-const MCQ_POLL_TIMEOUT_US:                      i64 = 500000;
+const MCQ_QCFG_STRIDE: usize = 0x40;
+const MCQ_QCFGPTR_UNIT: usize = 0x200;
+const MCQ_ENTRY_SIZE_IN_DWORD: u32 = 8;
+const MCQ_QUEUE_EN: u32 = 1 << 31;
+const MCQ_QUEUE_ID_SHIFT: u32 = 16;
+const MCQ_DEFAULT_OPR_STRIDE: usize = 48;
+const MCQ_POLL_INTERVAL_US: i64 = 20;
+const MCQ_POLL_TIMEOUT_US: i64 = 500000;
 
-const MCQ_CQIS_TAIL_ENT_PUSH_STS:               u32 = 0x1;
+const MCQ_CQIS_TAIL_ENT_PUSH_STS: u32 = 0x1;
 
-const MCQ_SQ_START:                             u32 = 0x0;
-const MCQ_SQ_STOP:                              u32 = 0x1;
-const MCQ_SQ_ICU:                               u32 = 0x2;
-const MCQ_SQ_STS:                               u32 = 0x1;
-const MCQ_SQ_CUS:                               u32 = 0x2;
-const MASK_MCQ_SQ_ICU_ERR_CODE:                 u32 = 0xF0;
-const SHIFT_MCQ_SQ_ICU_ERR_CODE:                u32 = 4;
+const MCQ_SQ_START: u32 = 0x0;
+const MCQ_SQ_STOP: u32 = 0x1;
+const MCQ_SQ_ICU: u32 = 0x2;
+const MCQ_SQ_STS: u32 = 0x1;
+const MCQ_SQ_CUS: u32 = 0x2;
+const MASK_MCQ_SQ_ICU_ERR_CODE: u32 = 0xF0;
+const SHIFT_MCQ_SQ_ICU_ERR_CODE: u32 = 4;
 
 // IS - Interrupt Status
-const UTP_TRANSFER_REQ_COMPL:                    u32 = 0x00000001;
-const UIC_DME_END_PT_RESET:                      u32 = 0x00000002;
-const UIC_ERROR:                                 u32 = 0x00000004;
-const UIC_TEST_MODE:                             u32 = 0x00000008;
-const UIC_POWER_MODE:                            u32 = 0x00000010;
-const UIC_HIBERNATE_EXIT:                        u32 = 0x00000020;
-const UIC_HIBERNATE_ENTER:                       u32 = 0x00000040;
-const UIC_LINK_LOST:                             u32 = 0x00000080;
-const UIC_LINK_STARTUP:                          u32 = 0x00000100;
-const UTP_TASK_REQ_COMPL:                        u32 = 0x00000200;
-const UIC_COMMAND_COMPL:                         u32 = 0x00000400;
-const DEVICE_FATAL_ERROR:                        u32 = 0x00000800;
-const UTP_ERROR:                                 u32 = 0x00001000;
-const CONTROLLER_FATAL_ERROR:                    u32 = 0x00010000;
-const SYSTEM_BUS_FATAL_ERROR:                    u32 = 0x00020000;
-const CRYPTO_ENGINE_FATAL_ERROR:                 u32 = 0x00040000;
-const MCQ_CQ_EVENT_STATUS:                       u32 = 0x00100000;
+const UTP_TRANSFER_REQ_COMPL: u32 = 0x00000001;
+const UIC_DME_END_PT_RESET: u32 = 0x00000002;
+const UIC_ERROR: u32 = 0x00000004;
+const UIC_TEST_MODE: u32 = 0x00000008;
+const UIC_POWER_MODE: u32 = 0x00000010;
+const UIC_HIBERNATE_EXIT: u32 = 0x00000020;
+const UIC_HIBERNATE_ENTER: u32 = 0x00000040;
+const UIC_LINK_LOST: u32 = 0x00000080;
+const UIC_LINK_STARTUP: u32 = 0x00000100;
+const UTP_TASK_REQ_COMPL: u32 = 0x00000200;
+const UIC_COMMAND_COMPL: u32 = 0x00000400;
+const DEVICE_FATAL_ERROR: u32 = 0x00000800;
+const UTP_ERROR: u32 = 0x00001000;
+const CONTROLLER_FATAL_ERROR: u32 = 0x00010000;
+const SYSTEM_BUS_FATAL_ERROR: u32 = 0x00020000;
+const CRYPTO_ENGINE_FATAL_ERROR: u32 = 0x00040000;
+const MCQ_CQ_EVENT_STATUS: u32 = 0x00100000;
 
 const UIC_INTR_HIBERNATE_MASK: u32 = UIC_HIBERNATE_EXIT | UIC_HIBERNATE_ENTER;
 const UIC_INTR_POWER_MASK: u32 = UIC_POWER_MODE | UIC_INTR_HIBERNATE_MASK;
 const UIC_INTR_MASK: u32 = UIC_INTR_POWER_MASK | UIC_COMMAND_COMPL;
 
 const UTP_REQ_COMPL_MASK: u32 = UTP_TRANSFER_REQ_COMPL | UTP_TASK_REQ_COMPL;
-const ERROR_MASK: u32 = UIC_ERROR | UIC_LINK_LOST | DEVICE_FATAL_ERROR |
-                        CONTROLLER_FATAL_ERROR | SYSTEM_BUS_FATAL_ERROR |
-                        CRYPTO_ENGINE_FATAL_ERROR | UTP_ERROR;
+const ERROR_MASK: u32 = UIC_ERROR
+    | UIC_LINK_LOST
+    | DEVICE_FATAL_ERROR
+    | CONTROLLER_FATAL_ERROR
+    | SYSTEM_BUS_FATAL_ERROR
+    | CRYPTO_ENGINE_FATAL_ERROR
+    | UTP_ERROR;
 
 pub(crate) enum PowerMode {
-    OK          = 0x00,
-    Local       = 0x01,
-    Remote      = 0x02,
-    Busy        = 0x03,
-    ErrorCap    = 0x04,
-    FatalError  = 0x05,
+    OK = 0x00,
+    Local = 0x01,
+    Remote = 0x02,
+    Busy = 0x03,
+    ErrorCap = 0x04,
+    FatalError = 0x05,
 }
 
 #[derive(Clone, Copy)]
@@ -235,7 +239,12 @@ impl UfsMcqOprSet {
         cqd: UfsMcqOprInfo,
         cqis: UfsMcqOprInfo,
     ) -> Self {
-        Self { sqd, sqis, cqd, cqis }
+        Self {
+            sqd,
+            sqis,
+            cqd,
+            cqis,
+        }
     }
 
     fn get(&self, region: UfsMcqOprRegion) -> UfsMcqOprInfo {
@@ -259,7 +268,8 @@ impl UfsReg {
         Arc::pin_init(
             try_pin_init!(Self {
                 bar <- pdev.iomap_region_sized::<UFS_BAR0_LEN>(0, c_str!("rufs_pci")),
-            }), GFP_KERNEL,
+            }),
+            GFP_KERNEL,
         )
     }
 
@@ -803,11 +813,7 @@ impl UfsReg {
         )
     }
 
-    pub(crate) fn initiate_mcq_sq_cleanup(
-        &self,
-        oprs: &UfsMcqOprSet,
-        queue: usize,
-    ) -> Result<()> {
+    pub(crate) fn initiate_mcq_sq_cleanup(&self, oprs: &UfsMcqOprSet, queue: usize) -> Result<()> {
         let rtc = self.read_mcq_opr(oprs, UfsMcqOprRegion::Sqd, queue, REG_MCQ_SQRTC)?;
         self.write_mcq_sq_runtime_control(oprs, queue, rtc | MCQ_SQ_ICU)?;
         self.wait_mcq_sq_status(oprs, queue, MCQ_SQ_CUS, true)
@@ -819,8 +825,10 @@ impl UfsReg {
         oprs: &UfsMcqOprSet,
         queue: usize,
     ) -> Result<u32> {
-        Ok((self.read_mcq_sq_runtime_status(oprs, queue)? & MASK_MCQ_SQ_ICU_ERR_CODE)
-            >> SHIFT_MCQ_SQ_ICU_ERR_CODE)
+        Ok(
+            (self.read_mcq_sq_runtime_status(oprs, queue)? & MASK_MCQ_SQ_ICU_ERR_CODE)
+                >> SHIFT_MCQ_SQ_ICU_ERR_CODE,
+        )
     }
 
     #[inline]
@@ -913,13 +921,17 @@ impl UfsReg {
     #[inline]
     pub(crate) fn autoh8(&self) -> bool {
         let access = self.bar.try_access().unwrap();
-        access.read(CONTROLLER_CAPABILITIES).auto_hibern8_supported()
+        access
+            .read(CONTROLLER_CAPABILITIES)
+            .auto_hibern8_supported()
     }
 
     #[inline]
     pub(crate) fn ctrl_enable(&self) {
         let access = self.bar.try_access().unwrap();
-        access.update(CONTROLLER_ENABLE_REG, |reg| reg.with_controller_enable(true));
+        access.update(CONTROLLER_ENABLE_REG, |reg| {
+            reg.with_controller_enable(true)
+        });
     }
 
     #[inline]
@@ -938,22 +950,17 @@ impl UfsReg {
     #[inline]
     pub(crate) fn set_utrdl_base(&self, dma_addr: u64) {
         self.write_utrlba(dma_addr as u32);
-        self.write_utrlbau((dma_addr >>32) as u32);
+        self.write_utrlbau((dma_addr >> 32) as u32);
     }
 
     #[inline]
     pub(crate) fn set_utmrdl_base(&self, dma_addr: u64) {
         self.write_utmrlba(dma_addr as u32);
-        self.write_utmrlbau((dma_addr >>32) as u32);
+        self.write_utmrlbau((dma_addr >> 32) as u32);
     }
 
     #[inline]
-    pub(crate) fn wait_for_ctrl_enable(
-        &self,
-        interval_us: i64,
-        timeout_ms: i64,
-    ) -> Result<()> {
-
+    pub(crate) fn wait_for_ctrl_enable(&self, interval_us: i64, timeout_ms: i64) -> Result<()> {
         pr_info!("[RUFS] drivers/rufs/ufs_reg: wait_for_ctrl_enable");
         match read_poll_timeout(
             || {
@@ -964,7 +971,7 @@ impl UfsReg {
             Delta::from_micros(interval_us),
             Delta::from_millis(timeout_ms),
         ) {
-            Ok(_) => { Ok(()) },
+            Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -990,11 +997,7 @@ impl UfsReg {
         self.read_uic_arg3()
     }
 
-    pub(crate) fn wait_for_uic_cmd_ready(
-        &self,
-        interval_us: i64,
-        timeout_ms: i64,
-    ) -> Result<()> {
+    pub(crate) fn wait_for_uic_cmd_ready(&self, interval_us: i64, timeout_ms: i64) -> Result<()> {
         match read_poll_timeout(
             || {
                 let access = self.bar.try_access().ok_or(ENODEV)?;
@@ -1004,7 +1007,7 @@ impl UfsReg {
             Delta::from_micros(interval_us),
             Delta::from_millis(timeout_ms),
         ) {
-            Ok(_) => { Ok(()) },
+            Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -1025,11 +1028,7 @@ impl UfsReg {
         self.write_ie(self.read_ie() | MCQ_CQ_EVENT_STATUS);
     }
 
-    pub(crate) fn wait_for_request_ready(
-        &self,
-        interval_us: i64,
-        timeout_ms: i64,
-    ) -> Result<()> {
+    pub(crate) fn wait_for_request_ready(&self, interval_us: i64, timeout_ms: i64) -> Result<()> {
         match read_poll_timeout(
             || {
                 let access = self.bar.try_access().ok_or(ENODEV)?;
@@ -1043,7 +1042,7 @@ impl UfsReg {
             Delta::from_micros(interval_us),
             Delta::from_millis(timeout_ms),
         ) {
-            Ok(_) => { Ok(()) },
+            Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
     }

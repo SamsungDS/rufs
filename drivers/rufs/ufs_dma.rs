@@ -3,13 +3,18 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
-use kernel::{bindings, device, pci, device::{Bound, Core}, prelude::*, new_spinlock};
-use kernel::{dma, dma_read, dma_write};
-use kernel::bits::genmask_u8;
-use kernel::sync::{Arc, SpinLock, aref::ARef};
-use crate::ufs_reg::*;
-use crate::ufs_queue::*;
 use crate::ufs_dev::*;
+use crate::ufs_queue::*;
+use crate::ufs_reg::*;
+use kernel::bits::genmask_u8;
+use kernel::sync::{aref::ARef, Arc, SpinLock};
+use kernel::{
+    bindings, device,
+    device::{Bound, Core},
+    new_spinlock, pci,
+    prelude::*,
+};
+use kernel::{dma, dma_read, dma_write};
 
 const PRDT_DATA_BYTE_COUNT_MAX: u32 = 0x00040000; // SZ_256K
 const PRDT_DATA_BYTE_COUNT_PAD: usize = 4;
@@ -74,25 +79,25 @@ impl UfsScsiResult {
 
 // UPIU
 enum UpiuFlag {
-    None    = 0x00,
-    CP      = 0x04,
-    Write   = 0x20,
-    Read    = 0x40,
+    None = 0x00,
+    CP = 0x04,
+    Write = 0x20,
+    Read = 0x40,
 }
 
 enum UpiuTransaction {
-    NopOut      = 0x00,
-    Command     = 0x01,
-    DataOut     = 0x02,
-    TaskReq     = 0x04,
-    QueryReq    = 0x16,
-    NopIn       = 0x20,
-    Response    = 0x21,
-    DataIn      = 0x22,
-    TaskRsp     = 0x24,
-    ReadyXfer   = 0x31,
-    QueryRsp    = 0x36,
-    Reject  = 0x3F,
+    NopOut = 0x00,
+    Command = 0x01,
+    DataOut = 0x02,
+    TaskReq = 0x04,
+    QueryReq = 0x16,
+    NopIn = 0x20,
+    Response = 0x21,
+    DataIn = 0x22,
+    TaskRsp = 0x24,
+    ReadyXfer = 0x31,
+    QueryRsp = 0x36,
+    Reject = 0x3F,
 }
 
 impl From<u8> for UpiuTransaction {
@@ -115,8 +120,8 @@ impl From<u8> for UpiuTransaction {
 }
 
 enum UpiuQueryFunction {
-    StandardRead    = 0x01,
-    StandardWrite   = 0x81,
+    StandardRead = 0x01,
+    StandardWrite = 0x81,
 }
 
 enum UpiuResponse {
@@ -276,9 +281,9 @@ impl Default for UpiuRsp {
 #[derive(Default, Clone, Copy)]
 struct UpiuTmReq {
     header: UpiuHeader,
-    input_param1: u32,  // (BE)
-    input_param2: u32,  // (BE)
-    input_param3: u32,  // (BE)
+    input_param1: u32, // (BE)
+    input_param2: u32, // (BE)
+    input_param3: u32, // (BE)
     reserved: [u32; 2],
     // Task Management doesn't have padding
     // because it is pre-allocated in UTMRD DMA aree directly
@@ -296,15 +301,15 @@ struct UpiuTmRsp {
 }
 
 enum QueryOpcode {
-    Nop         = 0x0,
-    ReadDesc    = 0x1,
-    WriteDesc   = 0x2,
-    ReadAttr    = 0x3,
-    WriteAttr   = 0x4,
-    ReadFlag    = 0x5,
-    SetFlag     = 0x6,
-    ClearFlag   = 0x7,
-    ToggleFlag  = 0x8,
+    Nop = 0x0,
+    ReadDesc = 0x1,
+    WriteDesc = 0x2,
+    ReadAttr = 0x3,
+    WriteAttr = 0x4,
+    ReadFlag = 0x5,
+    SetFlag = 0x6,
+    ClearFlag = 0x7,
+    ToggleFlag = 0x8,
 }
 
 #[repr(C)]
@@ -444,31 +449,45 @@ union UpiuQueryReq {
 
 impl UpiuQueryReq {
     fn read_desc(cmd: UfsDescCmd) -> Self {
-        Self { read_desc: UpiuReadDescReq::build(cmd) }
+        Self {
+            read_desc: UpiuReadDescReq::build(cmd),
+        }
     }
 
     fn read_attr(cmd: UfsAttrCmd) -> Self {
-        Self { read_attr: UpiuReadAttrReq::build(cmd) }
+        Self {
+            read_attr: UpiuReadAttrReq::build(cmd),
+        }
     }
 
     fn write_attr(cmd: UfsAttrCmd) -> Self {
-        Self { write_attr: UpiuWriteAttrReq::build(cmd) }
+        Self {
+            write_attr: UpiuWriteAttrReq::build(cmd),
+        }
     }
 
     fn read_flag(cmd: UfsFlagCmd) -> Self {
-        Self { read_flag: UpiuFlagReq::build(cmd, QueryOpcode::ReadFlag) }
+        Self {
+            read_flag: UpiuFlagReq::build(cmd, QueryOpcode::ReadFlag),
+        }
     }
 
     fn set_flag(cmd: UfsFlagCmd) -> Self {
-        Self { set_flag: UpiuFlagReq::build(cmd, QueryOpcode::SetFlag) }
+        Self {
+            set_flag: UpiuFlagReq::build(cmd, QueryOpcode::SetFlag),
+        }
     }
 
     fn clear_flag(cmd: UfsFlagCmd) -> Self {
-        Self { clear_flag: UpiuFlagReq::build(cmd, QueryOpcode::ClearFlag) }
+        Self {
+            clear_flag: UpiuFlagReq::build(cmd, QueryOpcode::ClearFlag),
+        }
     }
 
     fn toggle_flag(cmd: UfsFlagCmd) -> Self {
-        Self { toggle_flag: UpiuFlagReq::build(cmd, QueryOpcode::ToggleFlag) }
+        Self {
+            toggle_flag: UpiuFlagReq::build(cmd, QueryOpcode::ToggleFlag),
+        }
     }
 }
 
@@ -567,39 +586,57 @@ union UpiuBody {
 
 impl UpiuBody {
     fn nop_out() -> Self {
-        Self { nop_out: UpiuNop::build() }
+        Self {
+            nop_out: UpiuNop::build(),
+        }
     }
 
     fn read_desc(cmd: UfsDescCmd) -> Self {
-        Self { query_req: UpiuQueryReq::read_desc(cmd) }
+        Self {
+            query_req: UpiuQueryReq::read_desc(cmd),
+        }
     }
 
     fn read_attr(cmd: UfsAttrCmd) -> Self {
-        Self { query_req: UpiuQueryReq::read_attr(cmd) }
+        Self {
+            query_req: UpiuQueryReq::read_attr(cmd),
+        }
     }
 
     fn write_attr(cmd: UfsAttrCmd) -> Self {
-        Self { query_req: UpiuQueryReq::write_attr(cmd) }
+        Self {
+            query_req: UpiuQueryReq::write_attr(cmd),
+        }
     }
 
     fn read_flag(cmd: UfsFlagCmd) -> Self {
-        Self { query_req: UpiuQueryReq::read_flag(cmd) }
+        Self {
+            query_req: UpiuQueryReq::read_flag(cmd),
+        }
     }
 
     fn set_flag(cmd: UfsFlagCmd) -> Self {
-        Self { query_req: UpiuQueryReq::set_flag(cmd) }
+        Self {
+            query_req: UpiuQueryReq::set_flag(cmd),
+        }
     }
 
     fn clear_flag(cmd: UfsFlagCmd) -> Self {
-        Self { query_req: UpiuQueryReq::clear_flag(cmd) }
+        Self {
+            query_req: UpiuQueryReq::clear_flag(cmd),
+        }
     }
 
     fn toggle_flag(cmd: UfsFlagCmd) -> Self {
-        Self { query_req: UpiuQueryReq::toggle_flag(cmd) }
+        Self {
+            query_req: UpiuQueryReq::toggle_flag(cmd),
+        }
     }
 
     fn command(cmd: UfsSCSICmd) -> Self {
-        Self { cmd: UpiuCmd::command(cmd) }
+        Self {
+            cmd: UpiuCmd::command(cmd),
+        }
     }
 }
 
@@ -614,7 +651,7 @@ impl Default for Upiu {
     fn default() -> Self {
         Self {
             header: UpiuHeader::default(),
-            body: UpiuBody::nop_out()
+            body: UpiuBody::nop_out(),
         }
     }
 }
@@ -716,8 +753,7 @@ impl Upiu {
     fn scsi_result(&self, ocs: u8) -> UfsScsiResult {
         let upiu = self.body;
         let rsp = unsafe { upiu.rsp };
-        let sense_data_len = usize::from(u16::from_be(rsp.sendse_data_len))
-            .min(UFS_SENSE_SIZE);
+        let sense_data_len = usize::from(u16::from_be(rsp.sendse_data_len)).min(UFS_SENSE_SIZE);
 
         let mut result = UfsScsiResult {
             completion: UfsScsiCompletion::Error,
@@ -731,7 +767,7 @@ impl Upiu {
         };
 
         match self.transaction() {
-            UpiuTransaction::Response => {},
+            UpiuTransaction::Response => {}
             _ => return result,
         }
 
@@ -750,28 +786,20 @@ impl Upiu {
 
     fn fetch_dev(&self, cmd: UfsDevCmd) -> Result<UfsDevCmd> {
         match cmd {
-            UfsDevCmd::Nop => {
-                match self.transaction() {
-                    UpiuTransaction::NopIn => Ok(cmd),
-                    _ => Err(EIO),
-                }
+            UfsDevCmd::Nop => match self.transaction() {
+                UpiuTransaction::NopIn => Ok(cmd),
+                _ => Err(EIO),
             },
-            UfsDevCmd::Query(cmd) => {
-                match self.transaction() {
-                    UpiuTransaction::QueryRsp => {
-                        match self.response() {
-                            UpiuResponse::Success => self.fetch_query(cmd),
-                            _ => Err(EIO),
-                        }
-                    },
+            UfsDevCmd::Query(cmd) => match self.transaction() {
+                UpiuTransaction::QueryRsp => match self.response() {
+                    UpiuResponse::Success => self.fetch_query(cmd),
                     _ => Err(EIO),
-                }
+                },
+                _ => Err(EIO),
             },
-            UfsDevCmd::RPMB(cmd) => {
-                match self.transaction() {
-                    UpiuTransaction::Response => Ok(UfsDevCmd::RPMB(cmd)),
-                    _ => Err(EIO),
-                }
+            UfsDevCmd::RPMB(cmd) => match self.transaction() {
+                UpiuTransaction::Response => Ok(UfsDevCmd::RPMB(cmd)),
+                _ => Err(EIO),
             },
         }
     }
@@ -788,7 +816,7 @@ impl Upiu {
                     length: u16::from_be(upiu.length),
                     desc: Desc::from_buffer(upiu.idn, upiu.buffer),
                 })))
-            },
+            }
             UfsQueryCmd::ReadAttr(cmd) => {
                 let upiu = self.body;
                 let upiu = unsafe { upiu.query_rsp.attr };
@@ -798,7 +826,7 @@ impl Upiu {
                     selector: upiu.selector,
                     value: u64::from_be(upiu.value),
                 })))
-            },
+            }
             UfsQueryCmd::WriteAttr(cmd) => {
                 let upiu = self.body;
                 let upiu = unsafe { upiu.query_rsp.attr };
@@ -808,7 +836,7 @@ impl Upiu {
                     selector: upiu.selector,
                     value: u64::from_be(upiu.value),
                 })))
-            },
+            }
             UfsQueryCmd::ReadFlag(cmd) => {
                 let upiu = self.body;
                 let upiu = unsafe { upiu.query_rsp.flag };
@@ -818,7 +846,7 @@ impl Upiu {
                     selector: upiu.selector,
                     value: upiu.value,
                 })))
-            },
+            }
             UfsQueryCmd::SetFlag(cmd) => {
                 let upiu = self.body;
                 let upiu = unsafe { upiu.query_rsp.flag };
@@ -828,7 +856,7 @@ impl Upiu {
                     selector: upiu.selector,
                     value: upiu.value,
                 })))
-            },
+            }
             UfsQueryCmd::ClearFlag(cmd) => {
                 let upiu = self.body;
                 let upiu = unsafe { upiu.query_rsp.flag };
@@ -838,7 +866,7 @@ impl Upiu {
                     selector: upiu.selector,
                     value: upiu.value,
                 })))
-            },
+            }
             UfsQueryCmd::ToggleFlag(cmd) => {
                 let upiu = self.body;
                 let upiu = unsafe { upiu.query_rsp.flag };
@@ -848,7 +876,7 @@ impl Upiu {
                     selector: upiu.selector,
                     value: upiu.value,
                 })))
-            },
+            }
             _ => Ok(UfsDevCmd::Query(cmd)),
         }
     }
@@ -860,9 +888,9 @@ enum UtpCmdType {
 }
 
 enum UtpDataDirection {
-    NoDataTransfer  = 0,
-    HostToDevice    = 1,
-    DeviceToHost    = 2,
+    NoDataTransfer = 0,
+    HostToDevice = 1,
+    DeviceToHost = 2,
 }
 
 impl From<dma::DataDirection> for UtpDataDirection {
@@ -889,9 +917,9 @@ impl From<UfsScsiDataDirection> for UtpDataDirection {
 #[repr(C, packed)]
 #[derive(Default, Clone, Copy)]
 struct PrdEntry {
-    addr: u64,      // (LE)
-    reserved: u32,  // (LE)
-    size: u32,      // (LE)
+    addr: u64,     // (LE)
+    reserved: u32, // (LE)
+    size: u32,     // (LE)
 }
 
 #[repr(C, packed)]
@@ -1006,28 +1034,20 @@ impl Ucd {
 
     fn fetch_dev(&self, cmd: UfsDevCmd) -> Result<UfsDevCmd> {
         match cmd {
-            UfsDevCmd::Nop => {
-                match self.rsp_upiu.transaction() {
-                    UpiuTransaction::NopIn => Ok(cmd),
-                    _ => Err(EIO),
-                }
+            UfsDevCmd::Nop => match self.rsp_upiu.transaction() {
+                UpiuTransaction::NopIn => Ok(cmd),
+                _ => Err(EIO),
             },
-            UfsDevCmd::Query(cmd) => {
-                match self.rsp_upiu.transaction() {
-                    UpiuTransaction::QueryRsp => {
-                        match self.rsp_upiu.response() {
-                            UpiuResponse::Success => self.fetch_query(cmd),
-                            _ => Err(EIO),
-                        }
-                    },
+            UfsDevCmd::Query(cmd) => match self.rsp_upiu.transaction() {
+                UpiuTransaction::QueryRsp => match self.rsp_upiu.response() {
+                    UpiuResponse::Success => self.fetch_query(cmd),
                     _ => Err(EIO),
-                }
+                },
+                _ => Err(EIO),
             },
-            UfsDevCmd::RPMB(cmd) => {
-                match self.rsp_upiu.transaction() {
-                    UpiuTransaction::Response => self.fetch_rpmb(cmd),
-                    _ => Err(EIO),
-                }
+            UfsDevCmd::RPMB(cmd) => match self.rsp_upiu.transaction() {
+                UpiuTransaction::Response => self.fetch_rpmb(cmd),
+                _ => Err(EIO),
             },
         }
     }
@@ -1044,7 +1064,7 @@ impl Ucd {
                     length: u16::from_be(upiu.length),
                     desc: Desc::from_buffer(upiu.idn, upiu.buffer),
                 })))
-            },
+            }
             UfsQueryCmd::ReadAttr(cmd) => {
                 let upiu = self.rsp_upiu.body;
                 let upiu = unsafe { upiu.query_rsp.attr };
@@ -1054,7 +1074,7 @@ impl Ucd {
                     selector: upiu.selector,
                     value: u64::from_be(upiu.value),
                 })))
-            },
+            }
             UfsQueryCmd::WriteAttr(cmd) => {
                 let upiu = self.rsp_upiu.body;
                 let upiu = unsafe { upiu.query_rsp.attr };
@@ -1064,7 +1084,7 @@ impl Ucd {
                     selector: upiu.selector,
                     value: u64::from_be(upiu.value),
                 })))
-            },
+            }
             UfsQueryCmd::ReadFlag(cmd) => {
                 let upiu = self.rsp_upiu.body;
                 let upiu = unsafe { upiu.query_rsp.flag };
@@ -1074,7 +1094,7 @@ impl Ucd {
                     selector: upiu.selector,
                     value: upiu.value,
                 })))
-            },
+            }
             UfsQueryCmd::SetFlag(cmd) => {
                 let upiu = self.rsp_upiu.body;
                 let upiu = unsafe { upiu.query_rsp.flag };
@@ -1084,7 +1104,7 @@ impl Ucd {
                     selector: upiu.selector,
                     value: upiu.value,
                 })))
-            },
+            }
             UfsQueryCmd::ClearFlag(cmd) => {
                 let upiu = self.rsp_upiu.body;
                 let upiu = unsafe { upiu.query_rsp.flag };
@@ -1094,7 +1114,7 @@ impl Ucd {
                     selector: upiu.selector,
                     value: upiu.value,
                 })))
-            },
+            }
             UfsQueryCmd::ToggleFlag(cmd) => {
                 let upiu = self.rsp_upiu.body;
                 let upiu = unsafe { upiu.query_rsp.flag };
@@ -1104,7 +1124,7 @@ impl Ucd {
                     selector: upiu.selector,
                     value: upiu.value,
                 })))
-            },
+            }
             _ => Ok(UfsDevCmd::Query(cmd)),
         }
     }
@@ -1600,18 +1620,11 @@ impl UfsDma {
         unsafe { self.dev.as_bound() }
     }
 
-    pub(crate) fn new(
-        pdev: &pci::Device<Core>,
-        reg: Arc<UfsReg>,
-    ) -> Result<Arc<Self>> {
+    pub(crate) fn new(pdev: &pci::Device<Core>, reg: Arc<UfsReg>) -> Result<Arc<Self>> {
         let transfer_slots = Self::transfer_slots_for(&reg);
-        let ucdl = dma::Coherent::<Ucd>::zeroed_slice(
-            pdev.as_ref(), transfer_slots, GFP_KERNEL,
-        )?;
+        let ucdl = dma::Coherent::<Ucd>::zeroed_slice(pdev.as_ref(), transfer_slots, GFP_KERNEL)?;
 
-        let utrdl = dma::Coherent::<Utrd>::zeroed_slice(
-            pdev.as_ref(), transfer_slots, GFP_KERNEL,
-        )?;
+        let utrdl = dma::Coherent::<Utrd>::zeroed_slice(pdev.as_ref(), transfer_slots, GFP_KERNEL)?;
 
         for tag in 0..transfer_slots {
             let rsp_upiu_length = ((ALIGNED_UPIU_SIZE >> 2) as u16).to_le();
@@ -1626,19 +1639,21 @@ impl UfsDma {
             let command_desc_base_addr =
                 ucdl.dma_handle() + (tag * core::mem::size_of::<Ucd>()) as dma::DmaAddress;
 
-            dma_write!(utrdl, [tag]?, Utrd {
+            dma_write!(
+                utrdl,
+                [tag]?,
+                Utrd {
                     command_desc_base_addr: command_desc_base_addr.to_le(),
                     rsp_upiu_length,
                     rsp_upiu_offset,
                     prd_table_offset,
                     ..dma_read!(utrdl, [tag]?)
-            });
+                }
+            );
         }
 
         let nutmrs = reg.nutmrs();
-        let utmrdl = dma::Coherent::<Utmrd>::zeroed_slice(
-            pdev.as_ref(), nutmrs, GFP_KERNEL,
-        )?;
+        let utmrdl = dma::Coherent::<Utmrd>::zeroed_slice(pdev.as_ref(), nutmrs, GFP_KERNEL)?;
 
         Arc::pin_init(
             pin_init!(Self {
@@ -1651,7 +1666,7 @@ impl UfsDma {
                     utmrdl,
                 }),
             }),
-            GFP_KERNEL
+            GFP_KERNEL,
         )
     }
 
@@ -1662,8 +1677,10 @@ impl UfsDma {
     pub(crate) fn make_hba_operational(&self) -> Result<()> {
         self.reg.enable_interrupts();
 
-        self.reg.set_utrdl_base(self.inner.lock().utrdl.dma_handle() as u64);
-        self.reg.set_utmrdl_base(self.inner.lock().utmrdl.dma_handle() as u64);
+        self.reg
+            .set_utrdl_base(self.inner.lock().utrdl.dma_handle() as u64);
+        self.reg
+            .set_utmrdl_base(self.inner.lock().utmrdl.dma_handle() as u64);
 
         self.reg.wait_for_request_ready(1000, 50)?;
         self.reg.enable_run_stop();
@@ -1671,11 +1688,7 @@ impl UfsDma {
         Ok(())
     }
 
-    pub(crate) fn compose_devman_upiu(
-        &self,
-        cmd: UfsDevCmd,
-        tag: usize,
-    ) -> Result<()> {
+    pub(crate) fn compose_devman_upiu(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
         let inner = self.inner.lock();
 
         dma_write!(inner.ucdl, [tag]?.cmd_upiu, Upiu::device(cmd, tag));
@@ -1803,13 +1816,7 @@ impl UfsDma {
 
         // SAFETY: `self.dev` is a valid DMA device and the scatterlist was populated above.
         let mapped = unsafe {
-            bindings::dma_map_sg_attrs(
-                self.dev.as_raw(),
-                sg.as_mut_ptr(),
-                nents,
-                dma_dir,
-                0,
-            )
+            bindings::dma_map_sg_attrs(self.dev.as_raw(), sg.as_mut_ptr(), nents, dma_dir, 0)
         };
         if mapped <= 0 {
             return Err(ENOMEM);
@@ -1884,11 +1891,7 @@ impl UfsDma {
         // SAFETY: `cpu_addr` points to a DMA allocation of
         // `UNMAP_PARAM_LIST_SIZE` bytes.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                cpu_addr.as_ptr(),
-                UNMAP_PARAM_LIST_SIZE,
-            )
+            core::ptr::copy_nonoverlapping(data.as_ptr(), cpu_addr.as_ptr(), UNMAP_PARAM_LIST_SIZE)
         };
 
         let mapping = UfsUnmapMapping {
@@ -1913,11 +1916,7 @@ impl UfsDma {
         })
     }
 
-    pub(crate) fn fetch_devman_upiu(
-        &self,
-        cmd: UfsDevCmd,
-        tag: usize,
-    ) -> Result<UfsCmd> {
+    pub(crate) fn fetch_devman_upiu(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
         let inner = self.inner.lock();
 
         let utrd = dma_read!(inner.utrdl, [tag]?);
@@ -1936,7 +1935,7 @@ impl UfsDma {
         cqe: CqEntry,
     ) -> Result<UfsCmd> {
         match cqe.overall_status().into() {
-            UtpOcs::Success => {},
+            UtpOcs::Success => {}
             UtpOcs::InvalidCmdTableAttr => return Err(EINVAL),
             UtpOcs::InvalidPrdtAttr => return Err(EINVAL),
             UtpOcs::MismatchDataBufSize => return Err(EINVAL),
@@ -1953,10 +1952,7 @@ impl UfsDma {
         Ok(UfsCmd::Device(cmd))
     }
 
-    pub(crate) fn fetch_scsi_completion(
-        &self,
-        tag: usize,
-    ) -> UfsScsiResult {
+    pub(crate) fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult {
         let inner = self.inner.lock();
 
         let utrd = match (|| -> Result<_> { Ok(dma_read!(inner.utrdl, [tag]?)) })() {
@@ -1978,11 +1974,7 @@ impl UfsDma {
         }
     }
 
-    pub(crate) fn fetch_mcq_scsi_completion(
-        &self,
-        tag: usize,
-        cqe: CqEntry,
-    ) -> UfsScsiResult {
+    pub(crate) fn fetch_mcq_scsi_completion(&self, tag: usize, cqe: CqEntry) -> UfsScsiResult {
         let ocs = cqe.overall_status();
 
         if !matches!(ocs.into(), UtpOcs::Success) {
@@ -2000,32 +1992,84 @@ impl UfsDma {
     }
 }
 
-const _: () = { assert!(size_of::<UpiuHeader>() == 12); };
-const _: () = { assert!(size_of::<UpiuCmd>() == 500); };
-const _: () = { assert!(size_of::<UpiuRsp>() == 500); };
-const _: () = { assert!(size_of::<UpiuTmReq>() == 32); };
-const _: () = { assert!(size_of::<UpiuTmRsp>() == 32); };
-const _: () = { assert!(size_of::<DescBuffer>() == QUERY_DESC_MAX_SIZE); };
-const _: () = { assert!(size_of::<UpiuReadDescReq>() == 500); };
-const _: () = { assert!(size_of::<UpiuWriteDescReq>() == 500); };
-const _: () = { assert!(size_of::<UpiuReadAttrReq>() == 500); };
-const _: () = { assert!(size_of::<UpiuWriteAttrReq>() == 500); };
-const _: () = { assert!(size_of::<UpiuFlagReq>() == 500); };
-const _: () = { assert!(size_of::<UpiuQueryReq>() == 500); };
-const _: () = { assert!(size_of::<UpiuReadDescRsp>() == 500); };
-const _: () = { assert!(size_of::<UpiuWriteDescRsp>() == 500); };
-const _: () = { assert!(size_of::<UpiuAttrRsp>() == 500); };
-const _: () = { assert!(size_of::<UpiuFlagRsp>() == 500); };
-const _: () = { assert!(size_of::<UpiuQueryRsp>() == 500); };
-const _: () = { assert!(size_of::<UpiuNop>() == 500); };
-const _: () = { assert!(size_of::<UpiuBody>() == 500); };
-const _: () = { assert!(size_of::<Upiu>() == 512); };
-const _: () = { assert!(size_of::<ReqDescHeader>() == 16); };
-const _: () = { assert!(size_of::<PrdEntry>() == 16); };
-const _: () = { assert!(size_of::<CqEntry>() == 32); };
-const _: () = { assert!(size_of::<Ucd>() == 5120); };
-const _: () = { assert!(size_of::<Utrd>() == 32); };
-const _: () = { assert!(size_of::<Utmrd>() == 80); };
+const _: () = {
+    assert!(size_of::<UpiuHeader>() == 12);
+};
+const _: () = {
+    assert!(size_of::<UpiuCmd>() == 500);
+};
+const _: () = {
+    assert!(size_of::<UpiuRsp>() == 500);
+};
+const _: () = {
+    assert!(size_of::<UpiuTmReq>() == 32);
+};
+const _: () = {
+    assert!(size_of::<UpiuTmRsp>() == 32);
+};
+const _: () = {
+    assert!(size_of::<DescBuffer>() == QUERY_DESC_MAX_SIZE);
+};
+const _: () = {
+    assert!(size_of::<UpiuReadDescReq>() == 500);
+};
+const _: () = {
+    assert!(size_of::<UpiuWriteDescReq>() == 500);
+};
+const _: () = {
+    assert!(size_of::<UpiuReadAttrReq>() == 500);
+};
+const _: () = {
+    assert!(size_of::<UpiuWriteAttrReq>() == 500);
+};
+const _: () = {
+    assert!(size_of::<UpiuFlagReq>() == 500);
+};
+const _: () = {
+    assert!(size_of::<UpiuQueryReq>() == 500);
+};
+const _: () = {
+    assert!(size_of::<UpiuReadDescRsp>() == 500);
+};
+const _: () = {
+    assert!(size_of::<UpiuWriteDescRsp>() == 500);
+};
+const _: () = {
+    assert!(size_of::<UpiuAttrRsp>() == 500);
+};
+const _: () = {
+    assert!(size_of::<UpiuFlagRsp>() == 500);
+};
+const _: () = {
+    assert!(size_of::<UpiuQueryRsp>() == 500);
+};
+const _: () = {
+    assert!(size_of::<UpiuNop>() == 500);
+};
+const _: () = {
+    assert!(size_of::<UpiuBody>() == 500);
+};
+const _: () = {
+    assert!(size_of::<Upiu>() == 512);
+};
+const _: () = {
+    assert!(size_of::<ReqDescHeader>() == 16);
+};
+const _: () = {
+    assert!(size_of::<PrdEntry>() == 16);
+};
+const _: () = {
+    assert!(size_of::<CqEntry>() == 32);
+};
+const _: () = {
+    assert!(size_of::<Ucd>() == 5120);
+};
+const _: () = {
+    assert!(size_of::<Utrd>() == 32);
+};
+const _: () = {
+    assert!(size_of::<Utmrd>() == 80);
+};
 
 unsafe impl kernel::transmute::AsBytes for Ucd {}
 unsafe impl kernel::transmute::FromBytes for Ucd {}

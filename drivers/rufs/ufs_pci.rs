@@ -6,14 +6,14 @@
 
 use kernel::{device::Core, pci, prelude::*, sync::aref::ARef, sync::Arc};
 
-mod ufs_host;
-mod ufs_reg;
-mod ufs_dma;
-mod ufs_irq;
-mod ufs_uic;
-mod ufs_queue;
 mod ufs_dev;
+mod ufs_dma;
+mod ufs_host;
+mod ufs_irq;
 mod ufs_lu;
+mod ufs_queue;
+mod ufs_reg;
+mod ufs_uic;
 
 use ufs_host::UfsHost;
 
@@ -21,10 +21,7 @@ kernel::pci_device_table!(
     PCI_TABLE,
     MODULE_PCI_TABLE,
     <UfsPci as pci::Driver>::IdInfo,
-    [(
-        pci::DeviceId::from_id(pci::Vendor::REDHAT, 0x0013),
-        (),
-    )]
+    [(pci::DeviceId::from_id(pci::Vendor::REDHAT, 0x0013), (),)]
 );
 
 #[pin_data(PinnedDrop)]
@@ -41,7 +38,8 @@ impl pci::Driver for UfsPci {
         pin_init::pin_init_scope(move || {
             pr_info!(
                 "rufs: probe: vendor={} device=0x{:04x}",
-                pdev.vendor_id(), pdev.device_id(),
+                pdev.vendor_id(),
+                pdev.device_id(),
             );
 
             pdev.enable_device_mem()?;
@@ -59,8 +57,7 @@ impl pci::Driver for UfsPci {
         })
     }
 
-    fn unbind(_pdev: &pci::Device<Core>, _this: Pin<&Self>) {
-    }
+    fn unbind(_pdev: &pci::Device<Core>, _this: Pin<&Self>) {}
 }
 
 #[pinned_drop]

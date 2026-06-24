@@ -4,16 +4,16 @@
 
 #![allow(dead_code)]
 
+use crate::ufs_queue::*;
+use kernel::bindings;
 use kernel::block::{
     error::{code, BlkResult},
     mq::{self, gen_disk::GenDisk, gen_disk::GenDiskBuilder, IdleRequest, Operations, TagSet},
     SECTOR_SIZE,
 };
-use kernel::bindings;
 use kernel::sync::{Arc, ArcBorrow, Mutex, SpinLock};
 use kernel::types::{ARef, OwnableRefCounted, Owned};
 use kernel::{new_mutex, new_spinlock, prelude::*};
-use crate::ufs_queue::*;
 
 const SECTOR_SIZE_U64: u64 = SECTOR_SIZE as u64;
 const MAX_DISCARD_SEGMENTS: u16 = 1;
@@ -123,7 +123,8 @@ impl UfsLuGeometry {
     }
 
     pub(crate) fn logical_to_bytes(&self, blocks: u64) -> Option<u64> {
-        self.logical_to_sectors(blocks)?.checked_mul(SECTOR_SIZE_U64)
+        self.logical_to_sectors(blocks)?
+            .checked_mul(SECTOR_SIZE_U64)
     }
 }
 
@@ -216,16 +217,14 @@ impl UfsLu {
         .map_err(|_| EOVERFLOW)?;
 
         match command {
-            mq::Command::Read => {
-                Ok(UfsSCSICmd::read_write(self.lun, false, lba, blocks, data_len, false))
-            }
-            mq::Command::Write => {
-                Ok(UfsSCSICmd::read_write(self.lun, true, lba, blocks, data_len, false))
-            }
+            mq::Command::Read => Ok(UfsSCSICmd::read_write(
+                self.lun, false, lba, blocks, data_len, false,
+            )),
+            mq::Command::Write => Ok(UfsSCSICmd::read_write(
+                self.lun, true, lba, blocks, data_len, false,
+            )),
             mq::Command::Flush => Ok(UfsSCSICmd::flush(self.lun)),
-            mq::Command::Discard => {
-                Ok(UfsSCSICmd::unmap(self.lun, lba, blocks))
-            }
+            mq::Command::Discard => Ok(UfsSCSICmd::unmap(self.lun, lba, blocks)),
             _ => Err(ENOTSUPP),
         }
     }
@@ -257,7 +256,7 @@ impl UfsLu {
                     e.to_errno(),
                 );
                 return mq::RequestTimeoutStatus::RetryLater;
-            },
+            }
         };
 
         if self.queue.timeout(global_tag) {
