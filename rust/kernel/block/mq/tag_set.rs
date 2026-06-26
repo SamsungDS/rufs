@@ -16,9 +16,8 @@ use crate::{
         Result, //
     },
     prelude::*,
-    sync::atomic::ordering,
+    sync::{aref::ARef, atomic::ordering},
     types::{
-        ARef,
         ForeignOwnable,
         Opaque, //
     },
