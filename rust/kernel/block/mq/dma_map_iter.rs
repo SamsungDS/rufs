@@ -6,8 +6,8 @@ use crate::{
     block::error::{BlkError, BlkResult},
     device::Device,
     prelude::*,
-    sync::Arc,
-    types::{ARef, Opaque},
+    sync::{aref::ARef, Arc},
+    types::Opaque,
 };
 
 use super::{Operations, Request};
