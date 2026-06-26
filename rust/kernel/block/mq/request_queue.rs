@@ -88,8 +88,8 @@ where
 }
 
 impl<T: Operations> Ownable for RequestQueue<T> {
-    unsafe fn release(&mut self) {
-        let this: *mut Self = self;
+    unsafe fn release(this: NonNull<Self>) {
+        let this: *mut Self = this.as_ptr();
         let tagset = unsafe { (*this.cast::<bindings::request_queue>()).tag_set };
         // SAFETY: We own the queue
         unsafe { bindings::blk_mq_destroy_queue(this.cast()) }
