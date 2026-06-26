@@ -80,7 +80,7 @@ impl<T: Operations> IdleRequest<T> {
 impl<T: Operations> Ownable for IdleRequest<T> {
     // The `release` implementation leaks the `IdleRequest`, which is a valid state for a
     // [`Request`] with refcount 0.
-    unsafe fn release(&mut self) {}
+    unsafe fn release(_this: NonNull<Self>) {}
 }
 
 impl<T: Operations> Deref for IdleRequest<T> {
