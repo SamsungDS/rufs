@@ -99,6 +99,7 @@ impl<const SIZE: usize> KnownSize for Region<SIZE> {
 // `repr(align(4))`).
 unsafe impl<const SIZE: usize> IntoBytes for Region<SIZE> {
     #[inline]
+    #[allow(dead_code)]
     fn only_derive_is_allowed_to_implement_this_trait() {}
 }
 
@@ -1458,7 +1459,9 @@ pub struct IoSysMapBackend;
 ///
 /// [`include/linux/iosys-map.h`](srctree/include/linux/iosys-map.h)
 pub enum IoSysMap<'a, T: ?Sized> {
+    /// TODO
     Io(Mmio<'a, T>),
+    /// TODO
     Sys(SysMem<'a, T>),
 }
 
