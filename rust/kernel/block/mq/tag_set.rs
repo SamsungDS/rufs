@@ -83,3 +83,12 @@ impl<T: Operations> PinnedDrop for TagSet<T> {
         unsafe { bindings::blk_mq_free_tag_set(self.inner.get()) };
     }
 }
+
+// SAFETY: It is safe to transfer ownership of a `TagSet` across thread boundaries; the
+// wrapped `blk_mq_tag_set` is owned and the C block layer performs its own internal
+// synchronization.
+unsafe impl<T: Operations> Send for TagSet<T> {}
+
+// SAFETY: It is safe to share references to a `TagSet` across thread boundaries; access to
+// the wrapped `blk_mq_tag_set` is synchronized by the C block layer.
+unsafe impl<T: Operations> Sync for TagSet<T> {}
