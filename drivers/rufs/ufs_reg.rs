@@ -7,7 +7,7 @@ use kernel::time::Delta;
 use kernel::{c_str, device::Core, devres::Devres, pci, prelude::*, sync::Arc};
 
 const UFS_BAR0_LEN: usize = 0x1000;
-type Bar0 = pci::Bar<UFS_BAR0_LEN>;
+type Bar0 = pci::Bar<'static, UFS_BAR0_LEN>;
 
 register! {
     CONTROLLER_CAPABILITIES(u32) @ 0x00 {
@@ -257,20 +257,20 @@ impl UfsMcqOprSet {
     }
 }
 
-#[pin_data]
 pub(crate) struct UfsReg {
-    #[pin]
     bar: Devres<Bar0>,
 }
 
 impl UfsReg {
-    pub(crate) fn new(pdev: &pci::Device<Core>) -> Result<Arc<Self>> {
-        Arc::pin_init(
-            try_pin_init!(Self {
-                bar <- pdev.iomap_region_sized::<UFS_BAR0_LEN>(0, c_str!("rufs_pci")),
-            }),
+    pub(crate) fn new(pdev: &pci::Device<Core<'_>>) -> Result<Arc<Self>> {
+        Ok(Arc::new(
+            Self {
+                bar: pdev
+                    .iomap_region_sized::<UFS_BAR0_LEN>(0, c_str!("rufs_pci"))?
+                    .into_devres()?,
+            },
             GFP_KERNEL,
-        )
+        )?)
     }
 
     #[inline(always)]

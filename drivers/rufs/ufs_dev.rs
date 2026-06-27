@@ -11,9 +11,9 @@ use kernel::block::error::BlkResult;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;
 use kernel::block::mq::{self, IdleRequest, Request};
 use kernel::error::{from_err_ptr, to_result};
-use kernel::sync::{Arc, Mutex};
+use kernel::sync::{aref::ARef, Arc, Mutex};
 use kernel::time::{delay, Delta};
-use kernel::types::{ARef, Owned};
+use kernel::types::Owned;
 use kernel::uapi::NUMA_NO_NODE;
 use kernel::{bindings, kvec, new_mutex, prelude::*};
 

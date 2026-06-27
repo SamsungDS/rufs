@@ -7,6 +7,7 @@
 use kernel::sync::{Arc, Mutex, SpinLock};
 use kernel::time::{delay::*, Delta};
 use kernel::{block::mq::TagSet, device::Core, new_mutex, new_spinlock, pci, prelude::*};
+use pin_init::pin_init_scope;
 
 use crate::ufs_dev::*;
 use crate::ufs_dma::*;
@@ -47,66 +48,66 @@ pub(crate) struct UfsHost {
 }
 
 impl UfsHost {
-    pub(crate) fn new(pdev: &pci::Device<Core>) -> Result<Arc<Self>> {
-        let reg = UfsReg::new(pdev)?;
-        let dma = UfsDma::new(pdev, reg.clone())?;
+    pub(crate) fn new<'a>(pdev: &'a pci::Device<Core<'a>>) -> impl PinInit<Self, Error> + 'a {
+        pin_init_scope(move || {
+            let reg = UfsReg::new(pdev)?;
+            let dma = UfsDma::new(pdev, reg.clone())?;
 
-        reg.clear_all_interrupts();
-        reg.disable_interrupts();
+            reg.clear_all_interrupts();
+            reg.disable_interrupts();
 
-        let requested_irq_vectors = match ufs_mcq_interrupt_queue_count(&reg)
-            .and_then(|queues| u32::try_from(queues).map_err(|_| EOVERFLOW))
-        {
-            Ok(queues) => queues,
-            Err(e) => {
-                pr_warn!(
+            let requested_irq_vectors = match ufs_mcq_interrupt_queue_count(&reg)
+                .and_then(|queues| u32::try_from(queues).map_err(|_| EOVERFLOW))
+            {
+                Ok(queues) => queues,
+                Err(e) => {
+                    pr_warn!(
                     "[RUFS] ufs_host: failed to plan MCQ IRQ vectors errno={}, fallback to single shared IRQ\n",
                     e.to_errno(),
                 );
-                1
-            }
-        };
-        let msi_irq_types = pci::IrqTypes::default()
-            .with(pci::IrqType::MsiX)
-            .with(pci::IrqType::Msi);
-        let irq_vectors = if requested_irq_vectors > 1 {
-            match pdev.alloc_irq_vectors(
-                requested_irq_vectors,
-                requested_irq_vectors,
-                msi_irq_types,
-            ) {
-                Ok(irq_vectors) => irq_vectors,
-                Err(e) => {
-                    pr_warn!(
+                    1
+                }
+            };
+            let msi_irq_types = pci::IrqTypes::default()
+                .with(pci::IrqType::MsiX)
+                .with(pci::IrqType::Msi);
+            let irq_vectors = if requested_irq_vectors > 1 {
+                match pdev.alloc_irq_vectors(
+                    requested_irq_vectors,
+                    requested_irq_vectors,
+                    msi_irq_types,
+                ) {
+                    Ok(irq_vectors) => irq_vectors,
+                    Err(e) => {
+                        pr_warn!(
                         "[RUFS] ufs_host: failed to allocate {} MSI/MSI-X IRQ vectors errno={}, fallback to single shared IRQ\n",
                         requested_irq_vectors,
                         e.to_errno(),
                     );
-                    pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?
+                        pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?
+                    }
                 }
-            }
-        } else {
-            pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?
-        };
-        let first_irq_vector = *irq_vectors.start();
-        let allocated_irq_vectors = irq_vectors
-            .end()
-            .index()
-            .checked_sub(first_irq_vector.index())
-            .ok_or(EINVAL)?
-            + 1;
-        pr_info!(
-            "[RUFS] ufs_host: IRQ vectors requested={} allocated={}\n",
-            requested_irq_vectors,
-            allocated_irq_vectors,
-        );
+            } else {
+                pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?
+            };
+            let first_irq_vector = *irq_vectors.start();
+            let allocated_irq_vectors = irq_vectors
+                .end()
+                .index()
+                .checked_sub(first_irq_vector.index())
+                .ok_or(EINVAL)?
+                + 1;
+            pr_info!(
+                "[RUFS] ufs_host: IRQ vectors requested={} allocated={}\n",
+                requested_irq_vectors,
+                allocated_irq_vectors,
+            );
 
-        let irq = UfsIrq::new()?;
-        let uic = UfsUic::new(reg.clone(), irq.clone())?;
-        let queue = UfsQueue::new(reg.clone(), irq.clone(), dma.clone())?;
-        let dev = UfsDev::new(queue.clone())?;
-        let host = Arc::pin_init(
-            pin_init!(Self {
+            let irq = UfsIrq::new()?;
+            let uic = UfsUic::new(reg.clone(), irq.clone())?;
+            let queue = UfsQueue::new(reg.clone(), irq.clone(), dma.clone())?;
+            let dev = UfsDev::new(queue.clone())?;
+            let host = try_pin_init!(Self {
                 reg,
                 dma,
                 irq,
@@ -117,61 +118,66 @@ impl UfsHost {
                 state <- new_spinlock!(HostState::Reset),
                 max_hw_queues: 1,
                 max_prdt_entries: 256,
-            }),
-            GFP_KERNEL,
-        )?;
+            })
+            .pin_chain(move |host| {
+                host.reg.ctrl_enable();
+                fsleep(Delta::from_micros(HBA_ENABLE_DELAY_US));
+                host.reg.wait_for_ctrl_enable(1000, 50)?;
 
-        host.reg.ctrl_enable();
-        fsleep(Delta::from_micros(HBA_ENABLE_DELAY_US));
-        host.reg.wait_for_ctrl_enable(1000, 50)?;
+                /* ufshcd_link_startup() */
+                host.irq.request_uic_irq(
+                    pdev,
+                    first_irq_vector,
+                    host.reg.clone(),
+                    host.uic.clone(),
+                )?;
+                host.uic.link_startup()?;
+                host.dma.make_hba_operational()?;
 
-        /* ufshcd_link_startup() */
-        host.irq
-            .request_uic_irq(pdev, first_irq_vector, host.reg.clone(), host.uic.clone())?;
-        host.uic.link_startup()?;
-        host.dma.make_hba_operational()?;
-
-        /* ufshcd_verify_dev_init */
-        host.irq.request_queue_irqs(
-            pdev,
-            first_irq_vector,
-            allocated_irq_vectors as usize,
-            host.reg.clone(),
-            host.queue.clone(),
-        )?;
-        if allocated_irq_vectors < requested_irq_vectors {
-            pr_info!(
-                "[RUFS] ufs_host: allocated fewer IRQ vectors than requested {}/{}\n",
-                allocated_irq_vectors,
-                requested_irq_vectors,
-            );
-        }
-        if host.reg.mcq_supported() {
-            pr_info!("MCQ supported\n");
-            match host
-                .queue
-                .enable_mcq_backend(host.reg.clone(), host.dma.clone())
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    pr_warn!(
-                        "[RUFS] ufs_host: MCQ setup failed errno={}, keep SDB backend\n",
-                        e.to_errno(),
+                /* ufshcd_verify_dev_init */
+                host.irq.request_queue_irqs(
+                    pdev,
+                    first_irq_vector,
+                    allocated_irq_vectors as usize,
+                    host.reg.clone(),
+                    host.queue.clone(),
+                )?;
+                if allocated_irq_vectors < requested_irq_vectors {
+                    pr_info!(
+                        "[RUFS] ufs_host: allocated fewer IRQ vectors than requested {}/{}\n",
+                        allocated_irq_vectors,
+                        requested_irq_vectors,
                     );
                 }
-            }
-        } else {
-            pr_info!("MCQ not supported, using SDB mode!\n");
-        }
+                if host.reg.mcq_supported() {
+                    pr_info!("MCQ supported\n");
+                    match host
+                        .queue
+                        .enable_mcq_backend(host.reg.clone(), host.dma.clone())
+                    {
+                        Ok(()) => {}
+                        Err(e) => {
+                            pr_warn!(
+                                "[RUFS] ufs_host: MCQ setup failed errno={}, keep SDB backend\n",
+                                e.to_errno(),
+                            );
+                        }
+                    }
+                } else {
+                    pr_info!("MCQ not supported, using SDB mode!\n");
+                }
 
-        host.dev.alloc_dev_request()?;
-        host.dev.verify_dev_init()?;
-        host.dev.complete_dev_init()?;
-        host.dev.device_params_init()?;
-        host.alloc_luns()?;
-        host.dev.alloc_tmf_queue(host.reg.nutmrs())?;
+                host.dev.alloc_dev_request()?;
+                host.dev.verify_dev_init()?;
+                host.dev.complete_dev_init()?;
+                host.dev.device_params_init()?;
+                host.alloc_luns()?;
+                host.dev.alloc_tmf_queue(host.reg.nutmrs())?;
+                Ok(())
+            });
 
-        Ok(host)
+            Ok(host)
+        })
     }
 
     fn alloc_luns(&self) -> Result<()> {

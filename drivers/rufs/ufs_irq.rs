@@ -88,7 +88,7 @@ impl UfsIrq {
 
     pub(crate) fn request_uic_irq(
         &self,
-        pdev: &pci::Device<Core>,
+        pdev: &pci::Device<Core<'_>>,
         vector: pci::IrqVector<'_>,
         reg: Arc<UfsReg>,
         uic: Arc<UfsUic>,
@@ -109,7 +109,7 @@ impl UfsIrq {
 
     pub(crate) fn request_queue_irqs(
         &self,
-        pdev: &pci::Device<Core>,
+        pdev: &pci::Device<Core<'_>>,
         first_vector: pci::IrqVector<'_>,
         nr_vectors: usize,
         reg: Arc<UfsReg>,
@@ -139,7 +139,7 @@ impl UfsIrq {
 
     fn request_one_queue_irq(
         irqs: &mut KVec<Arc<irq::ThreadedRegistration<UfsQueueHandler>>>,
-        pdev: &pci::Device<Core>,
+        pdev: &pci::Device<Core<'_>>,
         vector: pci::IrqVector<'_>,
         reg: Arc<UfsReg>,
         queue: Arc<UfsQueue>,

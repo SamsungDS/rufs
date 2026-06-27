@@ -12,8 +12,8 @@ use kernel::block::mq;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;
 use kernel::cpu;
 use kernel::sync::atomic::{Atomic, Relaxed};
-use kernel::sync::{barrier, Arc, Completion, SpinLock};
-use kernel::types::{ARef, OwnableRefCounted};
+use kernel::sync::{aref::ARef, barrier, Arc, Completion, SpinLock};
+use kernel::types::OwnableRefCounted;
 use kernel::{bindings, kvec, new_spinlock, prelude::*};
 
 const READ_10: u8 = 0x28;

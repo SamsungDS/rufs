@@ -8,7 +8,7 @@ use crate::ufs_dma::MAX_PRD_ENTRIES;
 use crate::ufs_queue::*;
 use kernel::bindings;
 use kernel::sync::{Arc, ArcBorrow, Mutex, SpinLock};
-use kernel::types::{ARef, OwnableRefCounted, Owned};
+use kernel::types::{OwnableRefCounted, Owned};
 use kernel::{
     alloc::mempool::MemPool,
     block::{
@@ -21,6 +21,7 @@ use kernel::{
         },
         SECTOR_SIZE,
     },
+    sync::aref::ARef,
 };
 use kernel::{new_mutex, new_spinlock, prelude::*};
 
