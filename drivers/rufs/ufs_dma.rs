@@ -764,7 +764,7 @@ impl Upiu {
     }
 
     fn scsi_result(&self, ocs: u8) -> UfsScsiResult {
-        let rsp: UpiuRsp =  zerocopy::transmute!(self.body);
+        let rsp: UpiuRsp = zerocopy::transmute!(self.body);
         let sense_data_len = usize::from(u16::from_be(rsp.sendse_data_len)).min(UFS_SENSE_SIZE);
 
         let mut result = UfsScsiResult {
@@ -920,7 +920,7 @@ impl From<UfsScsiDataDirection> for UtpDataDirection {
 
 // UTP Command Descriptor
 #[repr(C, packed)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, IntoBytes)]
 struct PrdEntry {
     addr: u64,     // (LE)
     reserved: u32, // (LE)
@@ -1593,9 +1593,7 @@ impl UfsDma {
             // so this must be the descriptor's DMA (bus) address, not its CPU
             // virtual address. `ucdl` is a contiguous slice, so element `tag`
             // sits at `tag * size_of::<Ucd>()` bytes from the DMA base.
-            // TODO: use `io_project` when available https://lore.kernel.org/r/20260611-io_projection-v4-0-1f7224b02dcb@garyguo.net
-            let command_desc_base_addr =
-                ucdl.dma_handle() + (tag * core::mem::size_of::<Ucd>()) as dma::DmaAddress;
+            let command_desc_base_addr = io_project!(ucdl, [try: tag]).dma_handle();
 
             let utrd = Utrd {
                 command_desc_base_addr: command_desc_base_addr.to_le(),
@@ -1672,15 +1670,7 @@ impl UfsDma {
         io_project!(inner.ucdl, [try: tag].rsp_upiu).copy_write(Upiu::default());
 
         for (i, entry) in prdt.entries.iter().enumerate() {
-            // SAFETY: `tag` is checked against the UCD allocation, `i` is
-            // bounded by MAX_PRD_ENTRIES in `map_request_prdt`, and PRDT lives
-            // in a packed UCD so unaligned writes are required.
-            unsafe {
-                // TODO: Use IO projections when available.
-                let ucd = inner.ucdl.as_mut_ptr().cast::<Ucd>().add(tag);
-                let table = core::ptr::addr_of_mut!((*ucd).prdt).cast::<PrdEntry>();
-                core::ptr::write_unaligned(table.add(i), *entry);
-            }
+            io_project!(inner.ucdl, [try: tag].prdt[try: i]).copy_write(*entry);
         }
 
         let utrd = io_project!(inner.utrdl, [try: tag]).copy_read();
