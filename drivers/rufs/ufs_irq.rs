@@ -33,8 +33,9 @@ impl irq::ThreadedHandler for UfsUicHandler {
 
     fn handle_threaded(&self, _dev: &Device<Bound>) -> IrqReturn {
         let interrupt_status = self.interrupt_status.load(Acquire);
-        self.uic.get_uic_cmd_response(interrupt_status);
-        self.uic.complete_uic_cmd();
+        if self.uic.handle_uic_completion(interrupt_status) {
+            self.uic.complete_uic_cmd();
+        }
 
         IrqReturn::Handled
     }

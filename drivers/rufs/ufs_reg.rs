@@ -37,6 +37,7 @@ register! {
         31:0 value;
     }
     CONTROLLER_STATUS(u32) @ 0x30 {
+        10:8 power_mode_change_request_status;
         5:5 device_error_indicator => bool;
         4:4 host_error_indicator => bool;
         3:3 uic_command_ready => bool;
@@ -997,6 +998,14 @@ impl UfsReg {
         self.read_uic_arg3()
     }
 
+    pub(crate) fn get_power_mode_change_status(&self) -> u32 {
+        let access = self.bar.try_access().unwrap();
+        access
+            .read(CONTROLLER_STATUS)
+            .power_mode_change_request_status()
+            .get()
+    }
+
     pub(crate) fn wait_for_uic_cmd_ready(&self, interval_us: i64, timeout_ms: i64) -> Result<()> {
         match read_poll_timeout(
             || {
@@ -1060,5 +1069,5 @@ pub(crate) fn is_uic_command_completion(interrupt_status: u32) -> bool {
 
 #[inline]
 pub(crate) fn is_uic_power_mode(interrupt_status: u32) -> bool {
-    (interrupt_status & UIC_INTR_POWER_MASK) != 0
+    (interrupt_status & UIC_POWER_MODE) != 0
 }
