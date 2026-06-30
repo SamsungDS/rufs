@@ -936,6 +936,18 @@ impl UfsReg {
     }
 
     #[inline]
+    pub(crate) fn ctrl_disable(&self) {
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(CONTROLLER_ENABLE_REG::zeroed());
+    }
+
+    #[inline]
+    pub(crate) fn ctrl_enabled(&self) -> bool {
+        let access = self.bar.try_access().unwrap();
+        access.read(CONTROLLER_ENABLE_REG).controller_enable()
+    }
+
+    #[inline]
     pub(crate) fn clear_all_interrupts(&self) {
         let isb = self.read_is();
         if isb != 0 {
@@ -969,6 +981,22 @@ impl UfsReg {
                 Ok(access.read(CONTROLLER_ENABLE_REG))
             },
             |v: &CONTROLLER_ENABLE_REG| v.controller_enable(),
+            Delta::from_micros(interval_us),
+            Delta::from_millis(timeout_ms),
+        ) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn wait_for_ctrl_disable(&self, interval_us: i64, timeout_ms: i64) -> Result<()> {
+        match read_poll_timeout(
+            || {
+                let access = self.bar.try_access().ok_or(ENODEV)?;
+                Ok(access.read(CONTROLLER_ENABLE_REG))
+            },
+            |v: &CONTROLLER_ENABLE_REG| !v.controller_enable(),
             Delta::from_micros(interval_us),
             Delta::from_millis(timeout_ms),
         ) {
@@ -1061,6 +1089,11 @@ impl UfsReg {
     pub(crate) fn enable_run_stop(&self) {
         self.write_utmrl_runstop(1);
         self.write_utrl_runstop(1);
+    }
+
+    pub(crate) fn disable_run_stop(&self) {
+        self.write_utrl_runstop(0);
+        self.write_utmrl_runstop(0);
     }
 }
 

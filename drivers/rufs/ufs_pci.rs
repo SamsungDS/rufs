@@ -150,8 +150,9 @@ impl pci::Driver for UfsPci {
         })
     }
 
-    fn unbind(pdev: &pci::Device<Core<'_>>, _this: Pin<&Self::Data<'_>>) {
+    fn unbind(pdev: &pci::Device<Core<'_>>, this: Pin<&Self::Data<'_>>) {
         dev_dbg!(pdev.as_ref(), "Remove Rust UFS driver.\n");
+        this.host.remove();
     }
 }
 

@@ -203,6 +203,12 @@ impl UfsLu {
         Ok(())
     }
 
+    pub(crate) fn remove_disk(&self) {
+        self.set_state(UfsLuState::Reset);
+        let disk = self.disk.lock().take();
+        drop(disk);
+    }
+
     pub(crate) fn lun(&self) -> u8 {
         self.lun
     }

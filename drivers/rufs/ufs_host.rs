@@ -28,7 +28,7 @@ pub(crate) enum HostState {
     Error,
 }
 
-#[pin_data]
+#[pin_data(PinnedDrop)]
 pub(crate) struct UfsHost {
     reg: Arc<UfsReg>,
     dma: Arc<UfsDma>,
@@ -120,6 +120,11 @@ impl UfsHost {
                 max_prdt_entries: 256,
             })
             .pin_chain(move |host| {
+                if host.reg.ctrl_enabled() {
+                    pr_info!("[RUFS] ufs_host: controller is active, stop before enable\n");
+                    host.hba_stop();
+                }
+
                 host.reg.ctrl_enable();
                 fsleep(Delta::from_micros(HBA_ENABLE_DELAY_US));
                 host.reg.wait_for_ctrl_enable(1000, 50)?;
@@ -249,6 +254,33 @@ impl UfsHost {
         Ok(())
     }
 
+    pub(crate) fn remove(&self) {
+        self.remove_luns();
+        self.hba_stop();
+    }
+
+    fn remove_luns(&self) {
+        let mut luns = self.luns.lock();
+        for lu in luns.iter() {
+            lu.remove_disk();
+        }
+        luns.clear();
+    }
+
+    fn hba_stop(&self) {
+        self.reg.disable_interrupts();
+        self.reg.clear_all_interrupts();
+        self.reg.disable_run_stop();
+        self.reg.ctrl_disable();
+        if let Err(e) = self.reg.wait_for_ctrl_disable(10, 1) {
+            pr_err!(
+                "[RUFS] ufs_host: controller disable failed errno={}\n",
+                e.to_errno()
+            );
+        }
+        self.fallback_to_reset();
+    }
+
     // getter
     #[inline]
     pub(crate) fn state(&self) -> HostState {
@@ -279,5 +311,12 @@ impl UfsHost {
     #[inline]
     fn fallback_to_reset(&self) {
         *self.state.lock() = HostState::Reset;
+    }
+}
+
+#[pinned_drop]
+impl PinnedDrop for UfsHost {
+    fn drop(self: Pin<&mut Self>) {
+        self.remove();
     }
 }
