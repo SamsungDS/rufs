@@ -55,6 +55,9 @@ register! {
     UIC_ERROR_CODE_DATA_LINK_LAYER(u32) @ 0x3C {
         31:0 value;
     }
+    UTP_TRANSFER_REQ_INT_AGG_CONTROL(u32) @ 0x4C {
+        31:0 value;
+    }
     UTP_TRANSFER_REQ_LIST_BASE_L(u32) @ 0x50 {
         31:0 value;
     }
@@ -187,6 +190,9 @@ const ERROR_MASK: u32 = UIC_ERROR
     | SYSTEM_BUS_FATAL_ERROR
     | CRYPTO_ENGINE_FATAL_ERROR
     | UTP_ERROR;
+
+const INT_AGGR_STATUS_BIT: u32 = 1 << 20;
+const INT_AGGR_ENABLE: u32 = 1 << 31;
 
 pub(crate) enum PowerMode {
     OK = 0x00,
@@ -1061,6 +1067,21 @@ impl UfsReg {
 
     pub(crate) fn enable_interrupts(&self) {
         self.write_ie(self.read_ie() | UTP_REQ_COMPL_MASK | ERROR_MASK);
+    }
+
+    pub(crate) fn disable_transfer_req_int_aggr(&self) {
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UTP_TRANSFER_REQ_INT_AGG_CONTROL::zeroed().with_value(0 as u32));
+        let value = access.read(UTP_TRANSFER_REQ_INT_AGG_CONTROL).value().get();
+        let int_enable = (value & INT_AGGR_ENABLE) != 0;
+        let int_status = (value & INT_AGGR_STATUS_BIT) != 0;
+
+        pr_info!(
+            "[RUFS] ufs_reg: transfer request interrupt aggregation raw=0x{:08x} enabled={} status={}\n",
+            value,
+            int_enable,
+            int_status,
+        );
     }
 
     pub(crate) fn enable_mcq_interrupts(&self) {

@@ -1667,6 +1667,7 @@ impl UfsDma {
 
     pub(crate) fn make_hba_operational(&self) -> Result<()> {
         self.reg.enable_interrupts();
+        self.reg.disable_transfer_req_int_aggr();
 
         self.reg
             .set_utrdl_base(self.inner.lock().utrdl.dma_handle() as u64);
