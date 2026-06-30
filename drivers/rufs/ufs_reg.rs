@@ -1022,11 +1022,13 @@ impl UfsReg {
     }
 
     pub(crate) fn read_transfer_interrupts(&self) -> u32 {
-        self.read_is() & self.read_ie() & (UTP_TRANSFER_REQ_COMPL | MCQ_CQ_EVENT_STATUS)
+        self.read_is()
+            & self.read_ie()
+            & (UTP_TRANSFER_REQ_COMPL | MCQ_CQ_EVENT_STATUS | ERROR_MASK)
     }
 
     pub(crate) fn confirm_transfer_interrupts(&self, value: u32) {
-        self.write_is(value & (UTP_TRANSFER_REQ_COMPL | MCQ_CQ_EVENT_STATUS));
+        self.write_is(value & (UTP_TRANSFER_REQ_COMPL | MCQ_CQ_EVENT_STATUS | ERROR_MASK));
     }
 
     pub(crate) fn enable_interrupts(&self) {
@@ -1070,4 +1072,9 @@ pub(crate) fn is_uic_command_completion(interrupt_status: u32) -> bool {
 #[inline]
 pub(crate) fn is_uic_power_mode(interrupt_status: u32) -> bool {
     (interrupt_status & UIC_POWER_MODE) != 0
+}
+
+#[inline]
+pub(crate) fn is_error_interrupt(interrupt_status: u32) -> bool {
+    (interrupt_status & ERROR_MASK) != 0
 }

@@ -58,6 +58,12 @@ impl irq::ThreadedHandler for UfsQueueHandler {
         }
 
         self.reg.confirm_transfer_interrupts(interrupt_status);
+        if is_error_interrupt(interrupt_status) {
+            pr_warn!(
+                "[RUFS] ufs_irq: transfer/error interrupt status=0x{:x}\n",
+                interrupt_status
+            );
+        }
 
         ThreadedIrqReturn::WakeThread
     }
