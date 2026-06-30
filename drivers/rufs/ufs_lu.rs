@@ -4,7 +4,7 @@
 
 #![allow(dead_code)]
 
-use crate::ufs_dma::MAX_PRD_ENTRIES;
+use crate::ufs_dma::{MAX_PRD_ENTRIES, PRDT_DATA_BYTE_COUNT_MAX};
 use crate::ufs_queue::*;
 use kernel::bindings;
 use kernel::sync::{Arc, ArcBorrow, Mutex, SpinLock};
@@ -27,6 +27,7 @@ use kernel::{new_mutex, new_spinlock, prelude::*};
 
 const SECTOR_SIZE_U64: u64 = SECTOR_SIZE as u64;
 const MAX_DISCARD_SEGMENTS: u16 = 1;
+const MAX_SECTORS: u32 = 1024 * 1024 / 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UfsLuState {
@@ -185,6 +186,9 @@ impl UfsLu {
             .max_hw_discard_sectors(self.geometry.max_discard_sectors()?)
             .discard_granularity(self.geometry.logical_block_size())
             .max_discard_segments(MAX_DISCARD_SEGMENTS)
+            .max_hw_sectors(MAX_SECTORS)
+            .max_segments(u16::try_from(MAX_PRD_ENTRIES).map_err(|_| EOVERFLOW)?)
+            .max_segment_size(PRDT_DATA_BYTE_COUNT_MAX)
             .queue_depth(u32::try_from(self.queue_depth).map_err(|_| EOVERFLOW)?)?
             .capacity_sectors(capacity_sectors)
             .build(fmt!("ufs{}", self.lun), tagset, self.clone())?;

@@ -23,7 +23,7 @@ use kernel::{
 };
 use zerocopy_derive::{Immutable, KnownLayout};
 
-const PRDT_DATA_BYTE_COUNT_MAX: u32 = 0x00040000; // SZ_256K
+pub(crate) const PRDT_DATA_BYTE_COUNT_MAX: u32 = 0x00040000; // SZ_256K
 const PRDT_DATA_BYTE_COUNT_PAD: usize = 4;
 const UNMAP_PARAM_LIST_SIZE: usize = 24;
 const ALIGNED_UPIU_SIZE: usize = 512;
@@ -1563,6 +1563,40 @@ struct UfsPrdt {
     entries: KVec<PrdEntry>,
 }
 
+fn append_prd_entries(
+    entries: &mut KVec<PrdEntry>,
+    segment_address: u64,
+    segment_length: u32,
+) -> Result<()> {
+    if segment_length == 0 || segment_length % PRDT_DATA_BYTE_COUNT_PAD as u32 != 0 {
+        return Err(EINVAL);
+    }
+
+    let mut segment_offset = 0;
+    while segment_offset < segment_length {
+        if entries.len() == MAX_PRD_ENTRIES {
+            return Err(EINVAL);
+        }
+
+        let prd_len = core::cmp::min(PRDT_DATA_BYTE_COUNT_MAX, segment_length - segment_offset);
+        let addr = segment_address
+            .checked_add(u64::from(segment_offset))
+            .ok_or(EOVERFLOW)?;
+
+        entries.push(
+            PrdEntry {
+                addr: addr.to_le(),
+                reserved: 0,
+                size: (prd_len - 1).to_le(),
+            },
+            GFP_ATOMIC,
+        )?;
+        segment_offset += prd_len;
+    }
+
+    Ok(())
+}
+
 impl UfsDma {
     fn transfer_slots_for(reg: &UfsReg) -> usize {
         if reg.mcq_supported() {
@@ -1734,7 +1768,7 @@ impl UfsDma {
             return self.map_unmap_prdt(cmd);
         }
 
-        let iter = rq
+        let mut iter = rq
             .clone()
             .dma_map_iter(&self.dev, mempool.clone())
             .map_err(|_error| ENOMEM)?;
@@ -1743,18 +1777,18 @@ impl UfsDma {
         loop {
             let segment_address = iter.address();
             let segment_length = iter.length();
-            entries.push(
-                PrdEntry {
-                    addr: segment_address.to_le(),
-                    reserved: 0,
-                    size: (segment_length - 1).to_le(),
-                },
-                GFP_ATOMIC,
-            )?;
+            if segment_length == 0 || segment_length > remaining {
+                return Err(EINVAL);
+            }
+
+            append_prd_entries(&mut entries, segment_address, segment_length)?;
+
             remaining = remaining.saturating_sub(segment_length);
             if remaining == 0 {
                 break;
             }
+
+            iter.next()?;
         }
         let iter = iter.finish();
 
