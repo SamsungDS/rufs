@@ -172,7 +172,7 @@ impl UfsLu {
                 queue_depth,
                 state <- new_spinlock!(UfsLuState::Reset),
                 disk <- new_mutex!(None),
-                dma_vec_mempool: MemPool::new(1)?,
+                dma_vec_mempool: MemPool::new(*queue_depth)?,
             }),
             GFP_KERNEL,
         )
@@ -295,9 +295,14 @@ fn complete_unsubmitted(request: &Arc<UfsRequest>, e: Error) {
         return;
     };
 
-    let rq = OwnableRefCounted::try_from_shared(rq)
-        .map_err(|_e| kernel::error::code::EIO)
-        .expect("Failed to complete request");
+    let rq = match OwnableRefCounted::try_from_shared(rq) {
+        Ok(rq) => rq,
+        Err(rq) => {
+            pr_err!("[RUFS] ufs_lu: failed to reclaim unsubmitted request\n");
+            request.restore_block_request(rq);
+            return;
+        }
+    };
 
     if e == EBUSY {
         rq.requeue(true);
@@ -459,11 +464,23 @@ impl Operations for UfsLuBlockOps {
         // must never keep a second one while the command is in flight.
         let rq = OwnableRefCounted::into_shared(rq.start());
         if let Err(e) = request.compose_block_request(&rq, cmd, hw_queue, &lu.dma_vec_mempool) {
+            pr_err!(
+                "[RUFS] ufs_lu: compose request failed tag={} errno={}\n",
+                tag,
+                e.to_errno()
+            );
+            drop(rq);
             complete_unsubmitted(&request, e);
             return Ok(());
         }
 
         if let Err(e) = request.submit() {
+            pr_err!(
+                "[RUFS] ufs_lu: submit request failed tag={} errno={}\n",
+                tag,
+                e.to_errno()
+            );
+            drop(rq);
             complete_unsubmitted(&request, e);
         }
 

@@ -1247,6 +1247,10 @@ impl UfsRequest {
         self.inner.lock().block_rq.take()
     }
 
+    pub(crate) fn restore_block_request(&self, block_rq: ARef<mq::Request<UfsLuBlockOps>>) {
+        self.inner.lock().block_rq = Some(block_rq);
+    }
+
     fn timeout(&self) -> bool {
         let (cmd, block_rq, prdt, hw_queue) = {
             let mut inner = self.inner.lock();
