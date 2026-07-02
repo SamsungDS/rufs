@@ -179,6 +179,11 @@ impl<T: Operations> TagSet<T> {
         // converted back with `from_foreign` while `&self` is live.
         unsafe { T::TagSetData::borrow(ptr) }
     }
+    /// TODO
+    pub fn queue_depth(&self) -> u32 {
+        // SAFETY: By type invariant, `self.inner` is valid.
+        unsafe { (*self.inner.get()).queue_depth }
+    }
 }
 
 #[pinned_drop]

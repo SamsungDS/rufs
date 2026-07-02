@@ -297,7 +297,7 @@ static void blk_free_queue_rcu(struct rcu_head *rcu_head)
 	kmem_cache_free(blk_requestq_cachep, q);
 }
 
-static void blk_free_queue(struct request_queue *q)
+void blk_free_queue(struct request_queue *q)
 {
 	blk_free_queue_stats(q->stats);
 	if (queue_is_mq(q))
@@ -308,6 +308,7 @@ static void blk_free_queue(struct request_queue *q)
 	lockdep_unregister_key(&q->q_lock_cls_key);
 	call_rcu(&q->rcu_head, blk_free_queue_rcu);
 }
+EXPORT_SYMBOL(blk_free_queue);
 
 /**
  * blk_put_queue - decrement the request_queue refcount

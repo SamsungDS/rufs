@@ -263,13 +263,6 @@ impl Error {
         self.0.get()
     }
 
-    /// Convert a generic kernel error to a block layer error.
-    #[cfg(CONFIG_BLOCK)]
-    pub fn to_blk_status(self) -> bindings::blk_status_t {
-        // SAFETY: `self.0` is a valid error due to its invariant.
-        unsafe { bindings::errno_to_blk_status(self.0.get()) }
-    }
-
     /// Returns the error encoded as a pointer.
     pub fn to_ptr<T>(self) -> *mut T {
         // SAFETY: `self.0` is a valid error due to its invariant.

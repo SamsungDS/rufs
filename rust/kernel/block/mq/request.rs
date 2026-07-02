@@ -29,12 +29,7 @@ use crate::{
         Owned, //
     },
 };
-use core::{
-    marker::PhantomData,
-    ops::Deref,
-    pin::Pin,
-    ptr::NonNull, //
-};
+use core::{marker::PhantomData, ops::Deref, pin::Pin, ptr::NonNull};
 
 use super::{
     dma_map_iter::{
@@ -162,9 +157,9 @@ impl<T: Operations> RequestInner<T> {
 
     /// Get the blk-mq tag for this request.
     #[inline(always)]
-    pub fn tag(&self) -> i32 {
+    pub fn tag(&self) -> u32 {
         // SAFETY: By type invariant of `Self`, `self.0` is valid and live.
-        unsafe { (*self.0.get()).tag }
+        (unsafe { (*self.0.get()).tag } as u32)
     }
 
     /// Borrow the queue data from the request queue associated with this request.
@@ -391,6 +386,40 @@ impl<T: Operations> SyncRequest<T> {
             Ok(())
         }
     }
+
+    // TODO: Remove duplication.
+    /// Return a pointer to the [`RequestDataWrapper`] stored in the private area
+    /// of the request structure.
+    ///
+    /// # Safety
+    ///
+    /// - `this` must point to a valid allocation of size at least size of
+    ///   [`Self`] plus size of [`RequestDataWrapper`].
+    pub(crate) unsafe fn wrapper_ptr(this: *mut Self) -> NonNull<RequestDataWrapper<T>> {
+        let request_ptr = this.cast::<bindings::request>();
+        // SAFETY: By safety requirements for this function, `this` is a
+        // valid allocation.
+        let wrapper_ptr =
+            unsafe { bindings::blk_mq_rq_to_pdu(request_ptr).cast::<RequestDataWrapper<T>>() };
+        // SAFETY: By C API contract, `wrapper_ptr` points to a valid allocation
+        // and is not null.
+        unsafe { NonNull::new_unchecked(wrapper_ptr) }
+    }
+
+    /// Return a reference to the [`RequestDataWrapper`] stored in the private
+    /// area of the request structure.
+    pub(crate) fn wrapper_ref(&self) -> &RequestDataWrapper<T> {
+        // SAFETY: By type invariant, `self.0` is a valid allocation. Further,
+        // the private data associated with this request is initialized and
+        // valid. The existence of `&self` guarantees that the private data is
+        // valid as a shared reference.
+        unsafe { Self::wrapper_ptr(core::ptr::from_ref(self).cast_mut()).as_ref() }
+    }
+
+    /// Return a reference to the per-request data associated with this request.
+    pub fn data_ref(&self) -> &T::RequestData {
+        &self.wrapper_ref().data
+    }
 }
 
 impl<T: Operations> Drop for SyncRequest<T> {
@@ -607,5 +636,17 @@ impl<T: Operations> OwnableRefCounted for Request<T> {
 
         // SAFETY: We incremented the refcount above.
         unsafe { ARef::from_raw(Owned::into_raw(this)) }
+    }
+}
+
+impl<T: Operations> kernel::fmt::Debug for Request<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Request").finish()
+    }
+}
+
+impl<T: Operations> kernel::fmt::Debug for ARef<Request<T>> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Request").finish()
     }
 }

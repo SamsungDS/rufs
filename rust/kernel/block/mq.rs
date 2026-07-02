@@ -7,9 +7,8 @@
 //!
 //! - Implement [`Operations`] for a type `T`.
 //! - Create a [`TagSet<T>`].
-//! - Create a [`GenDisk<T>`], via the [`GenDiskBuilder`].
-//! - Add the disk to the system by calling [`GenDiskBuilder::build`] passing in
-//!   the `TagSet` reference.
+//! - Create and add a [`GenDisk<T>`] to the system by calling
+//!   [`GenDisk::new`] passing in the `TagSet` reference.
 //!
 //! The types available in this module that have direct C counterparts are:
 //!
@@ -56,8 +55,7 @@
 //!
 //! [`GenDisk`]: gen_disk::GenDisk
 //! [`GenDisk<T>`]: gen_disk::GenDisk
-//! [`GenDiskBuilder`]: gen_disk::GenDiskBuilder
-//! [`GenDiskBuilder::build`]: gen_disk::GenDiskBuilder::build
+//! [`GenDisk::new`]: gen_disk::GenDisk::new
 //!
 //! # Examples
 //!
@@ -79,6 +77,7 @@
 //!     type QueueData = ();
 //!     type HwData = ();
 //!     type TagSetData = ();
+//!     type GenDiskData = ();
 //!
 //!     fn new_request_data(
 //!     ) -> impl PinInit<()> {
@@ -123,9 +122,8 @@
 //!     ),
 //!     flags::GFP_KERNEL,
 //! )?;
-//! let mut disk = gen_disk::GenDiskBuilder::new()
-//!     .capacity_sectors(4096)
-//!     .build(fmt!("myblk"), tagset, ())?;
+//! let limits = LimitsBuilder::<MyBlkDevice>::new().build()?;
+//! let disk = gen_disk::GenDisk::new(fmt!("myblk"), tagset, (), limits, (), 4096, 256)?;
 //!
 //! # Ok::<(), kernel::error::Error>(())
 //! ```
@@ -155,7 +153,12 @@ pub use request::{
     IdleRequest,
     Request, //
 };
-pub use request_queue::RequestQueue;
+pub use request_queue::{
+    BoundRequestQueue, //
+    Limits,
+    LimitsBuilder,
+    RequestQueue,
+};
 pub use tag_set::{
     QueueType,
     TagSet, //

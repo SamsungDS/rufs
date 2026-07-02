@@ -17,6 +17,7 @@ use crate::{
     },
     error::{
         from_result,
+        to_result,
         Result, //
     },
     prelude::*,
@@ -33,6 +34,7 @@ use crate::{
 use core::marker::PhantomData;
 use pin_init::PinInit;
 
+use super::gen_disk::GenDisk;
 type ForeignBorrowed<'a, T> = <T as ForeignOwnable>::Borrowed<'a>;
 
 /// Implement this trait to interface blk-mq as block devices.
@@ -76,6 +78,10 @@ pub trait Operations: Sized {
     /// blk_mq_tag_set`.
     type TagSetData: ForeignOwnable + Sync;
 
+    /// Data associated with the `GenDisk`. This data is stored as a pointer in
+    /// `struct gendisk`.
+    type GenDiskData: ForeignOwnable + Send + Sync;
+
     /// Called by the kernel to get an initializer for a `Pin<&mut RequestData>`.
     fn new_request_data() -> impl PinInit<Self::RequestData>;
 
@@ -116,6 +122,21 @@ pub trait Operations: Sized {
     ) -> Result<bool> {
         build_error!(crate::error::VTABLE_DEFAULT_ERROR)
     }
+
+    /// Called by the kernel to get a zone report from the driver.
+    ///
+    /// The driver must call `callback` once for each zone on `disk` and populate the first argument
+    /// with a zone descriptor and the second argument when the zone index.
+    // TODO: We cannot gate this on CONFIG_BLK_DEV_ZONED due to limitations of the `vtable` macro.
+    fn report_zones(
+        _disk: &GenDisk<Self>,
+        _sector: u64,
+        _nr_zones: u32,
+        _callback: impl Fn(&bindings::blk_zone, u32) -> Result,
+    ) -> Result<u32> {
+        Err(ENOTSUPP)
+    }
+
     /// Called by the kernel to map hardware queues to CPU cores.
     fn map_queues(_tag_set: Pin<&mut TagSet<Self>>) {
         build_error!(crate::error::VTABLE_DEFAULT_ERROR)
@@ -436,6 +457,41 @@ impl<T: Operations> OperationsVTable<T> {
 
         // SAFETY: `pdu` is valid for read and write and is properly initialised.
         unsafe { core::ptr::drop_in_place(pdu) };
+    }
+
+    /// This function is a callback hook for the C kernel. A pointer to this function is
+    /// installed in the `blk_mq_ops` vtable for the driver.
+    ///
+    /// # Safety
+    ///
+    /// - This function may only be called by blk-mq C infrastructure.
+    /// - `disk_ptr` must be a pointer to a gendisk initialized by `GenDisk::build`.
+    pub(crate) unsafe extern "C" fn report_zones_callback(
+        disk_ptr: *mut bindings::gendisk,
+        sector: u64,
+        nr_zones: u32,
+        args: *mut bindings::blk_report_zones_args,
+    ) -> i32 {
+        // SAFETY: By function safety requirements, `disk_ptr` is a valid gendisk that stays
+        // valid for the duration of this callback.
+        let disk = unsafe { GenDisk::form_raw(disk_ptr.cast_const()) };
+
+        from_result(|| {
+            T::report_zones(disk, sector, nr_zones, |zone, idx| -> Result {
+                to_result(
+                    // SAFETY: `disk_ptr` is valid by function safety requirements.
+                    unsafe {
+                        bindings::disk_report_zone(
+                            disk_ptr,
+                            core::ptr::from_ref(zone).cast_mut(),
+                            idx,
+                            args,
+                        )
+                    },
+                )
+            })
+            .and_then(|v: u32| -> Result<_> { Ok(v.try_into()?) })
+        })
     }
 
     /// This function is called by the C kernel. A pointer to this function is
