@@ -5,11 +5,12 @@
 #![allow(unused_variables)]
 
 use crate::ufs_dma::{DescBuffer, MAX_PRD_ENTRIES};
+use crate::ufs_lu::UfsLuBlockOps;
 use crate::ufs_queue::*;
 use kernel::alloc::mempool::MemPool;
 use kernel::block::error::BlkResult;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;
-use kernel::block::mq::{self, IdleRequest, Request};
+use kernel::block::mq::{self, IdleRequest, LimitsBuilder, Request};
 use kernel::error::{from_err_ptr, to_result};
 use kernel::sync::{aref::ARef, Arc, Mutex};
 use kernel::time::{delay, Delta};
@@ -34,6 +35,7 @@ impl mq::Operations for TaskManagementOps {
     type QueueData = ();
     type HwData = ();
     type TagSetData = ();
+    type GenDiskData = ();
 
     fn new_request_data() -> impl PinInit<Self::RequestData> {
         ()
@@ -66,7 +68,7 @@ impl mq::Operations for TaskManagementOps {
 // so accidental dispatch is rejected instead of silently completing.
 struct TmfQueue {
     tag_set: Arc<mq::TagSet<TaskManagementOps>>,
-    queue: Owned<mq::RequestQueue<TaskManagementOps>>,
+    queue: mq::BoundRequestQueue<TaskManagementOps>,
 }
 
 // SAFETY: `TmfQueue` owns the blk-mq tag set, request queue, and request pointer
@@ -87,7 +89,8 @@ impl TmfQueue {
             GFP_KERNEL,
         )?;
 
-        let queue = mq::RequestQueue::new(tag_set.clone(), ())?;
+        let limits = LimitsBuilder::<UfsLuBlockOps>::new().build()?;
+        let queue = mq::RequestQueue::new(tag_set.clone(), limits, (), 1)?;
 
         Ok(Self { tag_set, queue })
     }

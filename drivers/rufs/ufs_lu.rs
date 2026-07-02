@@ -7,6 +7,8 @@
 use crate::ufs_dma::{MAX_PRD_ENTRIES, PRDT_DATA_BYTE_COUNT_MAX};
 use crate::ufs_queue::*;
 use kernel::bindings;
+use kernel::block::mq::gen_disk::BoundGenDisk;
+use kernel::block::mq::LimitsBuilder;
 use kernel::sync::atomic::{Acquire, Atomic, Relaxed};
 use kernel::sync::{Arc, ArcBorrow, Mutex, SpinLock};
 use kernel::types::{OwnableRefCounted, Owned};
@@ -15,10 +17,7 @@ use kernel::{
     block::{
         error::{code, BlkResult},
         mq::{
-            self,
-            dma_map_iter::DmaMapMempool,
-            gen_disk::{GenDisk, GenDiskBuilder},
-            IdleRequest, Operations, TagSet,
+            self, dma_map_iter::DmaMapMempool, gen_disk::GenDisk, IdleRequest, Operations, TagSet,
         },
         SECTOR_SIZE,
     },
@@ -153,7 +152,7 @@ pub(crate) struct UfsLu {
     state: SpinLock<UfsLuState>,
 
     #[pin]
-    disk: Mutex<Option<Arc<GenDisk<UfsLuBlockOps>>>>,
+    disk: Mutex<Option<BoundGenDisk<UfsLuBlockOps>>>,
 }
 
 impl UfsLu {
@@ -181,7 +180,7 @@ impl UfsLu {
 
     pub(crate) fn init_disk(self: &Arc<Self>, tagset: Arc<TagSet<UfsLuBlockOps>>) -> Result<()> {
         let capacity_sectors = self.geometry.capacity_sectors().ok_or(EOVERFLOW)?;
-        let disk = GenDiskBuilder::new()
+        let limits = LimitsBuilder::<UfsLuBlockOps>::new()
             .logical_block_size(self.geometry.logical_block_size())?
             .physical_block_size(self.geometry.physical_block_size())?
             .max_hw_discard_sectors(self.geometry.max_discard_sectors()?)
@@ -190,9 +189,18 @@ impl UfsLu {
             .max_hw_sectors(MAX_SECTORS)
             .max_segments(u16::try_from(MAX_PRD_ENTRIES).map_err(|_| EOVERFLOW)?)
             .max_segment_size(PRDT_DATA_BYTE_COUNT_MAX)
-            .queue_depth(u32::try_from(self.queue_depth).map_err(|_| EOVERFLOW)?)?
-            .capacity_sectors(capacity_sectors)
-            .build(fmt!("ufs{}", self.lun), tagset, self.clone())?;
+            .build()?;
+
+        let queue_depth = u32::try_from(self.queue_depth).map_err(|_| EOVERFLOW)?;
+        let disk = GenDisk::new(
+            fmt!("ufs{}", self.lun),
+            tagset,
+            self.clone(),
+            limits,
+            (),
+            capacity_sectors,
+            queue_depth,
+        )?;
 
         let mut current = self.disk.lock();
         if current.is_some() {
@@ -329,6 +337,7 @@ impl Operations for UfsLuBlockOps {
     type QueueData = Arc<UfsLu>;
     type HwData = KBox<u32>;
     type TagSetData = KBox<UfsQueueMap>;
+    type GenDiskData = ();
 
     fn new_request_data() -> impl PinInit<Self::RequestData> {
         pin_init!(UfsLuBlockRequest {
@@ -520,10 +529,7 @@ impl Operations for UfsLuBlockOps {
         let rq = OwnableRefCounted::try_from_shared(rq)
             .map_err(|_| EBUSY)
             .expect("rufs: request completion failed");
-        let status = rq
-            .data_ref()
-            .status
-            .load(Acquire);
+        let status = rq.data_ref().status.load(Acquire);
         rq.data_ref()
             .status
             .store(u32::from(bindings::BLK_STS_OK), Relaxed);
