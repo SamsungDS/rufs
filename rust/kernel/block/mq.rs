@@ -151,7 +151,12 @@ pub use request::{
     Request,
 };
 pub use request_list::RequestList;
-pub use request_queue::RequestQueue;
+pub use request_queue::{
+    Limits,
+    LimitsBuilder,
+    RequestQueue,
+    BoundRequestQueue, //
+};
 pub use tag_set::{
     QueueType,
     TagSet, //

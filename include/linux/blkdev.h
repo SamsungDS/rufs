@@ -1165,6 +1165,7 @@ void disk_set_independent_access_ranges(struct gendisk *disk,
 				struct blk_independent_access_ranges *iars);
 
 bool __must_check blk_get_queue(struct request_queue *);
+extern void blk_free_queue(struct request_queue *);
 extern void blk_put_queue(struct request_queue *);
 
 void blk_mark_disk_dead(struct gendisk *disk);

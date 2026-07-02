@@ -8,12 +8,12 @@
 use crate::{
     bindings,
     block::mq::{
-        Feature,
+        operations::OperationsVTable,
         Operations,
+        RequestQueue,
         TagSet, //
     },
     error::{
-        self,
         from_err_ptr,
         Result, //
     },
@@ -24,222 +24,54 @@ use crate::{
     prelude::*,
     static_lock_class,
     str::NullTerminatedFormatter,
-    sync::Arc,
+    sync::{
+        aref::ARef,
+        Arc, //
+    },
     types::{
         ForeignOwnable,
+        Opaque,
+        RefCounted,
         ScopeGuard, //
     },
 };
 use core::{
     marker::PhantomData,
+    ops::Deref,
     ptr::NonNull, //
 };
 
-/// A builder for [`GenDisk`].
+#[cfg(CONFIG_BLK_DEV_ZONED)]
+use super::Feature;
+use super::{request_queue::Limits, BoundRequestQueue};
+
+/// A generic block device.
 ///
-/// Use this struct to configure and add new [`GenDisk`] to the VFS.
-pub struct GenDiskBuilder<T> {
-    rotational: bool,
-    logical_block_size: u32,
-    physical_block_size: u32,
-    capacity_sectors: u64,
-    max_hw_discard_sectors: u32,
-    discard_granularity: u32,
-    max_discard_segments: u16,
-    queue_depth: u32,
-    write_cache: bool,
-    forced_unit_access: bool,
-    max_sectors: u32,
-    virt_boundary_mask: usize,
+/// # Invariants
+///
+///  - `gendisk` must always point to an initialized and valid `struct gendisk`.
+///  - `self.gendisk.queue.queuedata` is initialized by a call to `ForeignOwnable::into_foreign`.
+#[repr(transparent)]
+pub struct GenDisk<T: Operations> {
+    gendisk: Opaque<bindings::gendisk>,
     _p: PhantomData<T>,
 }
 
-impl<T> Default for GenDiskBuilder<T> {
-    fn default() -> Self {
-        Self {
-            rotational: false,
-            logical_block_size: bindings::PAGE_SIZE as u32,
-            physical_block_size: bindings::PAGE_SIZE as u32,
-            capacity_sectors: 0,
-            max_hw_discard_sectors: 0,
-            discard_granularity: 0,
-            max_discard_segments: 0,
-            queue_depth: 0,
-            write_cache: false,
-            forced_unit_access: false,
-            max_sectors: 0,
-            virt_boundary_mask: 0,
-            _p: PhantomData,
-        }
-    }
-}
-
-impl<T: Operations> GenDiskBuilder<T> {
-    /// Create a new instance.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the rotational media attribute for the device to be built.
-    pub fn rotational(mut self, rotational: bool) -> Self {
-        self.rotational = rotational;
-        self
-    }
-
-    /// Validate block size by verifying that it is between 512 and `PAGE_SIZE`,
-    /// and that it is a power of two.
-    pub fn validate_block_size(size: u32) -> Result {
-        if !(512..=bindings::PAGE_SIZE as u32).contains(&size) || !size.is_power_of_two() {
-            Err(error::code::EINVAL)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Set the logical block size of the device to be built.
-    ///
-    /// This method will check that block size is a power of two and between 512
-    /// and 4096. If not, an error is returned and the block size is not set.
-    ///
-    /// This is the smallest unit the storage device can address. It is
-    /// typically 4096 bytes.
-    pub fn logical_block_size(mut self, block_size: u32) -> Result<Self> {
-        Self::validate_block_size(block_size)?;
-        self.logical_block_size = block_size;
-        Ok(self)
-    }
-
-    /// Set the physical block size of the device to be built.
-    ///
-    /// This method will check that block size is a power of two and between 512
-    /// and 4096. If not, an error is returned and the block size is not set.
-    ///
-    /// This is the smallest unit a physical storage device can write
-    /// atomically. It is usually the same as the logical block size but may be
-    /// bigger. One example is SATA drives with 4096 byte physical block size
-    /// that expose a 512 byte logical block size to the operating system.
-    pub fn physical_block_size(mut self, block_size: u32) -> Result<Self> {
-        Self::validate_block_size(block_size)?;
-        self.physical_block_size = block_size;
-        Ok(self)
-    }
-
-    /// Set the capacity of the device to be built, in sectors (512 bytes).
-    pub fn capacity_sectors(mut self, capacity: u64) -> Self {
-        self.capacity_sectors = capacity;
-        self
-    }
-
-    /// Set the maximum amount of sectors the underlying hardware device can
-    /// discard/trim in a single operation.
-    ///
-    /// Setting 0 (default) here will cause the disk to report discard not
-    /// supported.
-    pub fn max_hw_discard_sectors(mut self, max_hw_discard_sectors: u32) -> Self {
-        self.max_hw_discard_sectors = max_hw_discard_sectors;
-        self
-    }
-
-    /// Set the granularity of discard operations, in bytes.
-    ///
-    /// Devices that support discard may internally allocate space in units that
-    /// are bigger than the logical block size. This value indicates the size of
-    /// the internal allocation unit in bytes. The beginning and the size of a
-    /// discard request should be aligned to this granularity for the discard to
-    /// take effect. If 0 is set here, the granularity is set to match the
-    /// physical block size of the device.
-    pub fn discard_granularity(mut self, discard_granularity: u32) -> Self {
-        self.discard_granularity = discard_granularity;
-        self
-    }
-
-    /// Set the maximum number of scatter/gather entries in a discard request.
-    ///
-    /// This is the maximum number of discontiguous ranges the underlying
-    /// hardware device can discard/trim in a single operation.
-    pub fn max_discard_segments(mut self, max_discard_segments: u16) -> Self {
-        self.max_discard_segments = max_discard_segments;
-        self
-    }
-
-    /// Set the request queue depth for the device to be built.
-    ///
-    /// Rejects a depth of zero, which is not a valid queue depth. Leaving this
-    /// unset preserves the tag-set default.
-    pub fn queue_depth(mut self, depth: u32) -> Result<Self> {
-        if depth == 0 {
-            return Err(EINVAL);
-        }
-
-        self.queue_depth = depth;
-        Ok(self)
-    }
-    /// Declare that this device supports forced unit access.
-    pub fn forced_unit_access(mut self, enable: bool) -> Self {
-        self.forced_unit_access = enable;
-        self
-    }
-
-    /// Declare that this device has a write-back cache.
-    pub fn write_cache(mut self, enable: bool) -> Self {
-        self.write_cache = enable;
-        self
-    }
-
-    /// Maximum size of a command in 512 byte sectors.
-    pub fn max_sectors(mut self, sectors: u32) -> Self {
-        self.max_sectors = sectors;
-        self
-    }
-
-    /// Set the I/O segment memory alignment mask for the block device. I/O requests to this device
-    /// will be split between segments wherever either the memory address of the end of the previous
-    /// segment or the memory address of the beginning of the current segment is not aligned to
-    /// virt_boundary_mask + 1 bytes.
-    pub fn virt_boundary_mask(mut self, mask: usize) -> Self {
-        self.virt_boundary_mask = mask;
-        self
-    }
-
-    /// Build a new `GenDisk` and add it to the VFS.
-    pub fn build(
-        self,
+impl<T: Operations> GenDisk<T> {
+    /// TODO
+    pub fn new_for_queue(
         name: fmt::Arguments<'_>,
-        tagset: Arc<TagSet<T>>,
-        queue_data: T::QueueData,
-    ) -> Result<GenDisk<T>> {
-        let data = queue_data.into_foreign();
-        let recover_data = ScopeGuard::new(|| {
-            // SAFETY: T::QueueData was created by the call to `into_foreign()` above
-            drop(unsafe { T::QueueData::from_foreign(data) });
-        });
+        request_queue: BoundRequestQueue<T>,
+        capacity_sectors: u64,
+        data: T::GenDiskData,
+    ) -> Result<BoundGenDisk<T>> {
+        #[cfg(CONFIG_BLK_DEV_ZONED)]
+        let features = request_queue.limits().features();
 
-        let mut lim: bindings::queue_limits = pin_init::zeroed();
-
-        lim.logical_block_size = self.logical_block_size;
-        lim.physical_block_size = self.physical_block_size;
-        lim.max_hw_discard_sectors = self.max_hw_discard_sectors;
-        lim.discard_granularity = self.discard_granularity;
-        lim.max_discard_segments = self.max_discard_segments;
-        lim.max_sectors = self.max_sectors;
-        lim.virt_boundary_mask = self.virt_boundary_mask;
-        if self.rotational {
-            lim.features = Feature::Rotational.into();
-        }
-
-        if self.write_cache {
-            lim.features |= Feature::WriteCache;
-        }
-
-        if self.forced_unit_access {
-            lim.features |= Feature::ForcedUnitAccess;
-        }
-        // SAFETY: `tagset.raw_tag_set()` points to a valid and initialized tag set
+        // SAFETY: TODO
         let gendisk = from_err_ptr(unsafe {
-            bindings::__blk_mq_alloc_disk(
-                tagset.raw_tag_set(),
-                &mut lim,
-                data,
+            bindings::blk_mq_alloc_disk_for_queue(
+                request_queue.into_raw(),
                 static_lock_class!().as_ptr(),
             )
         })?;
@@ -247,56 +79,55 @@ impl<T: Operations> GenDiskBuilder<T> {
         // SAFETY: `gendisk` is a valid pointer as we initialized it above
         unsafe { (*gendisk).fops = Self::build_vtable() };
 
-        if self.queue_depth != 0 {
-            // SAFETY: `gendisk` and its request queue are initialized.
-            unsafe { bindings::blk_set_queue_depth((*gendisk).queue, self.queue_depth) };
-        }
-
-        let cleanup_failure = ScopeGuard::new_with_data((gendisk, data), |(gendisk, data)| {
-            // SAFETY: `gendisk` came from `__blk_mq_alloc_disk()` above and
-            // has not been added to the VFS on this cleanup path.
-            unsafe { bindings::put_disk(gendisk) };
-            // SAFETY: `data` came from `into_foreign()` above and has not been
-            // converted back on this cleanup path.
-            drop(unsafe { T::QueueData::from_foreign(data) });
-        });
-
-        // The failure guard now owns both pieces of cleanup; the early guard
-        // must not run on this path anymore.
-        recover_data.dismiss();
-
         let mut writer = NullTerminatedFormatter::new(
-            // SAFETY: `gendisk` points to a valid and initialized instance. We
-            // have exclusive access, since the disk is not added to the VFS
-            // yet.
+            // SAFETY: `gendisk` is valid and initialized. We have exclusive
+            // access, since the disk is not added to the VFS yet.
             unsafe { &mut (*gendisk).disk_name },
         )
         .ok_or(EINVAL)?;
         writer.write_fmt(name)?;
 
-        // SAFETY: `gendisk` points to a valid and initialized instance of
-        // `struct gendisk`. `set_capacity` takes a lock to synchronize this
-        // operation, so we will not race.
-        unsafe { bindings::set_capacity(gendisk, self.capacity_sectors) };
+        // SAFETY: `disk.gendisk` is valid and initialized. `set_capacity` takes a
+        // lock to synchronize this operation, so we will not race.
+        unsafe { bindings::set_capacity(gendisk, capacity_sectors) };
 
-        crate::error::to_result(
-            // SAFETY: `gendisk` points to a valid and initialized instance of
-            // `struct gendisk`.
-            unsafe {
-                bindings::device_add_disk(core::ptr::null_mut(), gendisk, core::ptr::null_mut())
-            },
-        )?;
+        let data = data.into_foreign();
+        unsafe { (*gendisk).private_data = data };
 
-        cleanup_failure.dismiss();
+        let guard = ScopeGuard::new(|| unsafe { ForeignOwnable::from_foreign(data) });
 
-        // INVARIANT: `gendisk` was initialized above.
-        // INVARIANT: `gendisk` was added to the VFS via `device_add_disk` above.
-        // INVARIANT: `gendisk.queue.queue_data` is set to `data` in the call to
-        // `__blk_mq_alloc_disk` above.
-        Ok(GenDisk {
-            _tagset: tagset,
-            gendisk,
-        })
+        // SAFETY: `disk.gendisk` is valid and initialized.
+        crate::error::to_result(unsafe {
+            bindings::device_add_disk(core::ptr::null_mut(), gendisk, core::ptr::null_mut())
+        })?;
+
+        guard.dismiss();
+
+        #[cfg(CONFIG_BLK_DEV_ZONED)]
+        if features.contains(Feature::Zoned) {
+            // SAFETY: `disk.gendisk` is valid and was added to the VFS above.
+            unsafe { bindings::blk_revalidate_disk_zones(gendisk) };
+        }
+
+        // SAFETY: We one a refcount from the allocation of the disk.
+        let disk = unsafe { ARef::from_raw(NonNull::new_unchecked(gendisk).cast()) };
+
+        Ok(BoundGenDisk(disk, PhantomData))
+    }
+
+    /// Build a new `GenDisk` and add it to the VFS.
+    pub fn new(
+        name: fmt::Arguments<'_>,
+        tagset: Arc<TagSet<T>>,
+        queue_data: T::QueueData,
+        queue_limits: Limits,
+        gendisk_data: T::GenDiskData,
+        capacity_sectors: u64,
+        queue_depth: u32,
+    ) -> Result<BoundGenDisk<T>> {
+        let queue = RequestQueue::new(tagset, queue_limits, queue_data, queue_depth)?;
+
+        Self::new_for_queue(name, queue, capacity_sectors, gendisk_data)
     }
 
     const VTABLE: bindings::block_device_operations = bindings::block_device_operations {
@@ -310,7 +141,11 @@ impl<T: Operations> GenDiskBuilder<T> {
         getgeo: None,
         set_read_only: None,
         swap_slot_free_notify: None,
-        report_zones: None,
+        report_zones: if T::HAS_REPORT_ZONES {
+            Some(OperationsVTable::<T>::report_zones_callback)
+        } else {
+            None
+        },
         devnode: None,
         alternative_gpt_sector: None,
         get_unique_id: None,
@@ -319,26 +154,53 @@ impl<T: Operations> GenDiskBuilder<T> {
         // <https://github.com/rust-lang/rust/issues/119618>
         owner: core::ptr::null_mut(),
         pr_ops: core::ptr::null_mut(),
-        free_disk: None,
+        free_disk: Some(Self::release),
         poll_bio: None,
     };
 
     pub(crate) const fn build_vtable() -> &'static bindings::block_device_operations {
         &Self::VTABLE
     }
+
+    /// Get the [`RequestQueue`] associated with this [`GenDisk`].
+    pub fn queue(&self) -> &RequestQueue<T> {
+        // SAFETY: By type invariant, self is a valid gendisk.
+        unsafe { RequestQueue::from_raw((*self.gendisk.get()).queue) }
+    }
+
+    /// Get the private data associated with this [`GenDisk`].
+    pub fn disk_data(&self) -> <T::GenDiskData as ForeignOwnable>::Borrowed<'_> {
+        // SAFETY: By type invariant, self is a valid gendisk.
+        unsafe { T::GenDiskData::borrow((*self.gendisk.get()).private_data) }
+    }
+
+    extern "C" fn release(this: *mut bindings::gendisk) {
+        // SAFETY: We own a bound disk that we dissolved to a pointer during
+        // construction.
+        drop(unsafe { BoundRequestQueue::<T>::from_raw((*this).queue) });
+
+        let disk_data = unsafe { (*this).private_data };
+        // SAFETY: `this.private` was created by `GenDiskBuilder::build` with a
+        // call to `ForeignOwnable::into_foreign`.
+        // `ForeignOwnable::from_foreign` is only called here.
+        drop(unsafe { T::GenDiskData::from_foreign(disk_data) });
+    }
+
+    // # Safety: TODO
+    pub(crate) unsafe fn form_raw<'a>(ptr: *const bindings::gendisk) -> &'a Self {
+        // SAFETY: Self is transparent.
+        unsafe { &*ptr.cast() }
+    }
 }
 
-/// A generic block device.
-///
-/// # Invariants
-///
-///  - `gendisk` must always point to an initialized and valid `struct gendisk`.
-///  - `gendisk` was added to the VFS through a call to
-///    `bindings::device_add_disk`.
-///  - `self.gendisk.queue.queuedata` is initialized by a call to `ForeignOwnable::into_foreign`.
-pub struct GenDisk<T: Operations> {
-    _tagset: Arc<TagSet<T>>,
-    gendisk: *mut bindings::gendisk,
+unsafe impl<T: Operations> RefCounted for GenDisk<T> {
+    fn inc_ref(&self) {
+        unsafe { bindings::get_device(&raw mut (*(*self.gendisk.get()).part0).bd_device) };
+    }
+
+    unsafe fn dec_ref(obj: NonNull<Self>) {
+        unsafe { bindings::put_disk((*obj.as_ptr()).gendisk.get()) };
+    }
 }
 
 // SAFETY: `GenDisk` is an owned pointer to a `struct gendisk` and an `Arc` to a
@@ -362,27 +224,22 @@ where
 {
 }
 
-impl<T: Operations> Drop for GenDisk<T> {
+/// TODO
+pub struct BoundGenDisk<T: Operations>(ARef<GenDisk<T>>, PhantomData<T>);
+
+impl<T: Operations> Drop for BoundGenDisk<T> {
     fn drop(&mut self) {
-        // SAFETY: By type invariant of `Self`, `self.gendisk` points to a valid
-        // and initialized instance of `struct gendisk`, and, `queuedata` was
-        // initialized with the result of a call to
-        // `ForeignOwnable::into_foreign`.
-        let queue_data = unsafe { (*(*self.gendisk).queue).queuedata };
+        let disk = self.0.deref().gendisk.get();
 
-        // SAFETY: By type invariant, `self.gendisk` points to a valid and
-        // initialized instance of `struct gendisk`, and it was previously added
-        // to the VFS.
-        unsafe { bindings::del_gendisk(self.gendisk) };
+        // SAFETY: We own the disk binding;
+        unsafe { bindings::del_gendisk(disk) };
+    }
+}
 
-        // SAFETY: By type invariant, `self.gendisk` was added to the VFS, so
-        // `put_disk()` must follow `del_gendisk()` to drop the final gendisk
-        // reference and trigger the remaining release path.
-        unsafe { bindings::put_disk(self.gendisk) };
+impl<T: Operations> Deref for BoundGenDisk<T> {
+    type Target = ARef<GenDisk<T>>;
 
-        // SAFETY: `queue.queuedata` was created by `GenDiskBuilder::build` with
-        // a call to `ForeignOwnable::into_foreign` to create `queuedata`.
-        // `ForeignOwnable::from_foreign` is only called here.
-        drop(unsafe { T::QueueData::from_foreign(queue_data) });
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }

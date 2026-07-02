@@ -241,6 +241,12 @@ impl<T: Operations> TagSet<T> {
             Some(unsafe { Request::aref_from_raw(rq_ptr) })
         }
     }
+
+    /// TODO
+    pub fn queue_depth(&self) -> u32 {
+        // SAFETY: By type invariant, `self.inner` is valid.
+        unsafe { (*self.inner.get()).queue_depth }
+    }
 }
 
 #[pinned_drop]

@@ -161,7 +161,54 @@ unsafe impl ForeignOwnable for () {
     unsafe fn borrow_mut<'a>(_: *mut c_void) -> Self::BorrowedMut<'a> {}
 }
 
-/// Runs a cleanup function/closure when dropped.
+unsafe impl<T> ForeignOwnable for Option<T>
+where
+    T: ForeignOwnable,
+{
+    const FOREIGN_ALIGN: usize = T::FOREIGN_ALIGN;
+
+    type Borrowed<'a>
+        = Option<T::Borrowed<'a>>
+    where
+        T: 'a;
+
+    type BorrowedMut<'a>
+        = Option<T::BorrowedMut<'a>>
+    where
+        T: 'a;
+
+    fn into_foreign(self) -> *mut c_void {
+        match self {
+            None => core::ptr::null_mut(),
+            Some(value) => value.into_foreign(),
+        }
+    }
+
+    unsafe fn from_foreign(ptr: *mut c_void) -> Self {
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { T::from_foreign(ptr) })
+        }
+    }
+
+    unsafe fn borrow<'a>(ptr: *mut c_void) -> Self::Borrowed<'a> {
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { T::borrow(ptr) })
+        }
+    }
+
+    unsafe fn borrow_mut<'a>(ptr: *mut c_void) -> Self::BorrowedMut<'a> {
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { T::borrow_mut(ptr) })
+        }
+    }
+}
+
 ///
 /// The [`ScopeGuard::dismiss`] function prevents the cleanup function from running.
 ///
