@@ -161,14 +161,4 @@ impl UfsIrq {
         Ok(())
     }
 
-    pub(crate) fn wake_queue_thread(&self) {
-        let Some(irq) = self.queue.lock().first().map(|irq| irq.clone()) else {
-            pr_err!("rufs: queue IRQ thread is not registered\n");
-            return;
-        };
-
-        if irq.wake_thread().is_err() {
-            pr_err!("rufs: failed to wake queue IRQ thread\n");
-        }
-    }
 }

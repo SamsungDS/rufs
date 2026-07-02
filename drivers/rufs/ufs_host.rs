@@ -105,7 +105,7 @@ impl UfsHost {
 
             let irq = UfsIrq::new()?;
             let uic = UfsUic::new(reg.clone(), irq.clone())?;
-            let queue = UfsQueue::new(reg.clone(), irq.clone(), dma.clone())?;
+            let queue = UfsQueue::new(reg.clone(), dma.clone())?;
             let dev = UfsDev::new(queue.clone())?;
             let host = try_pin_init!(Self {
                 reg,

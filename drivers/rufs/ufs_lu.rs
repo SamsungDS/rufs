@@ -7,6 +7,7 @@
 use crate::ufs_dma::{MAX_PRD_ENTRIES, PRDT_DATA_BYTE_COUNT_MAX};
 use crate::ufs_queue::*;
 use kernel::bindings;
+use kernel::sync::atomic::{Acquire, Atomic, Relaxed};
 use kernel::sync::{Arc, ArcBorrow, Mutex, SpinLock};
 use kernel::types::{OwnableRefCounted, Owned};
 use kernel::{
@@ -317,14 +318,23 @@ fn complete_unsubmitted(request: &Arc<UfsRequest>, e: Error) {
     }
 }
 
+#[pin_data]
+pub(crate) struct UfsLuBlockRequest {
+    pub(crate) status: Atomic<u32>,
+}
+
 #[vtable]
 impl Operations for UfsLuBlockOps {
-    type RequestData = ();
+    type RequestData = UfsLuBlockRequest;
     type QueueData = Arc<UfsLu>;
     type HwData = KBox<u32>;
     type TagSetData = KBox<UfsQueueMap>;
 
-    fn new_request_data() -> impl PinInit<Self::RequestData> {}
+    fn new_request_data() -> impl PinInit<Self::RequestData> {
+        pin_init!(UfsLuBlockRequest {
+            status: Atomic::new(u32::from(bindings::BLK_STS_OK)),
+        })
+    }
 
     fn queue_rq(
         _hw_data: &u32,
@@ -465,9 +475,9 @@ impl Operations for UfsLuBlockOps {
         };
 
         // From here the driver takes shared ownership of the request and is
-        // responsible for completing it exactly once. The completion path
-        // reclaims unique ownership of this single reference, so the driver
-        // must never keep a second one while the command is in flight.
+        // responsible for completing it exactly once. Normal completion hands
+        // this reference to blk-mq completion; requeue and poll fallback paths
+        // reclaim unique ownership first because those APIs require it.
         let rq = OwnableRefCounted::into_shared(rq.start());
         if let Err(e) = request.compose_block_request(&rq, cmd, hw_queue, &lu.dma_vec_mempool) {
             pr_err!(
@@ -480,13 +490,18 @@ impl Operations for UfsLuBlockOps {
             return Ok(());
         }
 
+        // Drop the submit-side reference before making the request visible to
+        // hardware. A fast completion may run before queue_rq returns, and the
+        // blk-mq completion callback must be able to reclaim the only request
+        // reference kept by the RUFS slot.
+        drop(rq);
+
         if let Err(e) = request.submit() {
             pr_err!(
                 "[RUFS] ufs_lu: submit request failed tag={} errno={}\n",
                 tag,
                 e.to_errno()
             );
-            drop(rq);
             complete_unsubmitted(&request, e);
         }
 
@@ -502,10 +517,19 @@ impl Operations for UfsLuBlockOps {
     }
 
     fn complete(rq: ARef<mq::Request<Self>>) {
-        OwnableRefCounted::try_from_shared(rq)
+        let rq = OwnableRefCounted::try_from_shared(rq)
             .map_err(|_| EBUSY)
-            .expect("rufs: request completion failed")
-            .end_ok();
+            .expect("rufs: request completion failed");
+        let status = rq
+            .data_ref()
+            .status
+            .load(Acquire);
+        rq.data_ref()
+            .status
+            .store(u32::from(bindings::BLK_STS_OK), Relaxed);
+        let status = u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8);
+
+        rq.end(status);
     }
 
     fn request_timeout(
@@ -522,9 +546,10 @@ impl Operations for UfsLuBlockOps {
             return mq::RequestTimeoutStatus::RetryLater;
         };
 
-        request
-            .queue_data()
-            .timeout_request(queue_id as usize, tag as usize)
+        let lu = Arc::<UfsLu>::from(request.queue_data());
+        drop(request);
+
+        lu.timeout_request(queue_id as usize, tag as usize)
     }
 
     fn poll(
