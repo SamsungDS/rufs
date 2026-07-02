@@ -45,9 +45,6 @@ impl irq::ThreadedHandler for UfsUicHandler {
 pub(crate) struct UfsQueueHandler {
     reg: Arc<UfsReg>,
     queue: Arc<UfsQueue>,
-
-    #[pin]
-    placeholder: SpinLock<u32>,
 }
 
 impl irq::ThreadedHandler for UfsQueueHandler {
@@ -154,7 +151,6 @@ impl UfsIrq {
         let handler = try_pin_init!(UfsQueueHandler {
             reg,
             queue,
-            placeholder <- new_spinlock!(0),
         });
 
         let irq = pdev.request_threaded_irq(vector, Flags::SHARED, c_str!("ufshcd-queue"), handler);

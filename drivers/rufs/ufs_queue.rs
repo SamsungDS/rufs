@@ -12,9 +12,9 @@ use kernel::block::mq;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;
 use kernel::cpu;
 use kernel::sync::atomic::{Atomic, Relaxed};
-use kernel::sync::{aref::ARef, barrier, Arc, Completion, SpinLock};
+use kernel::sync::{aref::ARef, barrier, Arc, Completion, SpinLock, SpinLockIrq};
 use kernel::types::OwnableRefCounted;
-use kernel::{bindings, kvec, new_spinlock, prelude::*};
+use kernel::{bindings, kvec, new_spinlock, new_spinlock_irq, prelude::*};
 
 const READ_10: u8 = 0x28;
 const WRITE_10: u8 = 0x2a;
@@ -412,10 +412,10 @@ struct UfsRequestInner {
     //
     // This is intentionally kept as request state instead of using
     // `mq::Request::complete()`. blk-mq may run `Operations::complete()` from
-    // softirq context, and this kernel's Rust `SpinLock` API is not irqsave.
-    // Letting that callback re-enter RUFS queue/request locks can deadlock if
-    // it interrupts queue_rq or the threaded IRQ path while the same lock is
-    // held. MCQ also makes the extra state necessary because CQE consumption is
+    // softirq context, while RUFS still has plain queue/request locks in this
+    // ownership path. Letting that callback re-enter RUFS can deadlock if it
+    // interrupts queue_rq or the threaded IRQ path while the same lock is held.
+    // MCQ also makes the extra state necessary because CQE consumption is
     // destructive: once CQ head is advanced, the CQE cannot be fetched again if
     // `blk_mq_end_request()` temporarily fails due to outstanding `ARef`s.
     scsi_completion: Option<UfsScsiResult>,
@@ -425,6 +425,19 @@ struct UfsRequestInner {
 struct SdbTransferBackend {
     reg: Arc<UfsReg>,
     dma: Arc<UfsDma>,
+    state: Arc<SdbTransferState>,
+}
+
+#[derive(Default)]
+struct SdbCompletionState {
+    outstanding: u32,
+    completed: u32,
+}
+
+#[pin_data]
+struct SdbTransferState {
+    #[pin]
+    completion: SpinLockIrq<SdbCompletionState>,
 }
 
 #[pin_data]
@@ -568,26 +581,12 @@ impl McqQueueSet {
         Ok(())
     }
 
-    fn completion_cached(&self, tag: usize) -> bool {
+    fn completion_ready(&self, tag: usize) -> bool {
         self.completed
             .lock()
             .get(tag)
             .and_then(|cqe| cqe.as_ref())
             .is_some()
-    }
-
-    fn request_completed(&self, reg: &UfsReg, dma: &UfsDma, tag: usize) -> bool {
-        if let Err(e) = self.poll_completions(reg, dma) {
-            pr_err!(
-                "[RUFS] ufs_queue: MCQ poll failed tag={} errno={}\n",
-                tag,
-                e.to_errno(),
-            );
-            self.dump_state(reg, tag, "poll failed");
-            return false;
-        }
-
-        self.completion_cached(tag)
     }
 
     fn take_completion(&self, tag: usize) -> Option<CqEntry> {
@@ -712,18 +711,64 @@ trait UfsTransferOps {
     ) -> Result<Option<UfsPrdtMapping>>;
     fn submit_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<()>;
     fn submit_scsi(&self, cmd: UfsSCSICmd, tag: usize, hw_queue: Option<usize>) -> Result<()>;
-    fn request_completed(&self, tag: usize) -> bool;
     fn dump_state(&self, tag: usize, reason: &str);
     fn refresh_completions(&self) -> Result<()>;
     fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd>;
     fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult;
     fn poll_queue(&self, queue: usize) -> Result<()>;
-    fn completion_cached(&self, tag: usize) -> bool;
+    fn completion_ready(&self, tag: usize) -> bool;
 }
 
 impl SdbTransferBackend {
-    fn new(reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Self {
-        Self { reg, dma }
+    fn new(reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Result<Self> {
+        let state = Arc::pin_init(
+            pin_init!(SdbTransferState {
+                completion <- new_spinlock_irq!(SdbCompletionState::default()),
+            }),
+            GFP_KERNEL,
+        )?;
+
+        Ok(Self { reg, dma, state })
+    }
+
+    fn tag_mask(tag: usize) -> Option<u32> {
+        u32::try_from(tag).ok().and_then(|tag| 1u32.checked_shl(tag))
+    }
+
+    fn submit_tag(&self, tag: usize) -> Result<()> {
+        let mask = Self::tag_mask(tag).ok_or(EINVAL)?;
+        let mut state = self.state.completion.lock();
+
+        state.completed &= !mask;
+        state.outstanding |= mask;
+        self.reg.ring_utrl_doorbell(tag);
+
+        Ok(())
+    }
+
+    fn refresh_completion_state(&self) {
+        let mut state = self.state.completion.lock();
+        let doorbell = self.reg.read_utrl_doorbell();
+        let completed = !doorbell & state.outstanding;
+
+        state.outstanding &= !completed;
+        state.completed |= completed;
+    }
+
+    fn tag_completion_ready(&self, tag: usize) -> bool {
+        let Some(mask) = Self::tag_mask(tag) else {
+            return false;
+        };
+
+        (self.state.completion.lock().completed & mask) != 0
+    }
+
+    fn clear_completion(&self, tag: usize) {
+        let Some(mask) = Self::tag_mask(tag) else {
+            return;
+        };
+
+        self.state.completion.lock().completed &= !mask;
     }
 }
 
@@ -755,23 +800,15 @@ impl UfsTransferOps for SdbTransferBackend {
     }
 
     fn submit_dev(&self, _cmd: UfsDevCmd, tag: usize) -> Result<()> {
-        self.reg.ring_utrl_doorbell(tag);
-        Ok(())
+        self.submit_tag(tag)
     }
 
     fn submit_scsi(&self, _cmd: UfsSCSICmd, tag: usize, _hw_queue: Option<usize>) -> Result<()> {
-        self.reg.ring_utrl_doorbell(tag);
-        Ok(())
+        self.submit_tag(tag)
     }
 
-    fn request_completed(&self, tag: usize) -> bool {
-        (self.reg.read_utrl_doorbell() & (1 << tag)) == 0
-    }
-
-    // SDB has no destructive completion queue entry to snapshot, so this is a
-    // no-op. MCQ uses the same backend interface to separate CQ consumption
-    // from request finalization.
     fn refresh_completions(&self) -> Result<()> {
+        self.refresh_completion_state();
         Ok(())
     }
 
@@ -779,19 +816,31 @@ impl UfsTransferOps for SdbTransferBackend {
         Ok(())
     }
 
-    fn completion_cached(&self, tag: usize) -> bool {
-        self.request_completed(tag)
+    fn completion_ready(&self, tag: usize) -> bool {
+        self.tag_completion_ready(tag)
     }
 
     fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
+        self.clear_completion(tag);
         self.dma.fetch_devman_upiu(cmd, tag)
     }
 
     fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult {
+        self.clear_completion(tag);
         self.dma.fetch_scsi_completion(tag)
     }
 
-    fn dump_state(&self, _tag: usize, _reason: &str) {}
+    fn dump_state(&self, tag: usize, reason: &str) {
+        let state = self.state.completion.lock();
+
+        pr_err!(
+            "[RUFS] ufs_queue: SDB dump reason={} tag={} outstanding=0x{:x} completed=0x{:x}\n",
+            reason,
+            tag,
+            state.outstanding,
+            state.completed,
+        );
+    }
 }
 
 impl McqTransferBackend {
@@ -859,10 +908,6 @@ impl McqTransferBackend {
         self.queues.submit(&self.reg, &self.dma, tag, hw_queue)
     }
 
-    fn request_completed(&self, tag: usize) -> bool {
-        self.queues.request_completed(&self.reg, &self.dma, tag)
-    }
-
     fn dump_state(&self, tag: usize, reason: &str) {
         self.queues.dump_state(&self.reg, tag, reason);
     }
@@ -889,8 +934,8 @@ impl McqTransferBackend {
             .poll_completions_for_queue(&self.reg, &self.dma, queue)
     }
 
-    fn completion_cached(&self, tag: usize) -> bool {
-        self.queues.completion_cached(tag)
+    fn completion_ready(&self, tag: usize) -> bool {
+        self.queues.completion_ready(tag)
     }
 
     fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
@@ -943,10 +988,6 @@ impl UfsTransferOps for McqTransferBackend {
         McqTransferBackend::submit_scsi(self, cmd, tag, hw_queue)
     }
 
-    fn request_completed(&self, tag: usize) -> bool {
-        McqTransferBackend::request_completed(self, tag)
-    }
-
     fn dump_state(&self, tag: usize, reason: &str) {
         McqTransferBackend::dump_state(self, tag, reason);
     }
@@ -967,14 +1008,14 @@ impl UfsTransferOps for McqTransferBackend {
         McqTransferBackend::poll_queue(self, queue)
     }
 
-    fn completion_cached(&self, tag: usize) -> bool {
-        McqTransferBackend::completion_cached(self, tag)
+    fn completion_ready(&self, tag: usize) -> bool {
+        McqTransferBackend::completion_ready(self, tag)
     }
 }
 
 impl UfsTransferBackend {
-    fn sdb(reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Self {
-        Self::Sdb(SdbTransferBackend::new(reg, dma))
+    fn sdb(reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Result<Self> {
+        Ok(Self::Sdb(SdbTransferBackend::new(reg, dma)?))
     }
 
     fn ops(&self) -> &dyn UfsTransferOps {
@@ -1117,11 +1158,14 @@ impl UfsRequest {
     pub(crate) fn submit(&self) -> Result<()> {
         let (cmd, hw_queue) = self.cmd_and_hw_queue()?;
 
+        if let UfsCmd::Device(cmd) = cmd {
+            self.queue.prepare_dev_wait();
+        }
+
+        self.inner.lock().state = RequestState::Submitted;
+
         let result = match cmd {
-            UfsCmd::Device(cmd) => {
-                self.queue.prepare_dev_wait();
-                self.queue.submit_dev(cmd, self.tag)
-            }
+            UfsCmd::Device(cmd) => self.queue.submit_dev(cmd, self.tag),
             UfsCmd::SCSI(cmd) => self.queue.submit_scsi(cmd, self.tag, hw_queue),
         };
 
@@ -1134,13 +1178,7 @@ impl UfsRequest {
                 self.clear_keep_block_request();
                 Err(e)
             }
-            Ok(()) => {
-                self.inner.lock().state = RequestState::Submitted;
-                if self.queue.request_completed(self.tag) {
-                    self.queue.wake_completion_thread();
-                }
-                Ok(())
-            }
+            Ok(()) => Ok(()),
         }
     }
 
@@ -1377,12 +1415,12 @@ impl UfsRequest {
         }
     }
 
-    fn completion_ready_cached(&self) -> bool {
+    fn completion_ready(&self) -> bool {
         if self.inner.lock().state == RequestState::Completed {
             return true;
         }
 
-        self.queue.completion_cached(self.tag)
+        self.queue.completion_ready(self.tag)
     }
 }
 
@@ -1414,7 +1452,7 @@ impl UfsQueue {
         // The request table is sized for the allocation, while each backend
         // reports the tag range that is legal for that transport.
         let slot = kvec![None; dma.transfer_slots()]?;
-        let backend = UfsTransferBackend::sdb(reg, dma);
+        let backend = UfsTransferBackend::sdb(reg, dma)?;
         let queue_depth = backend.ops().queue_depth();
 
         let queue = Arc::pin_init(
@@ -1587,10 +1625,6 @@ impl UfsQueue {
         self.backend.lock().ops().fetch_scsi_completion(tag)
     }
 
-    fn request_completed(&self, tag: usize) -> bool {
-        self.backend.lock().ops().request_completed(tag)
-    }
-
     fn refresh_backend_completions(&self) -> Result<()> {
         self.backend.lock().ops().refresh_completions()
     }
@@ -1615,8 +1649,8 @@ impl UfsQueue {
         self.backend.lock().ops().poll_queue(queue)
     }
 
-    fn completion_cached(&self, tag: usize) -> bool {
-        self.backend.lock().ops().completion_cached(tag)
+    fn completion_ready(&self, tag: usize) -> bool {
+        self.backend.lock().ops().completion_ready(tag)
     }
 
     fn is_poll_queue(&self, queue: usize) -> bool {
@@ -1688,46 +1722,18 @@ impl UfsQueue {
         None
     }
 
-    fn complete_ready_request(&self, request: &Arc<UfsRequest>) -> (bool, bool) {
-        if request.completion_ready_cached() {
-            if request.complete() {
-                return (true, false);
-            }
-
-            return (false, true);
-        }
-
-        (false, false)
-    }
-
-    fn complete_ready_polled_request(
-        &self,
-        request: &Arc<UfsRequest>,
-        batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>,
-    ) -> (bool, bool) {
-        if request.completion_ready_cached() {
-            if request.complete_polled(batch) {
-                return (true, false);
-            }
-
-            return (false, true);
-        }
-
-        (false, false)
-    }
-
     pub(crate) fn complete(self: &Arc<Self>) -> bool {
         // Transfer completion must not run in the hard IRQ handler.
         //
-        // The Rust lock API exposed by this kernel only provides plain
-        // `SpinLock::lock()`, not an irqsave guard. Completion takes request
-        // and DMA locks that are also used from submission context, then hands
-        // the request back to blk-mq. Running that path directly from hard IRQ
-        // context could deadlock if the interrupt arrives while the same CPU
-        // already holds one of those locks. The queue IRQ is therefore
-        // registered as a threaded IRQ. Submit-side fast completion and retry
-        // paths wake that same IRQ thread instead of using a separate work
-        // item, so there is a single completion executor.
+        // Completion takes request and DMA locks that are also used from
+        // submission context, then hands the request back to blk-mq. Until that
+        // ownership path is converted to IRQ-safe locking or tag-based lookup,
+        // running it directly from hard IRQ context could deadlock if the
+        // interrupt arrives while the same CPU already holds one of those
+        // locks. The queue IRQ is therefore registered as a threaded IRQ.
+        // Submit-side fast completion and retry paths wake that same IRQ
+        // thread instead of using a separate work item, so there is a single
+        // completion executor.
         if let Err(e) = self.refresh_backend_completions() {
             pr_err!(
                 "[RUFS] ufs_queue: refresh completions failed errno={}\n",
@@ -1742,9 +1748,13 @@ impl UfsQueue {
         let mut retry = false;
         while let Some(request) = self.next_completable_request(tag) {
             let request_tag = request.tag;
-            let (request_completed, request_retry) = self.complete_ready_request(&request);
-            completed |= request_completed;
-            retry |= request_retry;
+            if request.completion_ready() {
+                if request.complete() {
+                    completed = true;
+                } else {
+                    retry = true;
+                }
+            }
             tag = request_tag + 1;
         }
 
@@ -1774,10 +1784,13 @@ impl UfsQueue {
         let mut retry = false;
         while let Some(request) = self.next_completable_request_on_queue(tag, hw_queue) {
             let request_tag = request.tag;
-            let (request_completed, request_retry) =
-                self.complete_ready_polled_request(&request, batch);
-            completed |= request_completed;
-            retry |= request_retry;
+            if request.completion_ready() {
+                if request.complete_polled(batch) {
+                    completed = true;
+                } else {
+                    retry = true;
+                }
+            }
             tag = request_tag + 1;
         }
 
