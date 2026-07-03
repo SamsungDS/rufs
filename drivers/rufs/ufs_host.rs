@@ -6,7 +6,7 @@
 
 use kernel::sync::{Arc, Mutex, SpinLock};
 use kernel::time::{delay::*, Delta};
-use kernel::{block::mq::TagSet, device::Core, new_mutex, new_spinlock, pci, prelude::*};
+use kernel::{device::Core, new_mutex, new_spinlock, pci, prelude::*};
 use pin_init::pin_init_scope;
 
 use crate::ufs_dev::*;
@@ -105,14 +105,14 @@ impl UfsHost {
 
             let irq = UfsIrq::new()?;
             let uic = UfsUic::new(reg.clone(), irq.clone())?;
-            let queue = UfsQueue::new(reg.clone(), dma.clone())?;
-            let dev = UfsDev::new(queue.clone())?;
+            let ufs_queue = UfsQueue::new(reg.clone(), dma.clone())?;
+            let dev = UfsDev::new(ufs_queue.clone())?;
             let host = try_pin_init!(Self {
                 reg,
                 dma,
                 irq,
                 uic,
-                queue,
+                queue: ufs_queue,
                 dev,
                 luns <- new_mutex!(KVec::new()),
                 state <- new_spinlock!(HostState::Reset),
@@ -172,7 +172,6 @@ impl UfsHost {
                     pr_info!("MCQ not supported, using SDB mode!\n");
                 }
 
-                host.dev.alloc_dev_request()?;
                 host.dev.verify_dev_init()?;
                 host.dev.complete_dev_init()?;
                 host.dev.device_params_init()?;
@@ -188,28 +187,6 @@ impl UfsHost {
 
     fn alloc_luns(&self) -> Result<()> {
         let num_lu = self.dev.num_lu();
-        let queue_map = self.queue.queue_map()?;
-        let nr_hw_queues = queue_map.nr_hw_queues();
-        let total_block_tags = self.queue.queue_depth().checked_sub(1).ok_or(EINVAL)?;
-        if total_block_tags == 0 || nr_hw_queues == 0 {
-            return Err(EINVAL);
-        }
-        let hw_queue_depth = total_block_tags.checked_div(nr_hw_queues).ok_or(EINVAL)?;
-        if hw_queue_depth == 0 {
-            return Err(EINVAL);
-        }
-        let num_maps = queue_map.num_maps();
-        let tagset = Arc::pin_init(
-            TagSet::<UfsLuBlockOps>::new(
-                u32::try_from(nr_hw_queues).map_err(|_| EOVERFLOW)?,
-                KBox::new(queue_map, GFP_KERNEL)?,
-                u32::try_from(hw_queue_depth).map_err(|_| EOVERFLOW)?,
-                num_maps,
-                kernel::alloc::NumaNode::NO_NODE,
-                kernel::block::mq::tag_set::Flags::default(),
-            ),
-            GFP_KERNEL,
-        )?;
         let mut luns = self.luns.lock();
         let mut lun = 0;
 
@@ -226,25 +203,24 @@ impl UfsHost {
                 desc.logical_block_shift(),
                 desc.logical_block_count(),
             )?;
-            let lu_queue_depth = match desc.lu_queue_depth() {
-                0 => total_block_tags,
-                depth => core::cmp::min(depth, total_block_tags),
+            let queue_depth = match desc.lu_queue_depth() {
+                0 => self.queue.tags.queue_depth(),
+                depth => core::cmp::min(depth as u32, self.queue.tags.queue_depth()),
             };
             let lu = UfsLu::new(
                 self.queue.clone(),
                 lun_id,
                 geometry,
-                hw_queue_depth,
-                lu_queue_depth,
+                queue_depth,
             )?;
-            lu.init_disk(tagset.clone())?;
+            lu.init_disk()?;
 
             pr_info!(
                 "[RUFS] ufs_host: allocated LU {} capacity={} logical_block_size={} queue_depth={}",
                 lun,
                 geometry.capacity_blocks(),
                 geometry.logical_block_size(),
-                lu_queue_depth,
+                queue_depth,
             );
 
             luns.push(lu, GFP_KERNEL)?;

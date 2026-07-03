@@ -73,6 +73,9 @@ register! {
     UTP_TRANSFER_REQ_LIST_RUN_STOP(u32) @ 0x60 {
         31:0 value;
     }
+    UTP_TRANSFER_REQ_LIST_COMPLETION_NOTIFICATION(u32) @ 0x64 {
+        31:0 value;
+    }
     UTP_TASK_REQ_LIST_BASE_L(u32) @ 0x70 {
         31:0 value;
     }
@@ -395,7 +398,7 @@ impl UfsReg {
     }
 
     #[inline]
-    pub(crate) fn ring_utrl_doorbell(&self, tag: usize) {
+    pub(crate) fn ring_utrl_doorbell(&self, tag: u32) {
         let access = self.bar.try_access().unwrap();
         access.write_reg(UTP_TRANSFER_REQ_DOOR_BELL::zeroed().with_value(1u32 << tag))
     }
@@ -1115,6 +1118,19 @@ impl UfsReg {
     pub(crate) fn disable_run_stop(&self) {
         self.write_utrl_runstop(0);
         self.write_utmrl_runstop(0);
+    }
+
+    pub(crate) fn utrlcnr(&self) -> u32 {
+        let access = self.bar.try_access().unwrap();
+        access
+            .read(UTP_TRANSFER_REQ_LIST_COMPLETION_NOTIFICATION)
+            .value()
+            .get()
+    }
+
+    pub(crate) fn write_utrlcnr(&self, value: u32) {
+        let access = self.bar.try_access().unwrap();
+        access.write_reg(UTP_TRANSFER_REQ_LIST_COMPLETION_NOTIFICATION::zeroed().with_value(value))
     }
 }
 

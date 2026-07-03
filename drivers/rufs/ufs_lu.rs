@@ -7,15 +7,16 @@
 use crate::ufs_dma::{MAX_PRD_ENTRIES, PRDT_DATA_BYTE_COUNT_MAX};
 use crate::ufs_queue::*;
 use kernel::bindings;
+use kernel::block::error::code::BLK_STS_IOERR;
 use kernel::block::mq::gen_disk::BoundGenDisk;
 use kernel::block::mq::LimitsBuilder;
+use kernel::block::mq::RequestQueue;
 use kernel::sync::atomic::{Acquire, Atomic, Relaxed};
-use kernel::sync::{Arc, ArcBorrow, Mutex, SpinLock};
+use kernel::sync::{Arc, Mutex, SpinLock};
 use kernel::types::{OwnableRefCounted, Owned};
 use kernel::{
-    alloc::mempool::MemPool,
     block::{
-        error::{code, BlkResult},
+        error::BlkResult,
         mq::{
             self, dma_map_iter::DmaMapMempool, gen_disk::GenDisk, IdleRequest, Operations, TagSet,
         },
@@ -141,12 +142,10 @@ impl UfsLuGeometry {
 
 #[pin_data]
 pub(crate) struct UfsLu {
-    queue: Arc<UfsQueue>,
+    pub(crate) queue: Arc<UfsQueue>,
     lun: u8,
     geometry: UfsLuGeometry,
-    hw_queue_depth: usize,
-    queue_depth: usize,
-    dma_vec_mempool: DmaMapMempool<MAX_PRD_ENTRIES>,
+    queue_depth: u32,
 
     #[pin]
     state: SpinLock<UfsLuState>,
@@ -160,26 +159,24 @@ impl UfsLu {
         queue: Arc<UfsQueue>,
         lun: u8,
         geometry: UfsLuGeometry,
-        hw_queue_depth: usize,
-        queue_depth: usize,
+        queue_depth: u32,
     ) -> Result<Arc<Self>> {
         Arc::pin_init(
             try_pin_init!(Self {
                 queue,
                 lun,
                 geometry,
-                hw_queue_depth,
                 queue_depth,
                 state <- new_spinlock!(UfsLuState::Reset),
                 disk <- new_mutex!(None),
-                dma_vec_mempool: MemPool::new(*queue_depth)?,
             }),
             GFP_KERNEL,
         )
     }
 
-    pub(crate) fn init_disk(self: &Arc<Self>, tagset: Arc<TagSet<UfsLuBlockOps>>) -> Result<()> {
+    pub(crate) fn init_disk(self: &Arc<Self>) -> Result<()> {
         let capacity_sectors = self.geometry.capacity_sectors().ok_or(EOVERFLOW)?;
+
         let limits = LimitsBuilder::<UfsLuBlockOps>::new()
             .logical_block_size(self.geometry.logical_block_size())?
             .physical_block_size(self.geometry.physical_block_size())?
@@ -191,16 +188,15 @@ impl UfsLu {
             .max_segment_size(PRDT_DATA_BYTE_COUNT_MAX)
             .build()?;
 
-        let queue_depth = u32::try_from(self.queue_depth).map_err(|_| EOVERFLOW)?;
-        let disk = GenDisk::new(
-            fmt!("ufs{}", self.lun),
-            tagset,
-            self.clone(),
+        let request_queue = RequestQueue::new(
+            self.queue.tags.clone(),
             limits,
-            (),
-            capacity_sectors,
-            queue_depth,
+            KBox::new(QueueData::Lu(self.clone()), GFP_KERNEL)?,
+            self.queue_depth,
         )?;
+
+        let disk =
+            GenDisk::new_for_queue(fmt!("ufs{}", self.lun), request_queue, capacity_sectors, ())?;
 
         let mut current = self.disk.lock();
         if current.is_some() {
@@ -259,43 +255,6 @@ impl UfsLu {
             _ => Err(ENOTSUPP),
         }
     }
-
-    fn acquire_request(&self, hw_queue: usize, tag: usize) -> Result<Arc<UfsRequest>> {
-        let tag = self.global_tag(hw_queue, tag)?;
-        self.queue.acquire(tag)
-    }
-
-    fn global_tag(&self, hw_queue: usize, tag: usize) -> Result<usize> {
-        if tag >= self.hw_queue_depth {
-            return Err(EINVAL);
-        }
-
-        hw_queue
-            .checked_mul(self.hw_queue_depth)
-            .and_then(|base| base.checked_add(tag))
-            .ok_or(EOVERFLOW)
-    }
-
-    fn timeout_request(&self, hw_queue: usize, tag: usize) -> mq::RequestTimeoutStatus {
-        let global_tag = match self.global_tag(hw_queue, tag) {
-            Ok(global_tag) => global_tag,
-            Err(e) => {
-                pr_err!(
-                    "[RUFS] ufs_lu: invalid timeout request tag={} hctx={} errno={}\n",
-                    tag,
-                    hw_queue,
-                    e.to_errno(),
-                );
-                return mq::RequestTimeoutStatus::RetryLater;
-            }
-        };
-
-        if self.queue.timeout(global_tag) {
-            mq::RequestTimeoutStatus::Completed
-        } else {
-            mq::RequestTimeoutStatus::RetryLater
-        }
-    }
 }
 
 pub(crate) struct UfsLuBlockOps;
@@ -305,19 +264,10 @@ pub(crate) struct UfsLuBlockOps;
 // The request reference is still held by the slot, so reclaim it and complete
 // it once. Because the command was not submitted, no completion can race for
 // the request.
-fn complete_unsubmitted(request: &Arc<UfsRequest>, e: Error) {
-    let Some(rq) = request.take_block_request() else {
-        return;
-    };
-
-    let rq = match OwnableRefCounted::try_from_shared(rq) {
-        Ok(rq) => rq,
-        Err(rq) => {
-            pr_err!("[RUFS] ufs_lu: failed to reclaim unsubmitted request\n");
-            request.restore_block_request(rq);
-            return;
-        }
-    };
+fn complete_unsubmitted(rq: ARef<mq::Request<UfsLuBlockOps>>, e: Error) {
+    let rq = OwnableRefCounted::try_from_shared(rq)
+        .map_err(|_e| kernel::error::code::EIO)
+        .expect("Failed to complete request");
 
     if e == EBUSY {
         rq.requeue(true);
@@ -327,40 +277,55 @@ fn complete_unsubmitted(request: &Arc<UfsRequest>, e: Error) {
 }
 
 #[pin_data]
-pub(crate) struct UfsLuBlockRequest {
+pub(crate) struct UfsRequestData {
+    #[pin]
+    pub(crate) inner: SpinLock<UfsRequestInner>,
     pub(crate) status: Atomic<u32>,
+}
+
+pub(crate) struct TagSetData {
+    pub(crate) dma_vec_mempool: DmaMapMempool<MAX_PRD_ENTRIES>,
+    pub(crate) queue_map: UfsQueueMap,
+}
+
+pub(crate) enum QueueData {
+    Dev(Arc<UfsQueue>),
+    Lu(Arc<UfsLu>),
 }
 
 #[vtable]
 impl Operations for UfsLuBlockOps {
-    type RequestData = UfsLuBlockRequest;
-    type QueueData = Arc<UfsLu>;
+    type RequestData = UfsRequestData;
+    type QueueData = KBox<QueueData>;
     type HwData = KBox<u32>;
-    type TagSetData = KBox<UfsQueueMap>;
+    type TagSetData = KBox<TagSetData>;
     type GenDiskData = ();
 
     fn new_request_data() -> impl PinInit<Self::RequestData> {
-        pin_init!(UfsLuBlockRequest {
+        pin_init!(UfsRequestData {
+            inner <- new_spinlock!(UfsRequestInner::default()),
             status: Atomic::new(u32::from(bindings::BLK_STS_OK)),
         })
     }
 
     fn queue_rq(
         _hw_data: &u32,
-        lu: ArcBorrow<'_, UfsLu>,
+        lu: &QueueData,
         rq: Owned<IdleRequest<Self>>,
         _is_last: bool,
     ) -> BlkResult {
         let command = rq.command();
         let sector = rq.sector();
         let sectors = rq.sectors();
-        let geometry = lu.geometry();
-        let mask = geometry.sectors_per_block() - 1;
-        let tag = usize::try_from(rq.tag()).map_err(|_| EINVAL)?;
-        let hw_queue = usize::try_from(rq.queue_index()).map_err(|_| EINVAL)?;
+
 
         let cmd = match command {
             mq::Command::Read | mq::Command::Write => {
+                let QueueData::Lu(lu) = lu else {
+                    return Err(BLK_STS_IOERR);
+                };
+                let geometry = lu.geometry();
+                let mask = geometry.sectors_per_block() - 1;
                 if sectors == 0 {
                     pr_debug!("[RUFS] ufs_lu: zero-length request on LU {}\n", lu.lun());
                     rq.start().end_ok();
@@ -407,10 +372,18 @@ impl Operations for UfsLuBlockOps {
                 cmd
             }
             mq::Command::Flush => {
+                let QueueData::Lu(lu) = lu else {
+                    return Err(BLK_STS_IOERR);
+                };
                 pr_debug!("[RUFS] ufs_lu: flush request on LU {}\n", lu.lun());
                 lu.build_scsi_cmd(command, 0, 0)?
             }
             mq::Command::Discard => {
+                let QueueData::Lu(lu) = lu else {
+                    return Err(BLK_STS_IOERR);
+                };
+                let geometry = lu.geometry();
+                let mask = geometry.sectors_per_block() - 1;
                 if sectors == 0 {
                     pr_debug!("[RUFS] ufs_lu: zero-length discard on LU {}\n", lu.lun());
                     rq.start().end_ok();
@@ -455,32 +428,22 @@ impl Operations for UfsLuBlockOps {
 
                 cmd
             }
+            mq::Command::DriverIn | mq::Command::DriverOut => {
+                let rq = OwnableRefCounted::into_shared(rq.start());
+                if let Err(e) = UfsRequest::compose_dev_request(&rq) {
+                    complete_unsubmitted(rq, e);
+                    return Ok(());
+                }
+                if let Err(e) = UfsRequest::submit(&rq) {
+                    complete_unsubmitted(rq, e);
+                }
+                return Ok(());
+            }
             _ => {
-                pr_warn!(
-                    "[RUFS] ufs_lu: unsupported request command={} on LU {}\n",
-                    command,
-                    lu.lun(),
-                );
+                pr_warn!("[RUFS] ufs_lu: unsupported request command={}\n", command,);
                 rq.start().end(bindings::BLK_STS_NOTSUPP as u8);
                 return Ok(());
             }
-        };
-
-        // Resolve the request slot for this tag before taking shared ownership
-        // of the block request. While the request is still an `IdleRequest` it
-        // is owned by the block layer (refcount zero), so a not-yet-recycled
-        // slot can be handed back to the block layer without leaking a
-        // reference.
-        //
-        // The completion path frees the blk-mq tag (allowing this tag to be
-        // dispatched again) just before it resets the slot to idle, so a fresh
-        // dispatch can briefly observe the slot as still busy. Signal that with
-        // `BLK_STS_DEV_RESOURCE` so the block layer retries, rather than
-        // converting the busy error into `BLK_STS_IOERR` through `?`.
-        let request = match lu.acquire_request(hw_queue, tag) {
-            Ok(request) => request,
-            Err(e) if e == EBUSY => return Err(code::BLK_STS_DEV_RESOURCE),
-            Err(e) => return Err(e.into()),
         };
 
         // From here the driver takes shared ownership of the request and is
@@ -488,38 +451,22 @@ impl Operations for UfsLuBlockOps {
         // this reference to blk-mq completion; requeue and poll fallback paths
         // reclaim unique ownership first because those APIs require it.
         let rq = OwnableRefCounted::into_shared(rq.start());
-        if let Err(e) = request.compose_block_request(&rq, cmd, hw_queue, &lu.dma_vec_mempool) {
-            pr_err!(
-                "[RUFS] ufs_lu: compose request failed tag={} errno={}\n",
-                tag,
-                e.to_errno()
-            );
-            drop(rq);
-            complete_unsubmitted(&request, e);
+
+        if let Err(e) = UfsRequest::compose_scsi_cmd(&rq, cmd) {
+            complete_unsubmitted(rq, e);
             return Ok(());
         }
 
-        // Drop the submit-side reference before making the request visible to
-        // hardware. A fast completion may run before queue_rq returns, and the
-        // blk-mq completion callback must be able to reclaim the only request
-        // reference kept by the RUFS slot.
-        drop(rq);
-
-        if let Err(e) = request.submit() {
-            pr_err!(
-                "[RUFS] ufs_lu: submit request failed tag={} errno={}\n",
-                tag,
-                e.to_errno()
-            );
-            complete_unsubmitted(&request, e);
+        if let Err(e) = UfsRequest::submit(&rq) {
+            complete_unsubmitted(rq, e);
         }
 
         Ok(())
     }
 
-    fn commit_rqs(_hw_data: &u32, _queue_data: ArcBorrow<'_, UfsLu>) {}
+    fn commit_rqs(_hw_data: &u32, _queue_data: &QueueData) {}
 
-    fn init_hctx(_tagset_data: &UfsQueueMap, hctx_idx: u32) -> Result<Self::HwData> {
+    fn init_hctx(_tagset_data: &TagSetData, hctx_idx: u32) -> Result<Self::HwData> {
         // Remember which hardware queue this context drives, so `poll` can find
         // the matching backend completion queue.
         Ok(KBox::new(hctx_idx, GFP_KERNEL)?)
@@ -543,31 +490,32 @@ impl Operations for UfsLuBlockOps {
         queue_id: u32,
         tag: u32,
     ) -> mq::RequestTimeoutStatus {
-        let Some(request) = tag_set.tag_to_rq(queue_id, tag) else {
-            pr_err!(
-                "[RUFS] ufs_lu: timeout for unknown request hctx={} tag={}\n",
-                queue_id,
-                tag,
-            );
-            return mq::RequestTimeoutStatus::RetryLater;
+        let status = if let Some(rq) = tag_set.tag_to_rq(queue_id, tag) {
+            UfsRequest::timeout(rq)
+        } else {
+            true
         };
 
-        let lu = Arc::<UfsLu>::from(request.queue_data());
-        drop(request);
-
-        lu.timeout_request(queue_id as usize, tag as usize)
+        if status {
+            mq::RequestTimeoutStatus::Completed
+        } else {
+            mq::RequestTimeoutStatus::RetryLater
+        }
     }
 
     fn poll(
         hw_data: &u32,
-        queue_data: ArcBorrow<'_, UfsLu>,
+        queue_data: &QueueData,
         batch: &mut mq::IoCompletionBatch<Self>,
     ) -> Result<bool> {
-        Ok(queue_data.queue.poll(*hw_data as usize, batch))
+        let QueueData::Lu(lu) = queue_data else {
+            return Err(EIO);
+        };
+        Ok(lu.queue.poll(*hw_data as usize, batch))
     }
 
     fn map_queues(tag_set: Pin<&mut TagSet<Self>>) {
-        let layout = *tag_set.data();
+        let layout = tag_set.data().queue_map;
         let default_queues = layout.default_queues() as u32;
         let read_queues = layout.read_queues() as u32;
         let poll_queues = layout.poll_queues() as u32;

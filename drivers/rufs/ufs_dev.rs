@@ -5,12 +5,14 @@
 #![allow(unused_variables)]
 
 use crate::ufs_dma::{DescBuffer, MAX_PRD_ENTRIES};
-use crate::ufs_lu::UfsLuBlockOps;
+use crate::ufs_lu::{QueueData, UfsLuBlockOps};
 use crate::ufs_queue::*;
 use kernel::alloc::mempool::MemPool;
 use kernel::block::error::BlkResult;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;
-use kernel::block::mq::{self, IdleRequest, LimitsBuilder, Request};
+use kernel::block::mq::{
+    self, BoundRequestQueue, IdleRequest, LimitsBuilder, Request, RequestQueue,
+};
 use kernel::error::{from_err_ptr, to_result};
 use kernel::sync::{aref::ARef, Arc, Mutex};
 use kernel::time::{delay, Delta};
@@ -68,7 +70,7 @@ impl mq::Operations for TaskManagementOps {
 // so accidental dispatch is rejected instead of silently completing.
 struct TmfQueue {
     tag_set: Arc<mq::TagSet<TaskManagementOps>>,
-    queue: mq::BoundRequestQueue<TaskManagementOps>,
+    queue: BoundRequestQueue<TaskManagementOps>,
 }
 
 // SAFETY: `TmfQueue` owns the blk-mq tag set, request queue, and request pointer
@@ -89,8 +91,12 @@ impl TmfQueue {
             GFP_KERNEL,
         )?;
 
-        let limits = LimitsBuilder::<UfsLuBlockOps>::new().build()?;
-        let queue = mq::RequestQueue::new(tag_set.clone(), limits, (), 1)?;
+        let queue = mq::RequestQueue::new(
+            tag_set.clone(),
+            LimitsBuilder::<TaskManagementOps>::new().build()?,
+            (),
+            depth as u32,
+        )?;
 
         Ok(Self { tag_set, queue })
     }
@@ -667,42 +673,38 @@ pub(crate) struct UfsDevInfo {
 
 #[pin_data]
 pub(crate) struct UfsDev {
-    queue: Arc<UfsQueue>,
+    ufs_queue: Arc<UfsQueue>,
+    pub(crate) request_queue: BoundRequestQueue<UfsLuBlockOps>,
 
     #[pin]
     pub(crate) info: Mutex<UfsDevInfo>,
 
     #[pin]
-    request: Mutex<Option<Arc<UfsRequest>>>,
-
-    #[pin]
     tmf_queue: Mutex<Option<TmfQueue>>,
-
-    dma_vec_pool: DmaMapMempool<MAX_PRD_ENTRIES>,
 }
 
 impl UfsDev {
-    pub(crate) fn new(queue: Arc<UfsQueue>) -> Result<Arc<Self>> {
-        Arc::pin_init(
+    pub(crate) fn new(ufs_queue: Arc<UfsQueue>) -> Result<Arc<Self>> {
+        let limits = LimitsBuilder::<UfsLuBlockOps>::new().build()?;
+
+        let request_queue = RequestQueue::new(
+            ufs_queue.tags.clone(),
+            limits,
+            KBox::new(QueueData::Dev(ufs_queue.clone()), GFP_KERNEL)?,
+            ufs_queue.tags.queue_depth(),
+        )?;
+
+        let this = Arc::pin_init(
             try_pin_init!(Self {
-                queue,
+                ufs_queue,
+                request_queue,
                 info <- new_mutex!(UfsDevInfo::default()),
-                request <- new_mutex!(None),
                 tmf_queue <- new_mutex!(None),
-                dma_vec_pool: MemPool::new(1)?,
             }),
             GFP_KERNEL,
-        )
-    }
+        )?;
 
-    pub(crate) fn alloc_dev_request(&self) -> Result<()> {
-        let mut request = self.request.lock();
-        if request.is_some() {
-            return Err(EBUSY);
-        }
-
-        request.replace(self.queue.reserve()?);
-        Ok(())
+        Ok(this)
     }
 
     // Allocate the placeholder TMF blk-mq objects early so the ownership and
@@ -720,16 +722,24 @@ impl UfsDev {
         Ok(())
     }
 
-    fn issue(&self, cmd: UfsCmd) -> Result<UfsCmd> {
-        let request = self.request.lock();
-        request
-            .as_ref()
-            .ok_or(EINVAL)?
-            .issue(cmd, &self.dma_vec_pool)
+    fn submit(&self, cmd: UfsCmd) -> Result<UfsCmd> {
+        let mut rq = self
+            .request_queue
+            .alloc_sync_request(mq::Command::DriverOut)?;
+        rq.data_ref().inner.lock().cmd = Some(cmd);
+        rq.as_pin_mut().execute(true)?;
+        let cmd = rq
+            .data_ref()
+            .inner
+            .lock()
+            .cmd
+            .take()
+            .expect("Expected command");
+        Ok(cmd)
     }
 
     fn nop(&self) -> Result<()> {
-        let cmd = self.issue(UfsDevCmd::nop())?;
+        let cmd = self.submit(UfsDevCmd::nop())?;
         Ok(())
     }
 
@@ -740,12 +750,12 @@ impl UfsDev {
     }
 
     fn read_desc(&self, idn: DescIdn, index: u8, selector: u8) -> Result<Desc> {
-        let cmd = self.issue(UfsDevCmd::query().read_desc(idn, index, selector))?;
+        let cmd = self.submit(UfsDevCmd::query().read_desc(idn, index, selector))?;
         Ok(cmd.get_device()?.get_query()?.get_read_desc()?.desc)
     }
 
     fn read_attr(&self, idn: AttrIdn, index: u8, selector: u8) -> Result<u64> {
-        let cmd = self.issue(UfsDevCmd::query().read_attr(idn, index, selector))?;
+        let cmd = self.submit(UfsDevCmd::query().read_attr(idn, index, selector))?;
         Ok(cmd.get_device()?.get_query()?.get_attr_value()?)
     }
 
@@ -758,7 +768,7 @@ impl UfsDev {
     }
 
     fn write_attr(&self, idn: AttrIdn, index: u8, selector: u8, value: u64) -> Result<()> {
-        let cmd = self.issue(UfsDevCmd::query().write_attr(idn, index, selector, value))?;
+        let cmd = self.submit(UfsDevCmd::query().write_attr(idn, index, selector, value))?;
         if cmd.get_device()?.get_query()?.get_attr_value()? == value {
             Ok(())
         } else {
@@ -767,22 +777,22 @@ impl UfsDev {
     }
 
     fn read_flag(&self, idn: FlagIdn, index: u8, selector: u8) -> Result<u8> {
-        let cmd = self.issue(UfsDevCmd::query().read_flag(idn, index, selector))?;
+        let cmd = self.submit(UfsDevCmd::query().read_flag(idn, index, selector))?;
         Ok(cmd.get_device()?.get_query()?.get_flag_value()?)
     }
 
     fn set_flag(&self, idn: FlagIdn, index: u8, selector: u8) -> Result<()> {
-        self.issue(UfsDevCmd::query().set_flag(idn, index, selector))?;
+        self.submit(UfsDevCmd::query().set_flag(idn, index, selector))?;
         Ok(())
     }
 
     fn clear_flag(&self, idn: FlagIdn, index: u8, selector: u8) -> Result<()> {
-        self.issue(UfsDevCmd::query().clear_flag(idn, index, selector))?;
+        self.submit(UfsDevCmd::query().clear_flag(idn, index, selector))?;
         Ok(())
     }
 
     fn toggle_flag(&self, idn: FlagIdn, index: u8, selector: u8) -> Result<u8> {
-        let cmd = self.issue(UfsDevCmd::query().toggle_flag(idn, index, selector))?;
+        let cmd = self.submit(UfsDevCmd::query().toggle_flag(idn, index, selector))?;
         Ok(cmd.get_device()?.get_query()?.get_flag_value()?)
     }
 

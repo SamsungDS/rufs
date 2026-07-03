@@ -1680,9 +1680,10 @@ impl UfsDma {
         Ok(())
     }
 
-    pub(crate) fn compose_devman_upiu(&self, cmd: UfsDevCmd, tag: usize) -> Result<()> {
+    pub(crate) fn compose_devman_upiu(&self, cmd: UfsDevCmd, tag: u32) -> Result<()> {
         let inner = self.inner.lock();
 
+        let tag: usize = tag as _;
         io_project!(inner.ucdl, [try: tag].cmd_upiu).copy_write(Upiu::device(cmd, tag));
         io_project!(inner.ucdl, [try: tag].rsp_upiu).copy_write(Upiu::default());
 
@@ -1693,13 +1694,13 @@ impl UfsDma {
 
     pub(crate) fn compose_scsi_upiu(
         &self,
-        cmd: UfsSCSICmd,
-        tag: usize,
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        cmd: UfsSCSICmd,
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>> {
-        let prdt = self.map_request_prdt(tag, cmd, rq, mempool)?;
+        let prdt = self.map_request_prdt(cmd, rq, mempool)?;
         let inner = self.inner.lock();
+        let tag: usize = rq.tag().try_into().unwrap();
 
         io_project!(inner.ucdl, [try: tag].cmd_upiu).copy_write(Upiu::command(cmd, tag));
         io_project!(inner.ucdl, [try: tag].rsp_upiu).copy_write(Upiu::default());
@@ -1748,7 +1749,6 @@ impl UfsDma {
 
     fn map_request_prdt(
         &self,
-        tag: usize,
         cmd: UfsSCSICmd,
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
@@ -1759,10 +1759,6 @@ impl UfsDma {
                 mapping: None,
                 entries,
             });
-        }
-
-        if tag >= self.transfer_slots {
-            return Err(EINVAL);
         }
 
         if cmd.is_unmap() {
