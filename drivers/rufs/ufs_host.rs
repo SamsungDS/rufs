@@ -175,7 +175,7 @@ impl UfsHost {
                 host.dev.verify_dev_init()?;
                 host.dev.complete_dev_init()?;
                 host.dev.device_params_init()?;
-                host.uic.configure_max_power_mode()?;
+                //host.uic.configure_max_power_mode()?;
                 host.alloc_luns()?;
                 host.dev.alloc_tmf_queue(host.reg.nutmrs())?;
                 Ok(())
