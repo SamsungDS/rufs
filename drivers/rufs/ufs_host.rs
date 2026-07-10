@@ -175,7 +175,12 @@ impl UfsHost {
                 host.dev.verify_dev_init()?;
                 host.dev.complete_dev_init()?;
                 host.dev.device_params_init()?;
-                //host.uic.configure_max_power_mode()?;
+                if let Err(e) = host.uic.configure_max_power_mode() {
+                    pr_warn!(
+                        "[RUFS] ufs_host: power mode configuration failed errno={}, continue with current mode\n",
+                        e.to_errno(),
+                    );
+                }
                 host.alloc_luns()?;
                 host.dev.alloc_tmf_queue(host.reg.nutmrs())?;
                 Ok(())
