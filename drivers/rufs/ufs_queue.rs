@@ -1100,6 +1100,12 @@ impl UfsRequest {
     }
 
     pub(crate) fn timeout(rq: ARef<mq::Request<UfsLuBlockOps>>) -> bool {
+        let queue = match rq.queue_data() {
+            QueueData::Dev(queue) => queue.clone(),
+            QueueData::Lu(lu) => lu.queue.clone(),
+        };
+        queue.dump_backend_state(rq.tag() as usize, "request timeout");
+
         let (cmd, prdt, hw_queue) = {
             let mut inner = rq.data_ref().inner.lock();
             let cmd = inner.cmd;
