@@ -1060,18 +1060,33 @@ impl UfsRequest {
         Ok(())
     }
 
-    pub(crate) fn submit(rq: &ARef<mq::Request<UfsLuBlockOps>>) -> Result<()> {
+    pub(crate) fn submit(
+        rq: ARef<mq::Request<UfsLuBlockOps>>,
+    ) -> core::result::Result<(), (ARef<mq::Request<UfsLuBlockOps>>, Error)> {
         let queue = match rq.queue_data() {
-            QueueData::Dev(ufs_queue) => ufs_queue,
-            QueueData::Lu(ufs_lu) => &ufs_lu.queue,
+            QueueData::Dev(ufs_queue) => ufs_queue.clone(),
+            QueueData::Lu(ufs_lu) => ufs_lu.queue.clone(),
         };
+        let queue_id = rq.queue_index();
+        let tag = rq.tag();
 
-        let result = queue.submit(rq.tag());
+        // Do not keep a submit-side request reference while making the command
+        // visible to hardware. A fast completion may run before `queue_rq()`
+        // returns and must be able to recover unique request ownership after
+        // dropping the DMA mapping's request reference.
+        drop(rq);
 
-        match result {
+        match queue.submit(tag) {
             Err(e) => {
+                // A failed submission did not make the request visible to
+                // hardware, so it is still owned by the driver and can be
+                // recovered from its hctx and tag.
+                let rq = queue
+                    .tags
+                    .tag_to_rq(queue_id, tag)
+                    .expect("rufs: submitted request disappeared");
                 rq.data_ref().inner.lock().clear();
-                Err(e)
+                Err((rq, e))
             }
             Ok(()) => Ok(()),
         }

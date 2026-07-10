@@ -434,7 +434,7 @@ impl Operations for UfsLuBlockOps {
                     complete_unsubmitted(rq, e);
                     return Ok(());
                 }
-                if let Err(e) = UfsRequest::submit(&rq) {
+                if let Err((rq, e)) = UfsRequest::submit(rq) {
                     complete_unsubmitted(rq, e);
                 }
                 return Ok(());
@@ -457,7 +457,7 @@ impl Operations for UfsLuBlockOps {
             return Ok(());
         }
 
-        if let Err(e) = UfsRequest::submit(&rq) {
+        if let Err((rq, e)) = UfsRequest::submit(rq) {
             complete_unsubmitted(rq, e);
         }
 
