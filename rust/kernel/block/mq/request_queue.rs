@@ -225,11 +225,15 @@ impl<T: Operations> LimitsBuilder<T> {
     pub fn build(self) -> Result<Limits> {
         let mut lim: bindings::queue_limits = pin_init::zeroed();
 
+        lim.logical_block_size = self.logical_block_size;
         lim.physical_block_size = self.physical_block_size;
         lim.max_hw_discard_sectors = self.max_hw_discard_sectors;
         lim.discard_granularity = self.discard_granularity;
         lim.max_discard_segments = self.max_discard_segments;
+        lim.max_hw_sectors = self.max_hw_sectors;
         lim.max_sectors = self.max_sectors;
+        lim.max_segments = self.max_segments;
+        lim.max_segment_size = self.max_segment_size;
         lim.virt_boundary_mask = self.virt_boundary_mask;
         if self.rotational {
             lim.features = Feature::Rotational.into();
