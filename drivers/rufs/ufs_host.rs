@@ -249,6 +249,11 @@ impl UfsHost {
     }
 
     fn hba_stop(&self) {
+        if !self.reg.ctrl_enabled() {
+            self.fallback_to_reset();
+            return;
+        }
+
         self.reg.disable_interrupts();
         self.reg.clear_all_interrupts();
         self.reg.disable_run_stop();
