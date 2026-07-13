@@ -261,10 +261,10 @@ pub(crate) struct UfsLuBlockOps;
 
 // Hand a request that never reached the device back to the block layer.
 //
-// The request reference is still held by the slot, so reclaim it and complete
-// it once. Because the command was not submitted, no completion can race for
-// the request.
+// Because the command was not submitted, no hardware completion can race with
+// returning the request to blk-mq.
 fn complete_unsubmitted(rq: ARef<mq::Request<UfsLuBlockOps>>, e: Error) {
+    rq.data_ref().inner.lock().clear();
     let rq = OwnableRefCounted::try_from_shared(rq)
         .map_err(|_e| kernel::error::code::EIO)
         .expect("Failed to complete request");
@@ -317,7 +317,6 @@ impl Operations for UfsLuBlockOps {
         let command = rq.command();
         let sector = rq.sector();
         let sectors = rq.sectors();
-
 
         let cmd = match command {
             mq::Command::Read | mq::Command::Write => {
@@ -430,11 +429,11 @@ impl Operations for UfsLuBlockOps {
             }
             mq::Command::DriverIn | mq::Command::DriverOut => {
                 let rq = OwnableRefCounted::into_shared(rq.start());
-                if let Err(e) = UfsRequest::compose_dev_request(&rq) {
+                if let Err(e) = UfsRequestData::compose_dev_request(&rq) {
                     complete_unsubmitted(rq, e);
                     return Ok(());
                 }
-                if let Err((rq, e)) = UfsRequest::submit(rq) {
+                if let Err((rq, e)) = UfsRequestData::submit(rq) {
                     complete_unsubmitted(rq, e);
                 }
                 return Ok(());
@@ -452,12 +451,12 @@ impl Operations for UfsLuBlockOps {
         // reclaim unique ownership first because those APIs require it.
         let rq = OwnableRefCounted::into_shared(rq.start());
 
-        if let Err(e) = UfsRequest::compose_scsi_cmd(&rq, cmd) {
+        if let Err(e) = UfsRequestData::compose_scsi_cmd(&rq, cmd) {
             complete_unsubmitted(rq, e);
             return Ok(());
         }
 
-        if let Err((rq, e)) = UfsRequest::submit(rq) {
+        if let Err((rq, e)) = UfsRequestData::submit(rq) {
             complete_unsubmitted(rq, e);
         }
 
@@ -491,7 +490,7 @@ impl Operations for UfsLuBlockOps {
         tag: u32,
     ) -> mq::RequestTimeoutStatus {
         let status = if let Some(rq) = tag_set.tag_to_rq(queue_id, tag) {
-            UfsRequest::timeout(rq)
+            UfsRequestData::timeout(rq)
         } else {
             true
         };

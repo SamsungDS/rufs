@@ -137,12 +137,10 @@ impl pci::Driver for UfsPci {
                 pdev.revision_id(),
             );
 
-
             pdev.enable_device_mem()?;
             pdev.set_master();
 
             let host = UfsHost::new(pdev);
-            //host.bring_up_controller()?;
 
             pr_info!("rufs: probe done");
 

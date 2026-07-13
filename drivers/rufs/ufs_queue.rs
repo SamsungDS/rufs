@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
 
-#![allow(dead_code)]
-#![allow(unused_variables)]
-
 use crate::ufs_dev::*;
 use crate::ufs_dma::*;
-use crate::ufs_lu::QueueData;
-use crate::ufs_lu::TagSetData;
-use crate::ufs_lu::UfsLuBlockOps;
+use crate::ufs_lu::{QueueData, TagSetData, UfsLuBlockOps, UfsRequestData};
 use crate::ufs_reg::*;
 use kernel::alloc::mempool::MemPool;
 use kernel::block::mq;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;
 use kernel::block::mq::TagSet;
 use kernel::cpu;
-use kernel::sync::atomic::{Atomic, Relaxed, Release};
-use kernel::sync::{aref::ARef, barrier, Arc, Completion, SpinLock, SpinLockIrq};
+use kernel::sync::atomic::Release;
+use kernel::sync::{aref::ARef, barrier, Arc, SpinLock, SpinLockIrq};
 use kernel::types::OwnableRefCounted;
 use kernel::types::Owned;
 use kernel::{bindings, kvec, new_spinlock, new_spinlock_irq, prelude::*};
@@ -45,17 +40,6 @@ struct McqQueueLayout {
 }
 
 impl McqQueueLayout {
-    fn sdb() -> Self {
-        Self {
-            max_queues: 1,
-            total_queues: 1,
-            default_queues: 1,
-            read_queues: 0,
-            interrupt_queues: 1,
-            poll_queues: 0,
-        }
-    }
-
     fn queue_map(&self) -> Result<UfsQueueMap> {
         UfsQueueMap::new(
             self.total_queues,
@@ -79,6 +63,15 @@ pub(crate) struct UfsQueueMap {
 }
 
 impl UfsQueueMap {
+    fn sdb() -> Self {
+        Self {
+            nr_hw_queues: 1,
+            default_queues: 1,
+            read_queues: 0,
+            poll_queues: 0,
+        }
+    }
+
     fn new(
         nr_hw_queues: usize,
         default_queues: usize,
@@ -132,7 +125,7 @@ impl UfsQueueMap {
 
 fn ufs_mcq_queue_layout(reg: &UfsReg) -> Result<McqQueueLayout> {
     if !reg.mcq_supported() {
-        return Ok(McqQueueLayout::sdb());
+        return Err(ENOTSUPP);
     }
 
     let hba_maxq = reg.mcq_max_queues();
@@ -176,6 +169,10 @@ fn ufs_mcq_queue_layout(reg: &UfsReg) -> Result<McqQueueLayout> {
 }
 
 pub(crate) fn ufs_mcq_interrupt_queue_count(reg: &UfsReg) -> Result<usize> {
+    if !reg.mcq_supported() {
+        return Ok(1);
+    }
+
     Ok(ufs_mcq_queue_layout(reg)?.interrupt_queues)
 }
 
@@ -805,8 +802,7 @@ impl UfsTransferOps for SdbTransferBackend {
     }
 
     fn queue_map(&self) -> Result<UfsQueueMap> {
-        // TODO: Why is this McqQueueLayout? This operation is not related to MCQ.
-        McqQueueLayout::sdb().queue_map()
+        Ok(UfsQueueMap::sdb())
     }
 
     fn compose_dev(&self, cmd: UfsDevCmd, tag: u32) -> Result<()> {
@@ -1015,17 +1011,7 @@ impl UfsTransferBackend {
     }
 }
 
-#[pin_data]
-pub(crate) struct UfsRequest {
-    // TODO: We should be able to remove these two fields
-    queue: Arc<UfsQueue>,
-    tag: usize,
-
-    #[pin]
-    pub(crate) inner: SpinLock<UfsRequestInner>,
-}
-
-impl UfsRequest {
+impl UfsRequestData {
     pub(crate) fn compose_dev_request(rq: &ARef<mq::Request<UfsLuBlockOps>>) -> Result<()> {
         if let QueueData::Dev(queue) = rq.queue_data() {
             let Some(UfsCmd::Device(cmd)) = rq.data_ref().inner.lock().cmd else {
@@ -1092,7 +1078,7 @@ impl UfsRequest {
         }
     }
 
-    pub(crate) fn clear(rq: &ARef<mq::Request<UfsLuBlockOps>>) {
+    fn clear(rq: &ARef<mq::Request<UfsLuBlockOps>>) {
         let mut inner = rq.data_ref().inner.lock();
         inner.prdt = None;
         inner.hw_queue = None;
@@ -1126,8 +1112,6 @@ impl UfsRequest {
         } else {
             pr_err!("[RUFS] ufs_queue: request timeout tag={}\n", rq.tag());
         }
-        //rq.queue_data().queue.dump_backend_state(self.tag, "request timeout");
-
         // This is only a minimum timeout return path. It does not clean the MCQ
         // SQ or prevent a late CQE for the same tag; full error handling will
         // need to quiesce/recover hardware before reusing timed-out tags.
@@ -1155,7 +1139,7 @@ impl UfsRequest {
         rq: ARef<mq::Request<UfsLuBlockOps>>,
         batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>,
     ) -> bool {
-        UfsRequest::complete_with(rq, CompletionTarget::Poll(batch))
+        Self::complete_with(rq, CompletionTarget::Poll(batch))
     }
 
     fn complete_with(rq: ARef<mq::Request<UfsLuBlockOps>>, target: CompletionTarget<'_>) -> bool {
@@ -1175,7 +1159,7 @@ impl UfsRequest {
                     .fetch_dev(cmd, rq.tag() as usize)
                     .expect("Expected dev cmd");
                 rq.data_ref().inner.lock().cmd = Some(cmd);
-                let rq = Owned::try_from(rq)
+                Owned::try_from(rq)
                     .expect("Expected exclusive access")
                     .end_ok();
                 true
@@ -1186,10 +1170,9 @@ impl UfsRequest {
                 };
                 let queue = &lu.queue;
                 let result = queue.fetch_scsi_completion(rq.tag() as usize);
-                drop(rq.data_ref().inner.lock().prdt.take());
+                Self::clear(&rq);
 
                 queue.clone().complete_scsi(cmd, result, rq, target);
-                // TODO: missing a clear() call here
                 true
             }
         }
@@ -1198,16 +1181,10 @@ impl UfsRequest {
 
 #[pin_data]
 pub(crate) struct UfsQueue {
-    reg: Arc<UfsReg>,
     pub(crate) tags: Arc<TagSet<UfsLuBlockOps>>,
 
     #[pin]
     backend: SpinLock<UfsTransferBackend>,
-
-    cached_queue_depth: Atomic<usize>,
-
-    #[pin]
-    completion: Completion,
 }
 
 impl UfsQueue {
@@ -1219,9 +1196,7 @@ impl UfsQueue {
             );
         }
 
-        // The request table is sized for the allocation, while each backend
-        // reports the tag range that is legal for that transport.
-        let backend = UfsTransferBackend::sdb(reg.clone(), dma)?;
+        let backend = UfsTransferBackend::sdb(reg, dma)?;
         let max_concurrent_requests = backend.ops().queue_depth();
         let queue_map = backend.ops().queue_map()?;
         let nr_hw_queues = queue_map.nr_hw_queues();
@@ -1254,11 +1229,8 @@ impl UfsQueue {
 
         let queue = Arc::pin_init(
             try_pin_init!(Self {
-                reg,
                 tags <- tagset,
                 backend <- new_spinlock!(backend),
-                cached_queue_depth: Atomic::new(max_concurrent_requests),
-                completion <- Completion::new(),
             }),
             GFP_KERNEL,
         )?;
@@ -1279,7 +1251,6 @@ impl UfsQueue {
         let queue_depth = backend.queue_depth();
         let allocated_queues = backend.allocated_queues();
         *self.backend.lock() = UfsTransferBackend::Mcq(backend);
-        self.cached_queue_depth.store(queue_depth, Relaxed);
         pr_info!(
             "[RUFS] ufs_queue: MCQ backend enabled queues={}/{} interrupt={} poll={} allocated={} depth={}\n",
             layout.total_queues,
@@ -1290,14 +1261,6 @@ impl UfsQueue {
             queue_depth,
         );
         Ok(())
-    }
-
-    pub(crate) fn queue_map(&self) -> Result<UfsQueueMap> {
-        self.backend.lock().ops().queue_map()
-    }
-
-    pub(crate) fn queue_depth(&self) -> usize {
-        self.cached_queue_depth.load(Relaxed)
     }
 
     // Issuing
@@ -1322,10 +1285,6 @@ impl UfsQueue {
         self.backend.lock().ops().submit(tag)
     }
 
-    fn prepare_dev_wait(&self) {
-        self.completion.reinit();
-    }
-
     fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
         self.backend.lock().ops().fetch_dev(cmd, tag)
     }
@@ -1342,11 +1301,6 @@ impl UfsQueue {
         self.backend.lock().ops().dump_state(tag, reason);
     }
 
-    pub(crate) fn timeout(&self, tag: usize) -> bool {
-        let rq = self.tags.tag_to_rq(0, tag as u32).expect("Expected to find tag");
-        UfsRequest::timeout(rq)
-    }
-
     fn poll_backend_queue(&self, queue: usize, completed_tags: &mut CompletedTags) -> Result<()> {
         self.backend.lock().ops().poll_queue(queue, completed_tags)
     }
@@ -1356,7 +1310,7 @@ impl UfsQueue {
     }
 
     fn complete_tag(&self, tag: u32) -> bool {
-        UfsRequest::complete(self.request_at_tag(tag))
+        UfsRequestData::complete(self.request_at_tag(tag))
     }
 
     fn complete_polled_tag(
@@ -1364,7 +1318,7 @@ impl UfsQueue {
         tag: u32,
         batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>,
     ) -> bool {
-        UfsRequest::complete_polled(self.request_at_tag(tag), batch)
+        UfsRequestData::complete_polled(self.request_at_tag(tag), batch)
     }
 
     pub(crate) fn complete(self: &Arc<Self>) -> bool {
@@ -1372,8 +1326,8 @@ impl UfsQueue {
         // the queue finalizes exactly those requests. Finalization still runs
         // from the threaded IRQ path because it takes request, backend, and DMA
         // locks that are shared with submission and hands requests back to
-        // blk-mq. Once those lock domains are IRQ-safe or removed by tag-based
-        // request lookup, this tag-driven path can move into hard IRQ context.
+        // blk-mq. Once those lock domains are IRQ-safe, this path can move into
+        // hard IRQ context.
         let mut completed_tags = CompletedTags::new();
         if let Err(e) = self.collect_backend_completions(&mut completed_tags) {
             pr_err!(
@@ -1413,10 +1367,6 @@ impl UfsQueue {
         }
 
         completed
-    }
-
-    fn complete_dev(&self, cmd: UfsDevCmd, tag: usize) {
-        self.completion.complete();
     }
 
     fn complete_scsi(
