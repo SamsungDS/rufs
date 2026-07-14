@@ -1342,14 +1342,27 @@ struct UfsDmaInner {
 }
 
 pub(crate) struct UfsMcqQueue {
+    descriptor: UfsMcqQueueDescriptor,
+    submission: UfsMcqSubmissionQueue,
+    completion: UfsMcqCompletionQueue,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct UfsMcqQueueDescriptor {
     id: u32,
     max_entries: u32,
+    oprs: UfsMcqOprSet,
+}
+
+pub(crate) struct UfsMcqSubmissionQueue {
     sqe: dma::Coherent<[SqEntry]>,
-    cqe: dma::Coherent<[CqEntry]>,
     sq_tail_slot: u32,
+}
+
+pub(crate) struct UfsMcqCompletionQueue {
+    cqe: dma::Coherent<[CqEntry]>,
     cq_tail_slot: u32,
     cq_head_slot: u32,
-    oprs: UfsMcqOprSet,
 }
 
 impl UfsMcqQueue {
@@ -1365,17 +1378,35 @@ impl UfsMcqQueue {
 
         let entries = max_entries as usize;
         Ok(Self {
-            id,
-            max_entries,
-            sqe: dma::Coherent::<SqEntry>::zeroed_slice(dev, entries, GFP_KERNEL)?,
-            cqe: dma::Coherent::<CqEntry>::zeroed_slice(dev, entries, GFP_KERNEL)?,
-            sq_tail_slot: 0,
-            cq_tail_slot: 0,
-            cq_head_slot: 0,
-            oprs,
+            descriptor: UfsMcqQueueDescriptor {
+                id,
+                max_entries,
+                oprs,
+            },
+            submission: UfsMcqSubmissionQueue {
+                sqe: dma::Coherent::<SqEntry>::zeroed_slice(dev, entries, GFP_KERNEL)?,
+                sq_tail_slot: 0,
+            },
+            completion: UfsMcqCompletionQueue {
+                cqe: dma::Coherent::<CqEntry>::zeroed_slice(dev, entries, GFP_KERNEL)?,
+                cq_tail_slot: 0,
+                cq_head_slot: 0,
+            },
         })
     }
 
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        UfsMcqQueueDescriptor,
+        UfsMcqSubmissionQueue,
+        UfsMcqCompletionQueue,
+    ) {
+        (self.descriptor, self.submission, self.completion)
+    }
+}
+
+impl UfsMcqQueueDescriptor {
     pub(crate) fn id(&self) -> u32 {
         self.id
     }
@@ -1384,21 +1415,36 @@ impl UfsMcqQueue {
         self.max_entries
     }
 
-    pub(crate) fn sqe_dma_addr(&self) -> dma::DmaAddress {
-        self.sqe.dma_handle()
+    pub(crate) fn oprs(&self) -> &UfsMcqOprSet {
+        &self.oprs
     }
 
-    pub(crate) fn cqe_dma_addr(&self) -> dma::DmaAddress {
-        self.cqe.dma_handle()
+    fn offset_to_slot(&self, offset: u32, entry_size: u32) -> Result<u32> {
+        if offset % entry_size != 0 {
+            return Err(EINVAL);
+        }
+
+        let slot = offset / entry_size;
+        if slot >= self.max_entries {
+            return Err(EINVAL);
+        }
+
+        Ok(slot)
+    }
+}
+
+impl UfsMcqSubmissionQueue {
+    pub(crate) fn dma_addr(&self) -> dma::DmaAddress {
+        self.sqe.dma_handle()
     }
 
     pub(crate) fn sq_tail_slot(&self) -> u32 {
         self.sq_tail_slot
     }
 
-    pub(crate) fn sq_tail_index(&self) -> Result<usize> {
+    fn sq_tail_index(&self, descriptor: &UfsMcqQueueDescriptor) -> Result<usize> {
         let index = self.sq_tail_slot as usize;
-        if index >= self.max_entries as usize {
+        if index >= descriptor.max_entries as usize {
             return Err(EINVAL);
         }
 
@@ -1409,102 +1455,98 @@ impl UfsMcqQueue {
         slot * core::mem::size_of::<SqEntry>() as u32
     }
 
-    fn cq_slot_offset(slot: u32) -> u32 {
-        slot * core::mem::size_of::<CqEntry>() as u32
-    }
-
-    fn offset_to_slot(offset: u32, entry_size: u32, max_entries: u32) -> Result<u32> {
-        if offset % entry_size != 0 {
-            return Err(EINVAL);
-        }
-
-        let slot = offset / entry_size;
-        if slot >= max_entries {
-            return Err(EINVAL);
-        }
-
-        Ok(slot)
-    }
-
-    fn sq_offset_to_slot(&self, offset: u32) -> Result<u32> {
-        Self::offset_to_slot(
-            offset,
-            core::mem::size_of::<SqEntry>() as u32,
-            self.max_entries,
-        )
-    }
-
-    fn cq_offset_to_slot(&self, offset: u32) -> Result<u32> {
-        Self::offset_to_slot(
-            offset,
-            core::mem::size_of::<CqEntry>() as u32,
-            self.max_entries,
-        )
-    }
-
-    fn next_sq_tail_slot(&self) -> u32 {
+    fn next_sq_tail_slot(&self, descriptor: &UfsMcqQueueDescriptor) -> u32 {
         let next = self.sq_tail_slot + 1;
-        if next == self.max_entries {
+        if next == descriptor.max_entries {
             0
         } else {
             next
         }
     }
 
-    pub(crate) fn sq_is_full(&self, reg: &UfsReg) -> Result<bool> {
-        let head = self.sq_offset_to_slot(reg.read_mcq_sq_head(&self.oprs, self.id as usize)?)?;
-        Ok(self.next_sq_tail_slot() == head)
+    pub(crate) fn is_full(
+        &self,
+        reg: &UfsReg,
+        descriptor: &UfsMcqQueueDescriptor,
+    ) -> Result<bool> {
+        let head = descriptor.offset_to_slot(
+            reg.read_mcq_sq_head(descriptor.oprs(), descriptor.id() as usize)?,
+            core::mem::size_of::<SqEntry>() as u32,
+        )?;
+        Ok(self.next_sq_tail_slot(descriptor) == head)
     }
 
-    pub(crate) fn cq_tail_slot(&self) -> u32 {
+    pub(crate) fn reset(&mut self) {
+        self.sq_tail_slot = 0;
+    }
+
+    pub(crate) fn write_entry(
+        &mut self,
+        descriptor: &UfsMcqQueueDescriptor,
+        entry: SqEntry,
+    ) -> Result<u32> {
+        let index = self.sq_tail_index(descriptor)?;
+        io_project!(self.sqe, [try: index]).copy_write(entry);
+
+        self.sq_tail_slot = self.next_sq_tail_slot(descriptor);
+
+        Ok(Self::sq_slot_offset(self.sq_tail_slot))
+    }
+}
+
+impl UfsMcqCompletionQueue {
+    pub(crate) fn dma_addr(&self) -> dma::DmaAddress {
+        self.cqe.dma_handle()
+    }
+
+    pub(crate) fn tail_slot(&self) -> u32 {
         self.cq_tail_slot
     }
 
-    pub(crate) fn cq_head_slot(&self) -> u32 {
+    pub(crate) fn head_slot(&self) -> u32 {
         self.cq_head_slot
     }
 
-    pub(crate) fn update_cq_tail_slot(&mut self, reg: &UfsReg) -> Result<()> {
-        self.cq_tail_slot =
-            self.cq_offset_to_slot(reg.read_mcq_cq_tail(&self.oprs, self.id as usize)?)?;
+    pub(crate) fn update_tail(
+        &mut self,
+        reg: &UfsReg,
+        descriptor: &UfsMcqQueueDescriptor,
+    ) -> Result<()> {
+        self.cq_tail_slot = descriptor.offset_to_slot(
+            reg.read_mcq_cq_tail(descriptor.oprs(), descriptor.id() as usize)?,
+            core::mem::size_of::<CqEntry>() as u32,
+        )?;
         Ok(())
     }
 
-    pub(crate) fn cq_is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.cq_head_slot == self.cq_tail_slot
     }
 
-    pub(crate) fn acknowledge_cq_events(&self, reg: &UfsReg) -> Result<()> {
-        let status = reg.read_mcq_cqis(&self.oprs, self.id as usize)?;
+    pub(crate) fn acknowledge_events(
+        &self,
+        reg: &UfsReg,
+        descriptor: &UfsMcqQueueDescriptor,
+    ) -> Result<()> {
+        let status = reg.read_mcq_cqis(descriptor.oprs(), descriptor.id() as usize)?;
         if status != 0 {
-            reg.write_mcq_cqis(&self.oprs, self.id as usize, status)?;
+            reg.write_mcq_cqis(descriptor.oprs(), descriptor.id() as usize, status)?;
         }
 
         Ok(())
     }
 
-    pub(crate) fn oprs(&self) -> &UfsMcqOprSet {
-        &self.oprs
-    }
-
-    pub(crate) fn reset_slots(&mut self) {
-        self.sq_tail_slot = 0;
+    pub(crate) fn reset(&mut self) {
         self.cq_tail_slot = 0;
         self.cq_head_slot = 0;
     }
 
-    pub(crate) fn write_sq_entry(&mut self, entry: SqEntry) -> Result<u32> {
-        let index = self.sq_tail_index()?;
-        io_project!(self.sqe, [try: index]).copy_write(entry);
-
-        self.sq_tail_slot = self.next_sq_tail_slot();
-
-        Ok(Self::sq_slot_offset(self.sq_tail_slot))
-    }
-
-    pub(crate) fn consume_cq_entry(&mut self) -> Result<Option<CqEntry>> {
+    pub(crate) fn consume_entry(
+        &mut self,
+        descriptor: &UfsMcqQueueDescriptor,
+    ) -> Result<Option<CqEntry>> {
         let index = self.cq_head_slot as usize;
-        if index >= self.max_entries as usize {
+        if index >= descriptor.max_entries as usize {
             return Err(EINVAL);
         }
 
@@ -1512,7 +1554,7 @@ impl UfsMcqQueue {
         io_project!(self.cqe, [try: index]).copy_write(CqEntry::default());
 
         self.cq_head_slot += 1;
-        if self.cq_head_slot == self.max_entries {
+        if self.cq_head_slot == descriptor.max_entries {
             self.cq_head_slot = 0;
         }
 
@@ -1523,11 +1565,15 @@ impl UfsMcqQueue {
         }
     }
 
-    pub(crate) fn commit_cq_head(&self, reg: &UfsReg) -> Result<()> {
+    pub(crate) fn commit_head(
+        &self,
+        reg: &UfsReg,
+        descriptor: &UfsMcqQueueDescriptor,
+    ) -> Result<()> {
         reg.write_mcq_cq_head(
-            &self.oprs,
-            self.id as usize,
-            Self::cq_slot_offset(self.cq_head_slot),
+            descriptor.oprs(),
+            descriptor.id() as usize,
+            self.cq_head_slot * core::mem::size_of::<CqEntry>() as u32,
         )
     }
 }

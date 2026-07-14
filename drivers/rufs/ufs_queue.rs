@@ -512,15 +512,21 @@ impl CompletedRequests {
 
 #[pin_data]
 struct McqHardwareQueue {
+    descriptor: UfsMcqQueueDescriptor,
     #[pin]
-    state: SpinLock<UfsMcqQueue>,
+    submission: SpinLock<UfsMcqSubmissionQueue>,
+    #[pin]
+    completion: SpinLock<UfsMcqCompletionQueue>,
 }
 
 impl McqHardwareQueue {
     fn new(queue: UfsMcqQueue) -> Result<Arc<Self>> {
+        let (descriptor, submission, completion) = queue.into_parts();
         Arc::pin_init(
             pin_init!(Self {
-                state <- new_spinlock!(queue),
+                descriptor,
+                submission <- new_spinlock!(submission),
+                completion <- new_spinlock!(completion),
             }),
             GFP_KERNEL,
         )
@@ -549,19 +555,19 @@ impl McqQueueSet {
         tag: u32,
     ) -> Result<()> {
         let queue = self.queues.get(queue_id).ok_or(EINVAL)?;
-        let mut queue = queue.state.lock();
-        if queue.id() as usize != queue_id {
+        if queue.descriptor.id() as usize != queue_id {
             return Err(EINVAL);
         }
-        if queue.sq_is_full(reg)? {
+        let mut submission = queue.submission.lock();
+        if submission.is_full(reg, &queue.descriptor)? {
             return Err(EBUSY);
         }
 
         let sqe = dma.transfer_request_desc(tag as usize)?;
-        let tail = queue.write_sq_entry(sqe)?;
+        let tail = submission.write_entry(&queue.descriptor, sqe)?;
 
         barrier::smp_wmb();
-        reg.write_mcq_sq_tail(queue.oprs(), queue_id, tail)
+        reg.write_mcq_sq_tail(queue.descriptor.oprs(), queue_id, tail)
     }
 
     fn poll_completions(
@@ -572,7 +578,7 @@ impl McqQueueSet {
         completed_requests: &mut CompletedRequests,
     ) -> Result<()> {
         for queue in self.queues.iter().take(nr_queues) {
-            self.collect_queue_completions(reg, dma, &mut queue.state.lock(), completed_requests)?;
+            self.collect_queue_completions(reg, dma, queue, completed_requests)?;
             if completed_requests.is_full() {
                 break;
             }
@@ -590,22 +596,23 @@ impl McqQueueSet {
     ) -> Result<()> {
         let queue = self.queues.get(queue_id).ok_or(EINVAL)?;
 
-        self.collect_queue_completions(reg, dma, &mut queue.state.lock(), completed_requests)
+        self.collect_queue_completions(reg, dma, queue, completed_requests)
     }
 
     fn collect_queue_completions(
         &self,
         reg: &UfsReg,
         dma: &UfsDma,
-        queue: &mut UfsMcqQueue,
+        queue: &McqHardwareQueue,
         completed_requests: &mut CompletedRequests,
     ) -> Result<()> {
-        queue.update_cq_tail_slot(reg)?;
+        let mut completion = queue.completion.lock();
+        completion.update_tail(reg, &queue.descriptor)?;
         let mut consumed = false;
         let result = (|| {
-            while !queue.cq_is_empty() && !completed_requests.is_full() {
+            while !completion.is_empty() && !completed_requests.is_full() {
                 consumed = true;
-                if let Some(cqe) = queue.consume_cq_entry()? {
+                if let Some(cqe) = completion.consume_entry(&queue.descriptor)? {
                     let tag = dma.tag_from_cq_entry(&cqe)?;
                     completed_requests.insert(tag, Some(cqe))?;
                 }
@@ -613,9 +620,9 @@ impl McqQueueSet {
             Ok(())
         })();
         if consumed {
-            queue.commit_cq_head(reg)?;
+            completion.commit_head(reg, &queue.descriptor)?;
         }
-        queue.acknowledge_cq_events(reg)?;
+        completion.acknowledge_events(reg, &queue.descriptor)?;
 
         result
     }
@@ -631,13 +638,25 @@ impl McqQueueSet {
         }
 
         for queue in self.queues.iter() {
-            let queue = queue.state.lock();
-            let id = queue.id() as usize;
-            let sq_head = reg.read_mcq_sq_head(queue.oprs(), id).unwrap_or(u32::MAX);
-            let sq_tail = reg.read_mcq_sq_tail(queue.oprs(), id).unwrap_or(u32::MAX);
-            let cq_head = reg.read_mcq_cq_head(queue.oprs(), id).unwrap_or(u32::MAX);
-            let cq_tail = reg.read_mcq_cq_tail(queue.oprs(), id).unwrap_or(u32::MAX);
-            let cqis = reg.read_mcq_cqis(queue.oprs(), id).unwrap_or(u32::MAX);
+            let descriptor = &queue.descriptor;
+            let id = descriptor.id() as usize;
+            let sq_head = reg
+                .read_mcq_sq_head(descriptor.oprs(), id)
+                .unwrap_or(u32::MAX);
+            let sq_tail = reg
+                .read_mcq_sq_tail(descriptor.oprs(), id)
+                .unwrap_or(u32::MAX);
+            let cq_head = reg
+                .read_mcq_cq_head(descriptor.oprs(), id)
+                .unwrap_or(u32::MAX);
+            let cq_tail = reg
+                .read_mcq_cq_tail(descriptor.oprs(), id)
+                .unwrap_or(u32::MAX);
+            let cqis = reg
+                .read_mcq_cqis(descriptor.oprs(), id)
+                .unwrap_or(u32::MAX);
+            let sq_tail_slot = queue.submission.lock().sq_tail_slot();
+            let completion = queue.completion.lock();
 
             pr_err!(
                 "[RUFS] ufs_queue: MCQ state reason={} tag={} q={} sqhp={} sqtp={} cqhp={} cqtp={} cqis={:#x} sw_sq_tail={} sw_cq_head={} sw_cq_tail={}\n",
@@ -649,9 +668,9 @@ impl McqQueueSet {
                 cq_head,
                 cq_tail,
                 cqis,
-                queue.sq_tail_slot(),
-                queue.cq_head_slot(),
-                queue.cq_tail_slot(),
+                sq_tail_slot,
+                completion.head_slot(),
+                completion.tail_slot(),
             );
         }
     }
@@ -666,37 +685,40 @@ impl McqQueueSet {
         }
 
         for queue in self.queues.iter() {
-            let mut queue = queue.state.lock();
-            let id = queue.id() as usize;
-            let sq_dma_addr = queue.sqe_dma_addr() as u64;
-            let cq_dma_addr = queue.cqe_dma_addr() as u64;
+            let descriptor = &queue.descriptor;
+            let id = descriptor.id() as usize;
+            let mut submission = queue.submission.lock();
+            let mut completion = queue.completion.lock();
+            let sq_dma_addr = submission.dma_addr() as u64;
+            let cq_dma_addr = completion.dma_addr() as u64;
 
             reg.set_mcq_sq_base_addr(id, sq_dma_addr)?;
             reg.write_mcq_sqdao(
                 id,
-                reg.mcq_opr_offset(queue.oprs(), UfsMcqOprRegion::Sqd, id, 0),
+                reg.mcq_opr_offset(descriptor.oprs(), UfsMcqOprRegion::Sqd, id, 0),
             )?;
             reg.write_mcq_sqisao(
                 id,
-                reg.mcq_opr_offset(queue.oprs(), UfsMcqOprRegion::Sqis, id, 0),
+                reg.mcq_opr_offset(descriptor.oprs(), UfsMcqOprRegion::Sqis, id, 0),
             )?;
 
             reg.set_mcq_cq_base_addr(id, cq_dma_addr)?;
             reg.write_mcq_cqdao(
                 id,
-                reg.mcq_opr_offset(queue.oprs(), UfsMcqOprRegion::Cqd, id, 0),
+                reg.mcq_opr_offset(descriptor.oprs(), UfsMcqOprRegion::Cqd, id, 0),
             )?;
             reg.write_mcq_cqisao(
                 id,
-                reg.mcq_opr_offset(queue.oprs(), UfsMcqOprRegion::Cqis, id, 0),
+                reg.mcq_opr_offset(descriptor.oprs(), UfsMcqOprRegion::Cqis, id, 0),
             )?;
 
-            queue.reset_slots();
+            submission.reset();
+            completion.reset();
             if id < interrupt_queues {
-                reg.enable_mcq_cq_tail_push_intr(queue.oprs(), id)?;
+                reg.enable_mcq_cq_tail_push_intr(descriptor.oprs(), id)?;
             }
-            reg.enable_mcq_cq(id, queue.max_entries() as usize)?;
-            reg.enable_mcq_sq(id, queue.max_entries() as usize, id)?;
+            reg.enable_mcq_cq(id, descriptor.max_entries() as usize)?;
+            reg.enable_mcq_sq(id, descriptor.max_entries() as usize, id)?;
         }
 
         Ok(())
