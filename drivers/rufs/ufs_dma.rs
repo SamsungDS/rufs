@@ -1817,7 +1817,10 @@ impl UfsDma {
 
             iter.next()?;
         }
-        let iter = iter.finish();
+        // SAFETY: The mapping is stored in this request's private data. blk-mq
+        // keeps the request alive by its tag until RUFS takes and drops the
+        // mapping before completing or requeuing the request.
+        let iter = unsafe { iter.finish_detached() };
 
         Ok(UfsPrdt {
             mapping: Some(UfsPrdtMapping::Sg(iter)),

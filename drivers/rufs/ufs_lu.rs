@@ -264,7 +264,7 @@ pub(crate) struct UfsLuBlockOps;
 // Because the command was not submitted, no hardware completion can race with
 // returning the request to blk-mq.
 fn complete_unsubmitted(rq: ARef<mq::Request<UfsLuBlockOps>>, e: Error) {
-    rq.data_ref().inner.lock().clear();
+    rq.data_ref().inner.lock().reset();
     let rq = OwnableRefCounted::try_from_shared(rq)
         .map_err(|_e| kernel::error::code::EIO)
         .expect("Failed to complete request");

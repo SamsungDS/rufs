@@ -726,16 +726,10 @@ impl UfsDev {
         let mut rq = self
             .request_queue
             .alloc_sync_request(mq::Command::DriverOut)?;
-        rq.data_ref().inner.lock().cmd = Some(cmd);
+        rq.data_ref().inner.lock().prepare_device(cmd)?;
         rq.as_pin_mut().execute(true)?;
-        let cmd = rq
-            .data_ref()
-            .inner
-            .lock()
-            .cmd
-            .take()
-            .expect("Expected command");
-        Ok(cmd)
+        let result = rq.data_ref().inner.lock().take_device_completion();
+        result
     }
 
     fn nop(&self) -> Result<()> {

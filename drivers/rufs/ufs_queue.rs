@@ -12,7 +12,6 @@ use kernel::cpu;
 use kernel::sync::atomic::Release;
 use kernel::sync::{aref::ARef, barrier, Arc, SpinLock, SpinLockIrq};
 use kernel::types::OwnableRefCounted;
-use kernel::types::Owned;
 use kernel::{bindings, new_spinlock, new_spinlock_irq, prelude::*};
 
 const READ_10: u8 = 0x28;
@@ -411,25 +410,110 @@ enum CompletionTarget<'a> {
 }
 
 pub(crate) struct UfsRequestInner {
-    // These fields form one ownership unit. Keep them under a single lock so a
-    // slot is never visible as idle while old DMA or block request state remains.
-    pub(crate) cmd: Option<UfsCmd>,
-    prdt: Option<UfsPrdtMapping>,
+    state: UfsRequestState,
+}
+
+enum UfsRequestState {
+    Idle,
+    Prepared {
+        cmd: UfsCmd,
+        prdt: Option<UfsPrdtMapping>,
+    },
+    InFlight {
+        cmd: UfsCmd,
+        prdt: Option<UfsPrdtMapping>,
+    },
+    DeviceComplete(UfsDevCmd),
 }
 
 impl Default for UfsRequestInner {
     fn default() -> Self {
         UfsRequestInner {
-            cmd: None,
-            prdt: None,
+            state: UfsRequestState::Idle,
         }
     }
 }
 
 impl UfsRequestInner {
-    pub(crate) fn clear(&mut self) {
-        self.prdt = None;
-        self.cmd = None;
+    pub(crate) fn prepare_device(&mut self, cmd: UfsCmd) -> Result<()> {
+        if !matches!(cmd, UfsCmd::Device(_)) || !matches!(self.state, UfsRequestState::Idle) {
+            return Err(EINVAL);
+        }
+        self.state = UfsRequestState::Prepared { cmd, prdt: None };
+        Ok(())
+    }
+
+    fn prepare_scsi(&mut self, cmd: UfsSCSICmd, prdt: Option<UfsPrdtMapping>) -> Result<()> {
+        if !matches!(self.state, UfsRequestState::Idle) {
+            return Err(EBUSY);
+        }
+        self.state = UfsRequestState::Prepared {
+            cmd: UfsCmd::SCSI(cmd),
+            prdt,
+        };
+        Ok(())
+    }
+
+    fn prepared_command(&self) -> Result<UfsCmd> {
+        match self.state {
+            UfsRequestState::Prepared { cmd, .. } => Ok(cmd),
+            _ => Err(EIO),
+        }
+    }
+
+    fn mark_in_flight(&mut self) -> Result<()> {
+        let state = core::mem::replace(&mut self.state, UfsRequestState::Idle);
+        self.state = match state {
+            UfsRequestState::Prepared { cmd, prdt } => {
+                UfsRequestState::InFlight { cmd, prdt }
+            }
+            state => {
+                self.state = state;
+                return Err(EIO);
+            }
+        };
+        Ok(())
+    }
+
+    fn take_in_flight(&mut self) -> Result<(UfsCmd, Option<UfsPrdtMapping>)> {
+        let state = core::mem::replace(&mut self.state, UfsRequestState::Idle);
+        match state {
+            UfsRequestState::InFlight { cmd, prdt } => Ok((cmd, prdt)),
+            state => {
+                self.state = state;
+                Err(EIO)
+            }
+        }
+    }
+
+    fn in_flight_command(&self) -> Option<UfsCmd> {
+        match self.state {
+            UfsRequestState::InFlight { cmd, .. } => Some(cmd),
+            _ => None,
+        }
+    }
+
+    fn complete_device(&mut self, cmd: UfsDevCmd) -> Result<()> {
+        if !matches!(self.state, UfsRequestState::Idle) {
+            return Err(EIO);
+        }
+        self.state = UfsRequestState::DeviceComplete(cmd);
+        Ok(())
+    }
+
+    pub(crate) fn take_device_completion(&mut self) -> Result<UfsCmd> {
+        let state = core::mem::replace(&mut self.state, UfsRequestState::Idle);
+        match state {
+            UfsRequestState::DeviceComplete(cmd) => Ok(UfsCmd::Device(cmd)),
+            state => {
+                self.state = state;
+                Err(EIO)
+            }
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.state = UfsRequestState::Idle;
     }
 }
 
@@ -1022,15 +1106,8 @@ impl UfsTransferBackend {
 impl UfsRequestData {
     pub(crate) fn compose_dev_request(rq: &ARef<mq::Request<UfsLuBlockOps>>) -> Result<()> {
         if let QueueData::Dev(queue) = rq.queue_data() {
-            let Some(UfsCmd::Device(cmd)) = rq.data_ref().inner.lock().cmd else {
-                return Err(EIO);
-            };
-            if let Err(e) = queue.compose_dev(cmd, rq.tag()) {
-                rq.data_ref().inner.lock().clear();
-                Err(e)
-            } else {
-                Ok(())
-            }
+            let cmd = rq.data_ref().inner.lock().prepared_command()?.get_device()?;
+            queue.compose_dev(cmd, rq.tag())
         } else {
             Err(EIO)
         }
@@ -1043,10 +1120,7 @@ impl UfsRequestData {
         let mempool = rq.queue().tag_set().data().dma_vec_mempool.clone();
         let prdt = UfsQueue::compose_scsi(rq, cmd, &mempool)?;
 
-        let mut inner = rq.data_ref().inner.lock();
-        inner.prdt = prdt;
-        inner.cmd = Some(UfsCmd::SCSI(cmd));
-        Ok(())
+        rq.data_ref().inner.lock().prepare_scsi(cmd, prdt)
     }
 
     pub(crate) fn submit(
@@ -1058,6 +1132,11 @@ impl UfsRequestData {
         };
         let queue_id = rq.queue_index();
         let tag = rq.tag();
+
+        let state_result = rq.data_ref().inner.lock().mark_in_flight();
+        if let Err(e) = state_result {
+            return Err((rq, e));
+        }
 
         // Do not keep a submit-side request reference while making the command
         // visible to hardware. A fast completion may run before `queue_rq()`
@@ -1074,17 +1153,11 @@ impl UfsRequestData {
                     .tags
                     .tag_to_rq(queue_id, tag)
                     .expect("rufs: submitted request disappeared");
-                rq.data_ref().inner.lock().clear();
+                rq.data_ref().inner.lock().reset();
                 Err((rq, e))
             }
             Ok(()) => Ok(()),
         }
-    }
-
-    fn clear(rq: &ARef<mq::Request<UfsLuBlockOps>>) {
-        let mut inner = rq.data_ref().inner.lock();
-        inner.prdt = None;
-        inner.cmd = None;
     }
 
     pub(crate) fn timeout(rq: ARef<mq::Request<UfsLuBlockOps>>) -> bool {
@@ -1094,13 +1167,7 @@ impl UfsRequestData {
         };
         queue.dump_backend_state(rq.tag() as usize, "request timeout");
 
-        let (cmd, prdt) = {
-            let mut inner = rq.data_ref().inner.lock();
-            let cmd = inner.cmd;
-            let prdt = inner.prdt.take();
-            inner.cmd = None;
-            (cmd, prdt)
-        };
+        let cmd = rq.data_ref().inner.lock().in_flight_command();
 
         if let Some(UfsCmd::SCSI(cmd)) = cmd {
             let cdb = cmd.cdb();
@@ -1113,22 +1180,9 @@ impl UfsRequestData {
         } else {
             pr_err!("[RUFS] ufs_queue: request timeout tag={}\n", rq.tag());
         }
-        // This is only a minimum timeout return path. It does not clean the MCQ
-        // SQ or prevent a late CQE for the same tag; full error handling will
-        // need to quiesce/recover hardware before reusing timed-out tags.
-        match OwnableRefCounted::try_from_shared(rq) {
-            Ok(rq) => {
-                rq.end(bindings::BLK_STS_IOERR as u8);
-                drop(prdt);
-                true
-            }
-            Err(rq) => {
-                let mut inner = rq.data_ref().inner.lock();
-                inner.cmd = cmd;
-                inner.prdt = prdt;
-                false
-            }
-        }
+        // Do not release the tag until recovery has stopped hardware and
+        // prevented a late completion from referring to a reused request.
+        false
     }
 
     fn complete(rq: ARef<mq::Request<UfsLuBlockOps>>, cqe: Option<CqEntry>) -> bool {
@@ -1148,34 +1202,62 @@ impl UfsRequestData {
         cqe: Option<CqEntry>,
         target: CompletionTarget<'_>,
     ) -> bool {
-        let cmd = rq
-            .data_ref()
-            .inner
-            .lock()
-            .cmd
-            .expect("Command must have cmd");
+        let (cmd, prdt) = match rq.data_ref().inner.lock().take_in_flight() {
+            Ok(state) => state,
+            Err(_) => {
+                pr_err!(
+                    "[RUFS] ufs_queue: completion for inactive request tag={}\n",
+                    rq.tag(),
+                );
+                return false;
+            }
+        };
 
         match cmd {
             UfsCmd::Device(cmd) => {
                 let QueueData::Dev(queue) = rq.queue_data() else {
-                    panic!("Invalid context")
+                    pr_err!("[RUFS] ufs_queue: device request has invalid context\n");
+                    drop(prdt);
+                    rq.data_ref()
+                        .status
+                        .store(u32::from(bindings::BLK_STS_IOERR), Release);
+                    mq::Request::complete(rq);
+                    return true;
                 };
-                let cmd = queue
-                    .fetch_dev(cmd, rq.tag() as usize, cqe)
-                    .expect("Expected dev cmd");
-                rq.data_ref().inner.lock().cmd = Some(cmd);
-                Owned::try_from(rq)
-                    .expect("Expected exclusive access")
-                    .end_ok();
+                let result = queue.fetch_dev(cmd, rq.tag() as usize, cqe);
+                drop(prdt);
+                match result {
+                    Ok(UfsCmd::Device(cmd)) => {
+                        if rq.data_ref().inner.lock().complete_device(cmd).is_err() {
+                            pr_err!("[RUFS] ufs_queue: invalid device completion state\n");
+                            rq.data_ref()
+                                .status
+                                .store(u32::from(bindings::BLK_STS_IOERR), Release);
+                        }
+                    }
+                    _ => {
+                        pr_err!("[RUFS] ufs_queue: failed to fetch device response\n");
+                        rq.data_ref()
+                            .status
+                            .store(u32::from(bindings::BLK_STS_IOERR), Release);
+                    }
+                }
+                mq::Request::complete(rq);
                 true
             }
             UfsCmd::SCSI(cmd) => {
                 let QueueData::Lu(lu) = rq.queue_data() else {
-                    panic!("Invalid context")
+                    pr_err!("[RUFS] ufs_queue: SCSI request has invalid context\n");
+                    drop(prdt);
+                    rq.data_ref()
+                        .status
+                        .store(u32::from(bindings::BLK_STS_IOERR), Release);
+                    mq::Request::complete(rq);
+                    return true;
                 };
                 let queue = &lu.queue;
                 let result = queue.fetch_scsi_completion(rq.tag() as usize, cqe);
-                Self::clear(&rq);
+                drop(prdt);
 
                 queue.clone().complete_scsi(cmd, result, rq, target);
                 true
