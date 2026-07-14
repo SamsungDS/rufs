@@ -6,6 +6,7 @@
 
 use kernel::sync::{Arc, Mutex, SpinLock};
 use kernel::time::{delay::*, Delta};
+use kernel::types::ScopeGuard;
 use kernel::{device::Core, new_mutex, new_spinlock, pci, prelude::*};
 use pin_init::pin_init_scope;
 
@@ -18,6 +19,23 @@ use crate::ufs_reg::*;
 use crate::ufs_uic::*;
 
 const HBA_ENABLE_DELAY_US: i64 = 1000;
+
+fn stop_hba_controller(reg: &UfsReg) {
+    if !reg.ctrl_enabled() {
+        return;
+    }
+
+    reg.disable_interrupts();
+    reg.clear_all_interrupts();
+    reg.disable_run_stop();
+    reg.ctrl_disable();
+    if let Err(e) = reg.wait_for_ctrl_disable(10, 1) {
+        pr_err!(
+            "[RUFS] ufs_host: controller disable failed errno={}\n",
+            e.to_errno()
+        );
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostState {
@@ -51,61 +69,38 @@ impl UfsHost {
     pub(crate) fn new<'a>(pdev: &'a pci::Device<Core<'a>>) -> impl PinInit<Self, Error> + 'a {
         pin_init_scope(move || {
             let reg = UfsReg::new(pdev)?;
-            let dma = UfsDma::new(pdev, reg.clone())?;
+            let transfer_config = UfsTransferConfig::new(&reg)?;
+            let dma = UfsDma::new(pdev, reg.clone(), transfer_config.tag_count())?;
 
             reg.clear_all_interrupts();
             reg.disable_interrupts();
 
-            let requested_irq_vectors = match ufs_mcq_interrupt_queue_count(&reg)
-                .and_then(|queues| u32::try_from(queues).map_err(|_| EOVERFLOW))
-            {
-                Ok(queues) => queues,
-                Err(e) => {
-                    pr_warn!(
-                    "[RUFS] ufs_host: failed to plan MCQ IRQ vectors errno={}, fallback to single shared IRQ\n",
-                    e.to_errno(),
-                );
-                    1
-                }
-            };
-            let msi_irq_types = pci::IrqTypes::default()
-                .with(pci::IrqType::MsiX)
-                .with(pci::IrqType::Msi);
-            let irq_vectors = if requested_irq_vectors > 1 {
-                match pdev.alloc_irq_vectors(
-                    requested_irq_vectors,
-                    requested_irq_vectors,
-                    msi_irq_types,
-                ) {
-                    Ok(irq_vectors) => irq_vectors,
-                    Err(e) => {
-                        pr_warn!(
-                        "[RUFS] ufs_host: failed to allocate {} MSI/MSI-X IRQ vectors errno={}, fallback to single shared IRQ\n",
-                        requested_irq_vectors,
-                        e.to_errno(),
-                    );
-                        pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?
-                    }
-                }
-            } else {
-                pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?
-            };
+            // Until MCQ ESI routing is implemented, all UIC and transfer
+            // completions use the controller's single global interrupt.
+            let irq_vectors = pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?;
             let first_irq_vector = *irq_vectors.start();
-            let allocated_irq_vectors = irq_vectors
-                .end()
-                .index()
-                .checked_sub(first_irq_vector.index())
-                .ok_or(EINVAL)?
-                + 1;
-            pr_info!(
-                "[RUFS] ufs_host: IRQ vectors requested={} allocated={}\n",
-                requested_irq_vectors,
-                allocated_irq_vectors,
-            );
 
             let irq = UfsIrq::new()?;
             let uic = UfsUic::new(reg.clone(), irq.clone())?;
-            let ufs_queue = UfsQueue::new(reg.clone(), dma.clone())?;
+
+            let cleanup_reg = reg.clone();
+            let init_guard = ScopeGuard::new(move || stop_hba_controller(&cleanup_reg));
+
+            if reg.ctrl_enabled() {
+                pr_info!("[RUFS] ufs_host: controller is active, stop before enable\n");
+                stop_hba_controller(&reg);
+            }
+
+            reg.ctrl_enable();
+            fsleep(Delta::from_micros(HBA_ENABLE_DELAY_US));
+            reg.wait_for_ctrl_enable(1000, 50)?;
+
+            /* ufshcd_link_startup() */
+            irq.request_uic_irq(pdev, first_irq_vector, reg.clone(), uic.clone())?;
+            uic.link_startup()?;
+            dma.make_hba_operational()?;
+
+            let ufs_queue = UfsQueue::new(transfer_config, reg.clone(), dma.clone())?;
             let dev = UfsDev::new(ufs_queue.clone())?;
             let host = try_pin_init!(Self {
                 reg,
@@ -120,58 +115,15 @@ impl UfsHost {
                 max_prdt_entries: 256,
             })
             .pin_chain(move |host| {
-                if host.reg.ctrl_enabled() {
-                    pr_info!("[RUFS] ufs_host: controller is active, stop before enable\n");
-                    host.hba_stop();
-                }
-
-                host.reg.ctrl_enable();
-                fsleep(Delta::from_micros(HBA_ENABLE_DELAY_US));
-                host.reg.wait_for_ctrl_enable(1000, 50)?;
-
-                /* ufshcd_link_startup() */
-                host.irq.request_uic_irq(
-                    pdev,
-                    first_irq_vector,
-                    host.reg.clone(),
-                    host.uic.clone(),
-                )?;
-                host.uic.link_startup()?;
-                host.dma.make_hba_operational()?;
+                init_guard.dismiss();
 
                 /* ufshcd_verify_dev_init */
-                host.irq.request_queue_irqs(
+                host.irq.request_queue_irq(
                     pdev,
                     first_irq_vector,
-                    allocated_irq_vectors as usize,
                     host.reg.clone(),
                     host.queue.clone(),
                 )?;
-                if allocated_irq_vectors < requested_irq_vectors {
-                    pr_info!(
-                        "[RUFS] ufs_host: allocated fewer IRQ vectors than requested {}/{}\n",
-                        allocated_irq_vectors,
-                        requested_irq_vectors,
-                    );
-                }
-                if host.reg.mcq_supported() {
-                    pr_info!("MCQ supported\n");
-                    match host
-                        .queue
-                        .enable_mcq_backend(host.reg.clone(), host.dma.clone())
-                    {
-                        Ok(()) => {}
-                        Err(e) => {
-                            pr_warn!(
-                                "[RUFS] ufs_host: MCQ setup failed errno={}, keep SDB backend\n",
-                                e.to_errno(),
-                            );
-                        }
-                    }
-                } else {
-                    pr_info!("MCQ not supported, using SDB mode!\n");
-                }
-
                 host.dev.verify_dev_init()?;
                 host.dev.complete_dev_init()?;
                 host.dev.device_params_init()?;
@@ -249,21 +201,7 @@ impl UfsHost {
     }
 
     fn hba_stop(&self) {
-        if !self.reg.ctrl_enabled() {
-            self.fallback_to_reset();
-            return;
-        }
-
-        self.reg.disable_interrupts();
-        self.reg.clear_all_interrupts();
-        self.reg.disable_run_stop();
-        self.reg.ctrl_disable();
-        if let Err(e) = self.reg.wait_for_ctrl_disable(10, 1) {
-            pr_err!(
-                "[RUFS] ufs_host: controller disable failed errno={}\n",
-                e.to_errno()
-            );
-        }
+        stop_hba_controller(&self.reg);
         self.fallback_to_reset();
     }
 

@@ -13,7 +13,7 @@ use kernel::sync::atomic::Release;
 use kernel::sync::{aref::ARef, barrier, Arc, SpinLock, SpinLockIrq};
 use kernel::types::OwnableRefCounted;
 use kernel::types::Owned;
-use kernel::{bindings, kvec, new_spinlock, new_spinlock_irq, prelude::*};
+use kernel::{bindings, new_spinlock, new_spinlock_irq, prelude::*};
 
 const READ_10: u8 = 0x28;
 const WRITE_10: u8 = 0x2a;
@@ -23,23 +23,26 @@ const READ_16: u8 = 0x88;
 const WRITE_16: u8 = 0x8a;
 const UFS_MCQ_DEFAULT_READ_QUEUES: usize = 0;
 const UFS_MCQ_DEFAULT_POLL_QUEUES: usize = 1;
-const MAX_COMPLETED_TAGS: usize = 256;
+const UFS_TASK_TAG_COUNT: usize = 256;
+const COMPLETION_BATCH_SIZE: usize = 16;
 
 fn possible_cpus() -> usize {
     (cpu::nr_cpu_ids() as usize).max(1)
 }
 
 #[derive(Copy, Clone)]
-struct McqQueueLayout {
+pub(crate) struct McqConfig {
     max_queues: usize,
     total_queues: usize,
     default_queues: usize,
     read_queues: usize,
     interrupt_queues: usize,
     poll_queues: usize,
+    tag_count: usize,
+    ring_entries: usize,
 }
 
-impl McqQueueLayout {
+impl McqConfig {
     fn queue_map(&self) -> Result<UfsQueueMap> {
         UfsQueueMap::new(
             self.total_queues,
@@ -51,6 +54,72 @@ impl McqQueueLayout {
 
     fn is_poll_queue(&self, queue: usize) -> bool {
         queue >= self.interrupt_queues && queue < self.total_queues
+    }
+}
+
+#[derive(Copy, Clone)]
+pub(crate) enum UfsTransferConfig {
+    Sdb { tag_count: usize },
+    Mcq(McqConfig),
+}
+
+impl UfsTransferConfig {
+    pub(crate) fn new(reg: &UfsReg) -> Result<Self> {
+        if !reg.mcq_supported() {
+            let tag_count = reg.nutrs();
+            if tag_count == 0 || tag_count > u32::BITS as usize {
+                return Err(EINVAL);
+            }
+            return Ok(Self::Sdb { tag_count });
+        }
+
+        let max_queues = reg.mcq_max_queues();
+        let read_queues = UFS_MCQ_DEFAULT_READ_QUEUES;
+        let poll_queues = UFS_MCQ_DEFAULT_POLL_QUEUES;
+        let reserved_queues = read_queues
+            .checked_add(poll_queues)
+            .ok_or(EOVERFLOW)?;
+        if max_queues <= reserved_queues {
+            return Err(ENOTSUPP);
+        }
+
+        let default_queues = core::cmp::min(max_queues - reserved_queues, possible_cpus());
+        let interrupt_queues = default_queues
+            .checked_add(read_queues)
+            .ok_or(EOVERFLOW)?;
+        let total_queues = interrupt_queues
+            .checked_add(poll_queues)
+            .ok_or(EOVERFLOW)?;
+        let tag_count = core::cmp::min(reg.nutrs_mcq(), UFS_TASK_TAG_COUNT);
+        let ring_entries = tag_count.checked_add(1).ok_or(EOVERFLOW)?;
+        if interrupt_queues == 0 || tag_count == 0 {
+            return Err(EINVAL);
+        }
+
+        Ok(Self::Mcq(McqConfig {
+            max_queues,
+            total_queues,
+            default_queues,
+            read_queues,
+            interrupt_queues,
+            poll_queues,
+            tag_count,
+            ring_entries,
+        }))
+    }
+
+    pub(crate) fn tag_count(&self) -> usize {
+        match self {
+            Self::Sdb { tag_count } => *tag_count,
+            Self::Mcq(config) => config.tag_count,
+        }
+    }
+
+    fn queue_map(&self) -> Result<UfsQueueMap> {
+        match self {
+            Self::Sdb { .. } => Ok(UfsQueueMap::sdb()),
+            Self::Mcq(config) => config.queue_map(),
+        }
     }
 }
 
@@ -121,59 +190,6 @@ impl UfsQueueMap {
             1
         }
     }
-}
-
-fn ufs_mcq_queue_layout(reg: &UfsReg) -> Result<McqQueueLayout> {
-    if !reg.mcq_supported() {
-        return Err(ENOTSUPP);
-    }
-
-    let hba_maxq = reg.mcq_max_queues();
-    if hba_maxq == 0 {
-        return Err(EINVAL);
-    }
-
-    // Match the C driver's default MCQ policy: rw_queues defaults to the
-    // possible CPU count, read_queues defaults to 0, and poll_queues defaults
-    // to 1. The resulting layout is exposed to blk-mq through an explicit
-    // queue-map configuration when LUs are allocated.
-    let read_queues = UFS_MCQ_DEFAULT_READ_QUEUES;
-    let poll_queues = UFS_MCQ_DEFAULT_POLL_QUEUES;
-    let requested_queues = read_queues + poll_queues;
-
-    if hba_maxq < requested_queues || hba_maxq == poll_queues {
-        return Err(ENOTSUPP);
-    }
-
-    let cpu_queues = possible_cpus();
-    let remaining = hba_maxq
-        .checked_sub(poll_queues)
-        .and_then(|remaining| remaining.checked_sub(read_queues))
-        .ok_or(EINVAL)?;
-    let default_queues = core::cmp::min(remaining, cpu_queues);
-
-    let interrupt_queues = default_queues + read_queues;
-    let total_queues = interrupt_queues + poll_queues;
-    if total_queues == 0 || interrupt_queues == 0 {
-        Err(EINVAL)
-    } else {
-        Ok(McqQueueLayout {
-            max_queues: hba_maxq,
-            total_queues,
-            default_queues,
-            read_queues,
-            interrupt_queues,
-            poll_queues,
-        })
-    }
-}
-
-pub(crate) fn ufs_mcq_interrupt_queue_count(reg: &UfsReg) -> Result<usize> {
-    if !reg.mcq_supported() {
-        return Ok(1);
-    }
-
-    Ok(ufs_mcq_queue_layout(reg)?.interrupt_queues)
 }
 
 #[derive(PartialEq, Copy, Clone, Debug)]
@@ -399,7 +415,6 @@ pub(crate) struct UfsRequestInner {
     // slot is never visible as idle while old DMA or block request state remains.
     pub(crate) cmd: Option<UfsCmd>,
     prdt: Option<UfsPrdtMapping>,
-    hw_queue: Option<u32>,
 }
 
 impl Default for UfsRequestInner {
@@ -407,7 +422,6 @@ impl Default for UfsRequestInner {
         UfsRequestInner {
             cmd: None,
             prdt: None,
-            hw_queue: None,
         }
     }
 }
@@ -415,7 +429,6 @@ impl Default for UfsRequestInner {
 impl UfsRequestInner {
     pub(crate) fn clear(&mut self) {
         self.prdt = None;
-        self.hw_queue = None;
         self.cmd = None;
     }
 }
@@ -437,132 +450,109 @@ struct SdbTransferState {
     completion: SpinLockIrq<SdbCompletionState>,
 }
 
-struct CompletedTags {
-    tags: [usize; MAX_COMPLETED_TAGS],
+#[derive(Clone, Copy)]
+struct CompletedRequest {
+    tag: usize,
+    cqe: Option<CqEntry>,
+}
+
+struct CompletedRequests {
+    requests: [Option<CompletedRequest>; COMPLETION_BATCH_SIZE],
     len: usize,
     pos: usize,
 }
 
-impl CompletedTags {
+impl CompletedRequests {
     fn new() -> Self {
         Self {
-            tags: [0; MAX_COMPLETED_TAGS],
+            requests: [None; COMPLETION_BATCH_SIZE],
             len: 0,
             pos: 0,
         }
     }
 
-    fn insert(&mut self, tag: usize) -> Result<()> {
-        if self.len == self.tags.len() {
+    fn insert(&mut self, tag: usize, cqe: Option<CqEntry>) -> Result<()> {
+        if self.len == self.requests.len() {
             return Err(ENOMEM);
         }
 
-        self.tags[self.len] = tag;
+        self.requests[self.len] = Some(CompletedRequest { tag, cqe });
         self.len += 1;
         Ok(())
     }
 
-    fn insert_sdb_mask(&mut self, mut mask: u32) -> Result<()> {
-        while mask != 0 {
+    fn insert_sdb_mask(&mut self, mut mask: u32) -> Result<u32> {
+        let mut inserted = 0;
+
+        while mask != 0 && !self.is_full() {
             let tag = mask.trailing_zeros();
-            mask &= !(1u32 << tag);
-            self.insert(tag as usize)?;
+            let tag_mask = 1u32 << tag;
+            mask &= !tag_mask;
+            self.insert(tag as usize, None)?;
+            inserted |= tag_mask;
         }
 
-        Ok(())
+        Ok(inserted)
     }
 
-    fn take_next(&mut self) -> Option<usize> {
+    fn is_full(&self) -> bool {
+        self.len == self.requests.len()
+    }
+
+    fn take_next(&mut self) -> Option<CompletedRequest> {
         if self.pos == self.len {
             return None;
         }
 
-        let tag = self.tags[self.pos];
+        let request = self.requests[self.pos].take();
         self.pos += 1;
-        Some(tag)
+        request
+    }
+}
+
+#[pin_data]
+struct McqHardwareQueue {
+    #[pin]
+    state: SpinLock<UfsMcqQueue>,
+}
+
+impl McqHardwareQueue {
+    fn new(queue: UfsMcqQueue) -> Result<Arc<Self>> {
+        Arc::pin_init(
+            pin_init!(Self {
+                state <- new_spinlock!(queue),
+            }),
+            GFP_KERNEL,
+        )
     }
 }
 
 #[pin_data]
 struct McqQueueSet {
-    #[pin]
-    queues: SpinLock<Option<KVec<UfsMcqQueue>>>,
-
-    #[pin]
-    completed: SpinLock<KVec<Option<CqEntry>>>,
+    queues: KVec<Arc<McqHardwareQueue>>,
 }
 
 impl McqQueueSet {
-    fn new(completed: KVec<Option<CqEntry>>) -> impl PinInit<Self> {
-        pin_init!(Self {
-            queues <- new_spinlock!(None),
-            completed <- new_spinlock!(completed),
-        })
-    }
-
-    fn allocate(
-        &self,
-        dma: &UfsDma,
-        nr_queues: usize,
-        queue_depth: usize,
-        oprs: UfsMcqOprSet,
-    ) -> Result<()> {
-        if nr_queues == 0 || queue_depth == 0 {
-            return Err(EINVAL);
-        }
-
-        let mut queues = KVec::new();
-        let queue_depth = u32::try_from(queue_depth).map_err(|_| EOVERFLOW)?;
-        for id in 0..nr_queues {
-            queues.push(
-                UfsMcqQueue::new(
-                    dma.dev(),
-                    u32::try_from(id).map_err(|_| EOVERFLOW)?,
-                    queue_depth,
-                    oprs,
-                )?,
-                GFP_KERNEL,
-            )?;
-        }
-
-        self.queues.lock().replace(queues);
-        Ok(())
+    fn new(queues: KVec<Arc<McqHardwareQueue>>) -> impl PinInit<Self> {
+        pin_init!(Self { queues })
     }
 
     fn len(&self) -> usize {
-        self.queues.lock().as_ref().map_or(0, |queues| queues.len())
-    }
-
-    fn queue_index(queue_hint: Option<u32>, tag: u32, nr_queues: u32) -> Result<u32> {
-        if nr_queues == 0 {
-            return Err(EINVAL);
-        }
-
-        Ok(queue_hint.unwrap_or(tag) % nr_queues)
+        self.queues.len()
     }
 
     fn submit(
         &self,
         reg: &UfsReg,
         dma: &UfsDma,
+        queue_id: usize,
         tag: u32,
-        queue_hint: Option<usize>,
     ) -> Result<()> {
-        {
-            let mut completed = self.completed.lock();
-            *completed.get_mut(tag as usize).ok_or(EINVAL)? = None;
+        let queue = self.queues.get(queue_id).ok_or(EINVAL)?;
+        let mut queue = queue.state.lock();
+        if queue.id() as usize != queue_id {
+            return Err(EINVAL);
         }
-
-        let mut guard = self.queues.lock();
-        // SAFETY: While holding the lock, this method only mutates queue state
-        // in place and never moves queues out of the vector or grows it.
-        let queues = unsafe { core::pin::Pin::get_unchecked_mut(guard.as_mut()) }
-            .as_mut()
-            .ok_or(EINVAL)?;
-        let queue_index =
-            Self::queue_index(queue_hint.map(|v| v as u32), tag, queues.len() as u32)?;
-        let queue = queues.get_mut(queue_index as usize).ok_or(EINVAL)?;
-        let queue_id = queue.id() as usize;
         if queue.sq_is_full(reg)? {
             return Err(EBUSY);
         }
@@ -579,17 +569,13 @@ impl McqQueueSet {
         reg: &UfsReg,
         dma: &UfsDma,
         nr_queues: usize,
-        completed_tags: &mut CompletedTags,
+        completed_requests: &mut CompletedRequests,
     ) -> Result<()> {
-        let mut guard = self.queues.lock();
-        // SAFETY: While holding the lock, this method only mutates queue state
-        // in place and never moves queues out of the vector or grows it.
-        let queues = unsafe { core::pin::Pin::get_unchecked_mut(guard.as_mut()) }
-            .as_mut()
-            .ok_or(EINVAL)?;
-
-        for queue in queues.iter_mut().take(nr_queues) {
-            self.collect_queue_completions(reg, dma, queue, completed_tags)?;
+        for queue in self.queues.iter().take(nr_queues) {
+            self.collect_queue_completions(reg, dma, &mut queue.state.lock(), completed_requests)?;
+            if completed_requests.is_full() {
+                break;
+            }
         }
 
         Ok(())
@@ -600,17 +586,11 @@ impl McqQueueSet {
         reg: &UfsReg,
         dma: &UfsDma,
         queue_id: usize,
-        completed_tags: &mut CompletedTags,
+        completed_requests: &mut CompletedRequests,
     ) -> Result<()> {
-        let mut guard = self.queues.lock();
-        // SAFETY: While holding the lock, this method only mutates queue state
-        // in place and never moves queues out of the vector or grows it.
-        let queues = unsafe { core::pin::Pin::get_unchecked_mut(guard.as_mut()) }
-            .as_mut()
-            .ok_or(EINVAL)?;
-        let queue = queues.get_mut(queue_id).ok_or(EINVAL)?;
+        let queue = self.queues.get(queue_id).ok_or(EINVAL)?;
 
-        self.collect_queue_completions(reg, dma, queue, completed_tags)
+        self.collect_queue_completions(reg, dma, &mut queue.state.lock(), completed_requests)
     }
 
     fn collect_queue_completions(
@@ -618,41 +598,40 @@ impl McqQueueSet {
         reg: &UfsReg,
         dma: &UfsDma,
         queue: &mut UfsMcqQueue,
-        completed_tags: &mut CompletedTags,
+        completed_requests: &mut CompletedRequests,
     ) -> Result<()> {
         queue.update_cq_tail_slot(reg)?;
-        while !queue.cq_is_empty() {
-            if let Some(cqe) = queue.consume_cq_entry(reg)? {
-                let tag = dma.tag_from_cq_entry(&cqe)?;
-                let mut completed = self.completed.lock();
-                *completed.get_mut(tag).ok_or(EINVAL)? = Some(cqe);
-                completed_tags.insert(tag)?;
+        let mut consumed = false;
+        let result = (|| {
+            while !queue.cq_is_empty() && !completed_requests.is_full() {
+                consumed = true;
+                if let Some(cqe) = queue.consume_cq_entry()? {
+                    let tag = dma.tag_from_cq_entry(&cqe)?;
+                    completed_requests.insert(tag, Some(cqe))?;
+                }
             }
+            Ok(())
+        })();
+        if consumed {
+            queue.commit_cq_head(reg)?;
         }
         queue.acknowledge_cq_events(reg)?;
 
-        Ok(())
-    }
-
-    fn take_completion(&self, tag: usize) -> Option<CqEntry> {
-        self.completed.lock().get_mut(tag).and_then(Option::take)
+        result
     }
 
     fn dump_state(&self, reg: &UfsReg, tag: usize, reason: &str) {
-        let mut guard = self.queues.lock();
-        // SAFETY: While holding the lock, this method only reads queue state in
-        // place and never moves queues out of the vector or grows it.
-        let Some(queues) = (unsafe { core::pin::Pin::get_unchecked_mut(guard.as_mut()) }).as_mut()
-        else {
+        if self.queues.is_empty() {
             pr_err!(
                 "[RUFS] ufs_queue: MCQ dump reason={} tag={} queues=unallocated\n",
                 reason,
                 tag,
             );
             return;
-        };
+        }
 
-        for queue in queues.iter() {
+        for queue in self.queues.iter() {
+            let queue = queue.state.lock();
             let id = queue.id() as usize;
             let sq_head = reg.read_mcq_sq_head(queue.oprs(), id).unwrap_or(u32::MAX);
             let sq_tail = reg.read_mcq_sq_tail(queue.oprs(), id).unwrap_or(u32::MAX);
@@ -682,17 +661,12 @@ impl McqQueueSet {
         reg: &UfsReg,
         interrupt_queues: usize,
     ) -> Result<()> {
-        let mut guard = self.queues.lock();
-        // SAFETY: While holding the lock, this method only mutates queue state
-        // in place and never moves queues out of the vector or grows it.
-        let queues = unsafe { core::pin::Pin::get_unchecked_mut(guard.as_mut()) }
-            .as_mut()
-            .ok_or(EINVAL)?;
-        if interrupt_queues > queues.len() {
+        if interrupt_queues > self.queues.len() {
             return Err(EINVAL);
         }
 
-        for queue in queues.iter_mut() {
+        for queue in self.queues.iter() {
+            let mut queue = queue.state.lock();
             let id = queue.id() as usize;
             let sq_dma_addr = queue.sqe_dma_addr() as u64;
             let cq_dma_addr = queue.cqe_dma_addr() as u64;
@@ -732,8 +706,7 @@ impl McqQueueSet {
 struct McqTransferBackend {
     reg: Arc<UfsReg>,
     dma: Arc<UfsDma>,
-    layout: McqQueueLayout,
-    queue_depth: usize,
+    config: McqConfig,
     queues: Arc<McqQueueSet>,
 }
 
@@ -743,8 +716,6 @@ enum UfsTransferBackend {
 }
 
 trait UfsTransferOps {
-    fn queue_depth(&self) -> usize;
-    fn queue_map(&self) -> Result<UfsQueueMap>;
     fn compose_dev(&self, cmd: UfsDevCmd, tag: u32) -> Result<()>;
     fn compose_scsi(
         &self,
@@ -752,12 +723,12 @@ trait UfsTransferOps {
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>>;
-    fn submit(&self, tag: u32) -> Result<()>;
+    fn submit(&self, queue: u32, tag: u32) -> Result<()>;
     fn dump_state(&self, tag: usize, reason: &str);
-    fn collect_completions(&self, completed_tags: &mut CompletedTags) -> Result<()>;
-    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd>;
-    fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult;
-    fn poll_queue(&self, queue: usize, completed_tags: &mut CompletedTags) -> Result<()>;
+    fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()>;
+    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize, cqe: Option<CqEntry>) -> Result<UfsCmd>;
+    fn fetch_scsi_completion(&self, tag: usize, cqe: Option<CqEntry>) -> UfsScsiResult;
+    fn poll_queue(&self, queue: usize, completed: &mut CompletedRequests) -> Result<()>;
 }
 
 impl SdbTransferBackend {
@@ -786,25 +757,18 @@ impl SdbTransferBackend {
         Ok(())
     }
 
-    fn collect_completions(&self, completed_tags: &mut CompletedTags) -> Result<()> {
+    fn collect_completions(&self, requests: &mut CompletedRequests) -> Result<()> {
         let mut state = self.state.completion.lock();
         let doorbell = self.reg.read_utrl_doorbell();
         let completed = !doorbell & state.outstanding;
+        let collected = requests.insert_sdb_mask(completed)?;
 
-        state.outstanding &= !completed;
-        completed_tags.insert_sdb_mask(completed)
+        state.outstanding &= !collected;
+        Ok(())
     }
 }
 
 impl UfsTransferOps for SdbTransferBackend {
-    fn queue_depth(&self) -> usize {
-        self.reg.nutrs()
-    }
-
-    fn queue_map(&self) -> Result<UfsQueueMap> {
-        Ok(UfsQueueMap::sdb())
-    }
-
     fn compose_dev(&self, cmd: UfsDevCmd, tag: u32) -> Result<()> {
         self.dma.compose_devman_upiu(cmd, tag)
     }
@@ -818,24 +782,24 @@ impl UfsTransferOps for SdbTransferBackend {
         self.dma.compose_scsi_upiu(rq, cmd, mempool)
     }
 
-    fn submit(&self, tag: u32) -> Result<()> {
+    fn submit(&self, _queue: u32, tag: u32) -> Result<()> {
         self.submit_tag(tag)
     }
 
-    fn collect_completions(&self, completed_tags: &mut CompletedTags) -> Result<()> {
-        SdbTransferBackend::collect_completions(self, completed_tags)
+    fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()> {
+        SdbTransferBackend::collect_completions(self, completed)
     }
 
-    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
+    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize, _cqe: Option<CqEntry>) -> Result<UfsCmd> {
         self.dma.fetch_devman_upiu(cmd, tag)
     }
 
-    fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult {
+    fn fetch_scsi_completion(&self, tag: usize, _cqe: Option<CqEntry>) -> UfsScsiResult {
         self.dma.fetch_scsi_completion(tag)
     }
 
-    fn poll_queue(&self, _queue: usize, completed_tags: &mut CompletedTags) -> Result<()> {
-        SdbTransferBackend::collect_completions(self, completed_tags)
+    fn poll_queue(&self, _queue: usize, completed: &mut CompletedRequests) -> Result<()> {
+        SdbTransferBackend::collect_completions(self, completed)
     }
 
     fn dump_state(&self, tag: usize, reason: &str) {
@@ -851,33 +815,31 @@ impl UfsTransferOps for SdbTransferBackend {
 }
 
 impl McqTransferBackend {
-    fn new(reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Result<Self> {
-        if !reg.mcq_supported() {
-            return Err(ENOTSUPP);
-        }
-
-        let layout = ufs_mcq_queue_layout(&reg)?;
-        // TODO: Should not do min here for MCQ?
-        let queue_depth = core::cmp::min(reg.nutrs_mcq(), dma.transfer_slots());
-        if queue_depth > MAX_COMPLETED_TAGS {
-            return Err(EOVERFLOW);
-        }
+    fn new(config: McqConfig, reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Result<Self> {
         let oprs = reg.mcq_default_opr_set()?;
-        let completed = kvec![None; queue_depth]?;
-        let queues = Arc::pin_init(McqQueueSet::new(completed), GFP_KERNEL)?;
-        queues.allocate(&dma, layout.total_queues, queue_depth, oprs)?;
+        let mut hardware_queues = KVec::new();
+        let ring_entries = u32::try_from(config.ring_entries).map_err(|_| EOVERFLOW)?;
+        for id in 0..config.total_queues {
+            let queue = UfsMcqQueue::new(
+                dma.dev(),
+                u32::try_from(id).map_err(|_| EOVERFLOW)?,
+                ring_entries,
+                oprs,
+            )?;
+            hardware_queues.push(McqHardwareQueue::new(queue)?, GFP_KERNEL)?;
+        }
+        let queues = Arc::pin_init(McqQueueSet::new(hardware_queues), GFP_KERNEL)?;
 
         Ok(Self {
             reg,
             dma,
-            layout,
-            queue_depth,
+            config,
             queues,
         })
     }
 
     fn queue_depth(&self) -> usize {
-        self.queue_depth
+        self.config.tag_count
     }
 
     fn allocated_queues(&self) -> usize {
@@ -886,11 +848,21 @@ impl McqTransferBackend {
 
     fn prepare(&self) -> Result<()> {
         self.queues
-            .configure_registers_with_interrupt_queues(&self.reg, self.layout.interrupt_queues)
+            .configure_registers_with_interrupt_queues(&self.reg, self.config.interrupt_queues)
     }
 
     fn enable(&self) {
         self.reg.enable_mcq_mode()
+    }
+
+    fn activate(&self) -> Result<()> {
+        self.prepare()?;
+        self.reg.config_mcq_max_active_cmds(
+            u32::try_from(self.queue_depth()).map_err(|_| EOVERFLOW)?,
+        )?;
+        self.enable();
+        self.reg.enable_mcq_interrupts();
+        Ok(())
     }
 
     fn compose_dev(&self, cmd: UfsDevCmd, tag: u32) -> Result<()> {
@@ -906,9 +878,13 @@ impl McqTransferBackend {
         self.dma.compose_scsi_upiu(rq, cmd, mempool)
     }
 
-    fn submit(&self, tag: u32) -> Result<()> {
-        // TODO: How to set correct hw queue?
-        self.queues.submit(&self.reg, &self.dma, tag, Some(0))
+    fn submit(&self, queue: u32, tag: u32) -> Result<()> {
+        self.queues.submit(
+            &self.reg,
+            &self.dma,
+            usize::try_from(queue).map_err(|_| EOVERFLOW)?,
+            tag,
+        )
     }
 
     fn dump_state(&self, tag: usize, reason: &str) {
@@ -918,33 +894,31 @@ impl McqTransferBackend {
     // MCQ CQE consumption is destructive because the software CQ head advances.
     // Snapshot each CQE before returning its tag so request finalization can
     // decode the consumed CQE after the backend lock is released.
-    fn collect_completions(&self, completed_tags: &mut CompletedTags) -> Result<()> {
+    fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()> {
         self.queues.poll_completions(
             &self.reg,
             &self.dma,
-            self.layout.interrupt_queues,
-            completed_tags,
+            self.config.interrupt_queues,
+            completed,
         )
     }
 
-    fn poll_queue(&self, queue: usize, completed_tags: &mut CompletedTags) -> Result<()> {
-        if !self.layout.is_poll_queue(queue) {
+    fn poll_queue(&self, queue: usize, completed: &mut CompletedRequests) -> Result<()> {
+        if !self.config.is_poll_queue(queue) {
             return Err(EINVAL);
         }
 
         self.queues
-            .poll_completions_for_queue(&self.reg, &self.dma, queue, completed_tags)
+            .poll_completions_for_queue(&self.reg, &self.dma, queue, completed)
     }
 
-    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
-        match self.queues.take_completion(tag) {
-            Some(cqe) => self.dma.fetch_mcq_devman_upiu(cmd, tag, cqe),
-            None => Err(EIO),
-        }
+    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize, cqe: Option<CqEntry>) -> Result<UfsCmd> {
+        self.dma
+            .fetch_mcq_devman_upiu(cmd, tag, cqe.ok_or(EIO)?)
     }
 
-    fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult {
-        match self.queues.take_completion(tag) {
+    fn fetch_scsi_completion(&self, tag: usize, cqe: Option<CqEntry>) -> UfsScsiResult {
+        match cqe {
             Some(cqe) => self.dma.fetch_mcq_scsi_completion(tag, cqe),
             None => UfsScsiResult::error(0xf),
         }
@@ -952,14 +926,6 @@ impl McqTransferBackend {
 }
 
 impl UfsTransferOps for McqTransferBackend {
-    fn queue_depth(&self) -> usize {
-        McqTransferBackend::queue_depth(self)
-    }
-
-    fn queue_map(&self) -> Result<UfsQueueMap> {
-        self.layout.queue_map()
-    }
-
     fn compose_dev(&self, cmd: UfsDevCmd, tag: u32) -> Result<()> {
         McqTransferBackend::compose_dev(self, cmd, tag)
     }
@@ -973,34 +939,54 @@ impl UfsTransferOps for McqTransferBackend {
         McqTransferBackend::compose_scsi(self, cmd, rq, mempool)
     }
 
-    fn submit(&self, tag: u32) -> Result<()> {
-        McqTransferBackend::submit(self, tag)
+    fn submit(&self, queue: u32, tag: u32) -> Result<()> {
+        McqTransferBackend::submit(self, queue, tag)
     }
 
     fn dump_state(&self, tag: usize, reason: &str) {
         McqTransferBackend::dump_state(self, tag, reason);
     }
 
-    fn collect_completions(&self, completed_tags: &mut CompletedTags) -> Result<()> {
-        McqTransferBackend::collect_completions(self, completed_tags)
+    fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()> {
+        McqTransferBackend::collect_completions(self, completed)
     }
 
-    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
-        McqTransferBackend::fetch_dev(self, cmd, tag)
+    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize, cqe: Option<CqEntry>) -> Result<UfsCmd> {
+        McqTransferBackend::fetch_dev(self, cmd, tag, cqe)
     }
 
-    fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult {
-        McqTransferBackend::fetch_scsi_completion(self, tag)
+    fn fetch_scsi_completion(&self, tag: usize, cqe: Option<CqEntry>) -> UfsScsiResult {
+        McqTransferBackend::fetch_scsi_completion(self, tag, cqe)
     }
 
-    fn poll_queue(&self, queue: usize, completed_tags: &mut CompletedTags) -> Result<()> {
-        McqTransferBackend::poll_queue(self, queue, completed_tags)
+    fn poll_queue(&self, queue: usize, completed: &mut CompletedRequests) -> Result<()> {
+        McqTransferBackend::poll_queue(self, queue, completed)
     }
 }
 
 impl UfsTransferBackend {
-    fn sdb(reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Result<Self> {
-        Ok(Self::Sdb(SdbTransferBackend::new(reg, dma)?))
+    fn new(config: UfsTransferConfig, reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Result<Self> {
+        match config {
+            UfsTransferConfig::Sdb { .. } => {
+                pr_info!("[RUFS] ufs_queue: use SDB backend\n");
+                Ok(Self::Sdb(SdbTransferBackend::new(reg, dma)?))
+            }
+            UfsTransferConfig::Mcq(config) => {
+                let backend = McqTransferBackend::new(config, reg, dma)?;
+                backend.activate()?;
+                pr_info!(
+                    "[RUFS] ufs_queue: MCQ backend enabled queues={}/{} interrupt={} poll={} allocated={} depth={} ring_entries={}\n",
+                    config.total_queues,
+                    config.max_queues,
+                    config.interrupt_queues,
+                    config.poll_queues,
+                    backend.allocated_queues(),
+                    backend.queue_depth(),
+                    config.ring_entries,
+                );
+                Ok(Self::Mcq(backend))
+            }
+        }
     }
 
     fn ops(&self) -> &dyn UfsTransferOps {
@@ -1032,11 +1018,6 @@ impl UfsRequestData {
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
         cmd: UfsSCSICmd,
     ) -> Result<()> {
-        {
-            let mut inner = rq.data_ref().inner.lock();
-            inner.hw_queue = Some(rq.queue_index());
-        }
-
         let mempool = rq.queue().tag_set().data().dma_vec_mempool.clone();
         let prdt = UfsQueue::compose_scsi(rq, cmd, &mempool)?;
 
@@ -1062,7 +1043,7 @@ impl UfsRequestData {
         // dropping the DMA mapping's request reference.
         drop(rq);
 
-        match queue.submit(tag) {
+        match queue.submit(queue_id, tag) {
             Err(e) => {
                 // A failed submission did not make the request visible to
                 // hardware, so it is still owned by the driver and can be
@@ -1081,7 +1062,6 @@ impl UfsRequestData {
     fn clear(rq: &ARef<mq::Request<UfsLuBlockOps>>) {
         let mut inner = rq.data_ref().inner.lock();
         inner.prdt = None;
-        inner.hw_queue = None;
         inner.cmd = None;
     }
 
@@ -1092,13 +1072,12 @@ impl UfsRequestData {
         };
         queue.dump_backend_state(rq.tag() as usize, "request timeout");
 
-        let (cmd, prdt, hw_queue) = {
+        let (cmd, prdt) = {
             let mut inner = rq.data_ref().inner.lock();
             let cmd = inner.cmd;
             let prdt = inner.prdt.take();
-            let hw_queue = inner.hw_queue.take();
             inner.cmd = None;
-            (cmd, prdt, hw_queue)
+            (cmd, prdt)
         };
 
         if let Some(UfsCmd::SCSI(cmd)) = cmd {
@@ -1125,24 +1104,28 @@ impl UfsRequestData {
                 let mut inner = rq.data_ref().inner.lock();
                 inner.cmd = cmd;
                 inner.prdt = prdt;
-                inner.hw_queue = hw_queue;
                 false
             }
         }
     }
 
-    fn complete(rq: ARef<mq::Request<UfsLuBlockOps>>) -> bool {
-        Self::complete_with(rq, CompletionTarget::Direct)
+    fn complete(rq: ARef<mq::Request<UfsLuBlockOps>>, cqe: Option<CqEntry>) -> bool {
+        Self::complete_with(rq, cqe, CompletionTarget::Direct)
     }
 
     fn complete_polled(
         rq: ARef<mq::Request<UfsLuBlockOps>>,
+        cqe: Option<CqEntry>,
         batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>,
     ) -> bool {
-        Self::complete_with(rq, CompletionTarget::Poll(batch))
+        Self::complete_with(rq, cqe, CompletionTarget::Poll(batch))
     }
 
-    fn complete_with(rq: ARef<mq::Request<UfsLuBlockOps>>, target: CompletionTarget<'_>) -> bool {
+    fn complete_with(
+        rq: ARef<mq::Request<UfsLuBlockOps>>,
+        cqe: Option<CqEntry>,
+        target: CompletionTarget<'_>,
+    ) -> bool {
         let cmd = rq
             .data_ref()
             .inner
@@ -1156,7 +1139,7 @@ impl UfsRequestData {
                     panic!("Invalid context")
                 };
                 let cmd = queue
-                    .fetch_dev(cmd, rq.tag() as usize)
+                    .fetch_dev(cmd, rq.tag() as usize, cqe)
                     .expect("Expected dev cmd");
                 rq.data_ref().inner.lock().cmd = Some(cmd);
                 Owned::try_from(rq)
@@ -1169,7 +1152,7 @@ impl UfsRequestData {
                     panic!("Invalid context")
                 };
                 let queue = &lu.queue;
-                let result = queue.fetch_scsi_completion(rq.tag() as usize);
+                let result = queue.fetch_scsi_completion(rq.tag() as usize, cqe);
                 Self::clear(&rq);
 
                 queue.clone().complete_scsi(cmd, result, rq, target);
@@ -1182,26 +1165,19 @@ impl UfsRequestData {
 #[pin_data]
 pub(crate) struct UfsQueue {
     pub(crate) tags: Arc<TagSet<UfsLuBlockOps>>,
-
-    #[pin]
-    backend: SpinLock<UfsTransferBackend>,
+    backend: UfsTransferBackend,
 }
 
 impl UfsQueue {
-    pub(crate) fn new(reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Result<Arc<Self>> {
-        if reg.mcq_supported() {
-            pr_info!(
-                "[RUFS] ufs_queue: MCQ supported by controller mcq_depth={}\n",
-                reg.nutrs_mcq(),
-            );
-        }
-
-        let backend = UfsTransferBackend::sdb(reg, dma)?;
-        let max_concurrent_requests = backend.ops().queue_depth();
-        let queue_map = backend.ops().queue_map()?;
+    pub(crate) fn new(
+        config: UfsTransferConfig,
+        reg: Arc<UfsReg>,
+        dma: Arc<UfsDma>,
+    ) -> Result<Arc<Self>> {
+        let backend = UfsTransferBackend::new(config, reg, dma)?;
+        let queue_map = config.queue_map()?;
         let nr_hw_queues = queue_map.nr_hw_queues();
-        // TODO: Do we need this sub by one when we do not reserve a request for UfsDev?
-        let blk_mq_tag_count = max_concurrent_requests.checked_sub(1).ok_or(EINVAL)?;
+        let blk_mq_tag_count = config.tag_count();
         if blk_mq_tag_count == 0 || nr_hw_queues == 0 {
             return Err(EINVAL);
         }
@@ -1215,6 +1191,8 @@ impl UfsQueue {
             GFP_KERNEL,
         )?;
 
+        let mut tagset_flags = kernel::block::mq::tag_set::Flags::default();
+        tagset_flags |= kernel::block::mq::tag_set::Flag::TagHctxShared;
         let tagset = Arc::pin_init(
             TagSet::<UfsLuBlockOps>::new(
                 nr_hw_queues as u32,
@@ -1222,7 +1200,7 @@ impl UfsQueue {
                 u32::try_from(blk_mq_tag_count).map_err(|_| EOVERFLOW)?,
                 queue_map.num_maps(),
                 kernel::alloc::NumaNode::NO_NODE,
-                kernel::block::mq::tag_set::Flags::default(),
+                tagset_flags,
             ),
             GFP_KERNEL,
         )?;
@@ -1230,7 +1208,7 @@ impl UfsQueue {
         let queue = Arc::pin_init(
             try_pin_init!(Self {
                 tags <- tagset,
-                backend <- new_spinlock!(backend),
+                backend,
             }),
             GFP_KERNEL,
         )?;
@@ -1238,34 +1216,9 @@ impl UfsQueue {
         Ok(queue)
     }
 
-    pub(crate) fn enable_mcq_backend(&self, reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Result<()> {
-        let backend = McqTransferBackend::new(reg, dma)?;
-        backend.prepare()?;
-        backend.reg.config_mcq_max_active_cmds(
-            u32::try_from(backend.queue_depth()).map_err(|_| EOVERFLOW)?,
-        )?;
-        backend.enable();
-        backend.reg.enable_mcq_interrupts();
-
-        let layout = backend.layout;
-        let queue_depth = backend.queue_depth();
-        let allocated_queues = backend.allocated_queues();
-        *self.backend.lock() = UfsTransferBackend::Mcq(backend);
-        pr_info!(
-            "[RUFS] ufs_queue: MCQ backend enabled queues={}/{} interrupt={} poll={} allocated={} depth={}\n",
-            layout.total_queues,
-            layout.max_queues,
-            layout.interrupt_queues,
-            layout.poll_queues,
-            allocated_queues,
-            queue_depth,
-        );
-        Ok(())
-    }
-
     // Issuing
     pub(crate) fn compose_dev(&self, cmd: UfsDevCmd, tag: u32) -> Result<()> {
-        self.backend.lock().ops().compose_dev(cmd, tag)
+        self.backend.ops().compose_dev(cmd, tag)
     }
 
     fn compose_scsi(
@@ -1278,47 +1231,59 @@ impl UfsQueue {
             QueueData::Lu(ufs_lu) => &ufs_lu.queue,
         };
 
-        queue.backend.lock().ops().compose_scsi(cmd, rq, mempool)
+        queue.backend.ops().compose_scsi(cmd, rq, mempool)
     }
 
-    fn submit(&self, tag: u32) -> Result<()> {
-        self.backend.lock().ops().submit(tag)
+    fn submit(&self, queue: u32, tag: u32) -> Result<()> {
+        self.backend.ops().submit(queue, tag)
     }
 
-    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
-        self.backend.lock().ops().fetch_dev(cmd, tag)
+    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize, cqe: Option<CqEntry>) -> Result<UfsCmd> {
+        self.backend.ops().fetch_dev(cmd, tag, cqe)
     }
 
-    fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult {
-        self.backend.lock().ops().fetch_scsi_completion(tag)
+    fn fetch_scsi_completion(&self, tag: usize, cqe: Option<CqEntry>) -> UfsScsiResult {
+        self.backend.ops().fetch_scsi_completion(tag, cqe)
     }
 
-    fn collect_backend_completions(&self, completed_tags: &mut CompletedTags) -> Result<()> {
-        self.backend.lock().ops().collect_completions(completed_tags)
+    fn collect_backend_completions(&self, completed: &mut CompletedRequests) -> Result<()> {
+        self.backend.ops().collect_completions(completed)
     }
 
     fn dump_backend_state(&self, tag: usize, reason: &str) {
-        self.backend.lock().ops().dump_state(tag, reason);
+        self.backend.ops().dump_state(tag, reason);
     }
 
-    fn poll_backend_queue(&self, queue: usize, completed_tags: &mut CompletedTags) -> Result<()> {
-        self.backend.lock().ops().poll_queue(queue, completed_tags)
+    fn poll_backend_queue(&self, queue: usize, completed: &mut CompletedRequests) -> Result<()> {
+        self.backend.ops().poll_queue(queue, completed)
     }
 
-    fn request_at_tag(&self, tag: u32) -> ARef<mq::Request<UfsLuBlockOps>> {
-        self.tags.tag_to_rq(0, tag).expect("Expected to find tag")
+    fn request_at_shared_tag(&self, tag: u32) -> ARef<mq::Request<UfsLuBlockOps>> {
+        // TagHctxShared makes every hctx point at the same tag map. The UFS
+        // task tag is therefore sufficient request identity; CQ identity is
+        // only needed while draining the hardware queue.
+        self.tags
+            .tag_to_rq(0, tag)
+            .expect("Expected to find tag")
     }
 
-    fn complete_tag(&self, tag: u32) -> bool {
-        UfsRequestData::complete(self.request_at_tag(tag))
+    fn complete_tag(&self, request: CompletedRequest) -> bool {
+        UfsRequestData::complete(
+            self.request_at_shared_tag(request.tag as u32),
+            request.cqe,
+        )
     }
 
     fn complete_polled_tag(
         &self,
-        tag: u32,
+        request: CompletedRequest,
         batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>,
     ) -> bool {
-        UfsRequestData::complete_polled(self.request_at_tag(tag), batch)
+        UfsRequestData::complete_polled(
+            self.request_at_shared_tag(request.tag as u32),
+            request.cqe,
+            batch,
+        )
     }
 
     pub(crate) fn complete(self: &Arc<Self>) -> bool {
@@ -1328,22 +1293,28 @@ impl UfsQueue {
         // locks that are shared with submission and hands requests back to
         // blk-mq. Once those lock domains are IRQ-safe, this path can move into
         // hard IRQ context.
-        let mut completed_tags = CompletedTags::new();
-        if let Err(e) = self.collect_backend_completions(&mut completed_tags) {
-            pr_err!(
-                "[RUFS] ufs_queue: collect completions failed errno={}\n",
-                e.to_errno(),
-            );
-            self.dump_backend_state(0, "collect completions failed");
-            return false;
+        let mut any_completed = false;
+        loop {
+            let mut requests = CompletedRequests::new();
+            if let Err(e) = self.collect_backend_completions(&mut requests) {
+                pr_err!(
+                    "[RUFS] ufs_queue: collect completions failed errno={}\n",
+                    e.to_errno(),
+                );
+                self.dump_backend_state(0, "collect completions failed");
+                return any_completed;
+            }
+
+            let batch_full = requests.is_full();
+            while let Some(request) = requests.take_next() {
+                any_completed |= self.complete_tag(request);
+            }
+            if !batch_full {
+                break;
+            }
         }
 
-        let mut completed = false;
-        while let Some(tag) = completed_tags.take_next() {
-            completed |= self.complete_tag(tag as u32);
-        }
-
-        completed
+        any_completed
     }
 
     pub(crate) fn poll(
@@ -1351,22 +1322,28 @@ impl UfsQueue {
         hw_queue: usize,
         batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>,
     ) -> bool {
-        let mut completed_tags = CompletedTags::new();
-        if let Err(e) = self.poll_backend_queue(hw_queue, &mut completed_tags) {
-            pr_err!(
-                "[RUFS] ufs_queue: poll queue {} failed errno={}\n",
-                hw_queue,
-                e.to_errno(),
-            );
-            return false;
+        let mut any_completed = false;
+        loop {
+            let mut requests = CompletedRequests::new();
+            if let Err(e) = self.poll_backend_queue(hw_queue, &mut requests) {
+                pr_err!(
+                    "[RUFS] ufs_queue: poll queue {} failed errno={}\n",
+                    hw_queue,
+                    e.to_errno(),
+                );
+                return any_completed;
+            }
+
+            let batch_full = requests.is_full();
+            while let Some(request) = requests.take_next() {
+                any_completed |= self.complete_polled_tag(request, batch);
+            }
+            if !batch_full {
+                break;
+            }
         }
 
-        let mut completed = false;
-        while let Some(tag) = completed_tags.take_next() {
-            completed |= self.complete_polled_tag(tag as u32, batch);
-        }
-
-        completed
+        any_completed
     }
 
     fn complete_scsi(
