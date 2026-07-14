@@ -286,6 +286,7 @@ pub(crate) struct UfsRequestData {
 pub(crate) struct TagSetData {
     pub(crate) dma_vec_mempool: DmaMapMempool<MAX_PRD_ENTRIES>,
     pub(crate) queue_map: UfsQueueMap,
+    pub(crate) hw_queues: KVec<UfsHwQueue>,
 }
 
 pub(crate) enum QueueData {
@@ -297,7 +298,7 @@ pub(crate) enum QueueData {
 impl Operations for UfsLuBlockOps {
     type RequestData = UfsRequestData;
     type QueueData = KBox<QueueData>;
-    type HwData = KBox<u32>;
+    type HwData = KBox<UfsHwQueue>;
     type TagSetData = KBox<TagSetData>;
     type GenDiskData = ();
 
@@ -309,7 +310,7 @@ impl Operations for UfsLuBlockOps {
     }
 
     fn queue_rq(
-        _hw_data: &u32,
+        hw_queue: &UfsHwQueue,
         lu: &QueueData,
         rq: Owned<IdleRequest<Self>>,
         _is_last: bool,
@@ -433,7 +434,7 @@ impl Operations for UfsLuBlockOps {
                     complete_unsubmitted(rq, e);
                     return Ok(());
                 }
-                if let Err((rq, e)) = UfsRequestData::submit(rq) {
+                if let Err((rq, e)) = UfsRequestData::submit(rq, hw_queue) {
                     complete_unsubmitted(rq, e);
                 }
                 return Ok(());
@@ -456,19 +457,22 @@ impl Operations for UfsLuBlockOps {
             return Ok(());
         }
 
-        if let Err((rq, e)) = UfsRequestData::submit(rq) {
+        if let Err((rq, e)) = UfsRequestData::submit(rq, hw_queue) {
             complete_unsubmitted(rq, e);
         }
 
         Ok(())
     }
 
-    fn commit_rqs(_hw_data: &u32, _queue_data: &QueueData) {}
+    fn commit_rqs(_hw_data: &UfsHwQueue, _queue_data: &QueueData) {}
 
-    fn init_hctx(_tagset_data: &TagSetData, hctx_idx: u32) -> Result<Self::HwData> {
-        // Remember which hardware queue this context drives, so `poll` can find
-        // the matching backend completion queue.
-        Ok(KBox::new(hctx_idx, GFP_KERNEL)?)
+    fn init_hctx(tagset_data: &TagSetData, hctx_idx: u32) -> Result<Self::HwData> {
+        let hw_queue = tagset_data
+            .hw_queues
+            .get(hctx_idx as usize)
+            .ok_or(EINVAL)?
+            .clone();
+        Ok(KBox::new(hw_queue, GFP_KERNEL)?)
     }
 
     fn complete(rq: ARef<mq::Request<Self>>) {
@@ -503,14 +507,14 @@ impl Operations for UfsLuBlockOps {
     }
 
     fn poll(
-        hw_data: &u32,
+        hw_queue: &UfsHwQueue,
         queue_data: &QueueData,
         batch: &mut mq::IoCompletionBatch<Self>,
     ) -> Result<bool> {
         let QueueData::Lu(lu) = queue_data else {
             return Err(EIO);
         };
-        Ok(lu.queue.poll(*hw_data as usize, batch))
+        Ok(lu.queue.poll(hw_queue, batch))
     }
 
     fn map_queues(tag_set: Pin<&mut TagSet<Self>>) {
