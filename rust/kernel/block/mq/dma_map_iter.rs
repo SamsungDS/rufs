@@ -9,6 +9,7 @@ use crate::{
     sync::{aref::ARef, Arc},
     types::Opaque,
 };
+use core::ptr::NonNull;
 
 use super::{Operations, Request};
 
@@ -41,7 +42,7 @@ impl<const N: usize, T: Operations> DmaMapIter<N, T> {
 
         let ok = unsafe {
             bindings::blk_rq_dma_map_iter_start(
-                this.inner.request.as_raw(),
+                this.inner.request().as_raw(),
                 device.as_raw(),
                 this.inner.state.get(),
                 this.iter.get(),
@@ -66,7 +67,7 @@ impl<const N: usize, T: Operations> DmaMapIter<N, T> {
     pub fn next(&mut self) -> Result {
         let ok = unsafe {
             bindings::blk_rq_dma_map_iter_next(
-                self.inner.request.as_raw(),
+                self.inner.request().as_raw(),
                 self.inner.device.as_raw(),
                 self.iter.get(),
             )
@@ -95,12 +96,26 @@ impl<const N: usize, T: Operations> DmaMapIter<N, T> {
         let Self { iter: _, inner } = self;
         DmaMapIterMapped { _inner: inner }
     }
+
+    /// Consume the iterator without retaining a request reference.
+    ///
+    /// # Safety
+    ///
+    /// The request must remain owned by the driver until the returned mapping
+    /// is dropped. In particular, the caller must drop the mapping before
+    /// completing or requeuing the request.
+    pub unsafe fn finish_detached(self) -> DmaMapIterMapped<N, T> {
+        let Self { iter: _, mut inner } = self;
+        inner.request_ref = None;
+        DmaMapIterMapped { _inner: inner }
+    }
 }
 
 /// The result of a completed DMA mapping iteration.
 pub struct DmaMapIterInner<const N: usize, T: Operations> {
     state: Opaque<bindings::dma_iova_state>,
-    request: ARef<Request<T>>,
+    request: NonNull<Request<T>>,
+    request_ref: Option<ARef<Request<T>>>,
     device: ARef<Device>,
     dma_vectors: MemPoolBox<[DmaVector; N]>,
     dma_vector_count: usize,
@@ -108,9 +123,11 @@ pub struct DmaMapIterInner<const N: usize, T: Operations> {
 
 impl<const N: usize, T: Operations> DmaMapIterInner<N, T> {
     fn new(rq: ARef<Request<T>>, device: &Device, mempool: DmaMapMempool<N>) -> Result<Self> {
+        let request = NonNull::from(&*rq);
         Ok(Self {
             state: Opaque::zeroed(),
-            request: rq,
+            request,
+            request_ref: Some(rq),
             device: device.into(),
             dma_vectors: mempool.alloc_zeroed(GFP_ATOMIC)?,
             dma_vector_count: 0,
@@ -136,6 +153,12 @@ impl<const N: usize, T: Operations> DmaMapIterInner<N, T> {
 
         Ok(())
     }
+
+    fn request(&self) -> &Request<T> {
+        // SAFETY: A normal mapping retains `request_ref`. A detached mapping
+        // requires its caller to keep the request driver-owned until drop.
+        unsafe { self.request.as_ref() }
+    }
 }
 
 impl<const N: usize, T: Operations> Drop for DmaMapIterInner<N, T> {
@@ -146,7 +169,7 @@ impl<const N: usize, T: Operations> Drop for DmaMapIterInner<N, T> {
         // recording of the vectos to unmap.
         if !unsafe {
             bindings::blk_rq_dma_unmap(
-                self.request.as_raw(),
+                self.request().as_raw(),
                 self.device.as_raw(),
                 self.state.get(),
                 self.total_length(),
@@ -159,7 +182,7 @@ impl<const N: usize, T: Operations> Drop for DmaMapIterInner<N, T> {
                         self.device.as_raw(),
                         mapping.address,
                         mapping.length as usize,
-                        self.request.dma_direction().into(),
+                        self.request().dma_direction().into(),
                         0,
                     )
                 };
