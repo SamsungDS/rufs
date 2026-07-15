@@ -14,6 +14,7 @@ use kernel::block::mq::{
     self, BoundRequestQueue, IdleRequest, LimitsBuilder, Request, RequestQueue,
 };
 use kernel::error::{from_err_ptr, to_result};
+use kernel::io::poll::read_poll_timeout;
 use kernel::sync::{aref::ARef, Arc, Mutex};
 use kernel::time::{delay, Delta};
 use kernel::types::Owned;
@@ -791,27 +792,31 @@ impl UfsDev {
     }
 
     pub(crate) fn complete_dev_init(&self) -> Result<()> {
-        let mut timeout = Delta::from_millis(FDEVICE_COMPL_TIMEOUT_MS);
-        let tick = Delta::from_micros(FDEVICE_COMPL_TICK_US);
-
         self.set_flag(FlagIdn::FDeviceInit, 0, 0)?;
 
-        while !timeout.is_zero() && !timeout.is_negative() {
-            match self.read_flag(FlagIdn::FDeviceInit, 0, 0)? {
-                0 => {
-                    pr_info!("[RUFS] ufs_dev: device initialized");
-                    return Ok(());
-                }
-                _ => {
-                    pr_info!("[RUFS] ufs_dev: device not initialized... try again");
-                    timeout -= tick;
-                    delay::fsleep(tick);
-                }
+        let result = read_poll_timeout(
+            || self.read_flag(FlagIdn::FDeviceInit, 0, 0),
+            |flag: &u8| *flag == 0,
+            Delta::from_micros(FDEVICE_COMPL_TICK_US),
+            Delta::from_millis(FDEVICE_COMPL_TIMEOUT_MS),
+        );
+        match result {
+            Ok(_) => {
+                pr_info!("[RUFS] ufs_dev: device initialized\n");
+                Ok(())
+            }
+            Err(ETIMEDOUT) => {
+                pr_err!("[RUFS] ufs_dev: fDeviceInit was not cleared\n");
+                Err(EBUSY)
+            }
+            Err(e) => {
+                pr_err!(
+                    "[RUFS] ufs_dev: failed to read fDeviceInit errno={}\n",
+                    e.to_errno(),
+                );
+                Err(e)
             }
         }
-
-        pr_info!("[RUFS] ufs_dev: device not initialized");
-        Err(ENODEV)
     }
 
     pub(crate) fn device_params_init(&self) -> Result<()> {
