@@ -11,7 +11,6 @@ use kernel::block::error::code::BLK_STS_IOERR;
 use kernel::block::mq::gen_disk::BoundGenDisk;
 use kernel::block::mq::LimitsBuilder;
 use kernel::block::mq::RequestQueue;
-use kernel::sync::atomic::{Acquire, Atomic, Relaxed};
 use kernel::sync::{Arc, Mutex, SpinLock};
 use kernel::types::{OwnableRefCounted, Owned};
 use kernel::{
@@ -280,7 +279,6 @@ fn complete_unsubmitted(rq: ARef<mq::Request<UfsLuBlockOps>>, e: Error) {
 pub(crate) struct UfsRequestData {
     #[pin]
     pub(crate) inner: SpinLock<UfsRequestInner>,
-    pub(crate) status: Atomic<u32>,
 }
 
 pub(crate) struct TagSetData {
@@ -305,7 +303,6 @@ impl Operations for UfsLuBlockOps {
     fn new_request_data() -> impl PinInit<Self::RequestData> {
         pin_init!(UfsRequestData {
             inner <- new_spinlock!(UfsRequestInner::default()),
-            status: Atomic::new(u32::from(bindings::BLK_STS_OK)),
         })
     }
 
@@ -446,10 +443,10 @@ impl Operations for UfsLuBlockOps {
             }
         };
 
-        // From here the driver takes shared ownership of the request and is
-        // responsible for completing it exactly once. Normal completion hands
-        // this reference to blk-mq completion; requeue and poll fallback paths
-        // reclaim unique ownership first because those APIs require it.
+        // Make the request discoverable through its blk-mq tag while composing
+        // it. Submission drops this temporary reference before exposing the
+        // command to hardware. Completion later recovers unique ownership from
+        // the same tag after releasing the DMA mapping.
         let rq = OwnableRefCounted::into_shared(rq.start());
 
         if let Err(e) = UfsRequestData::compose_scsi_cmd(&rq, cmd) {
@@ -476,28 +473,28 @@ impl Operations for UfsLuBlockOps {
     }
 
     fn complete(rq: ARef<mq::Request<Self>>) {
-        let rq = OwnableRefCounted::try_from_shared(rq)
-            .map_err(|_| EBUSY)
-            .expect("rufs: request completion failed");
-        let status = rq.data_ref().status.load(Acquire);
-        rq.data_ref()
-            .status
-            .store(u32::from(bindings::BLK_STS_OK), Relaxed);
-        let status = u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8);
-
-        rq.end(status);
+        match OwnableRefCounted::try_from_shared(rq) {
+            Ok(rq) => {
+                let status = rq
+                    .data_ref()
+                    .inner
+                    .lock()
+                    .finish_scheduled_completion()
+                    .unwrap_or(u32::from(bindings::BLK_STS_IOERR));
+                rq.end(u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8));
+            }
+            Err(_) => pr_err!("[RUFS] ufs_lu: scheduled completion ownership conflict\n"),
+        }
     }
 
     fn request_timeout(
-        tag_set: &TagSet<Self>,
-        queue_id: u32,
+        _tag_set: &TagSet<Self>,
+        request_data: &UfsRequestData,
+        queue_data: &QueueData,
+        _queue_id: u32,
         tag: u32,
     ) -> mq::RequestTimeoutStatus {
-        let status = if let Some(rq) = tag_set.tag_to_rq(queue_id, tag) {
-            UfsRequestData::timeout(rq)
-        } else {
-            true
-        };
+        let status = UfsRequestData::timeout(request_data, queue_data, tag);
 
         if status {
             mq::RequestTimeoutStatus::Completed

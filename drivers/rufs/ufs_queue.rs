@@ -9,7 +9,7 @@ use kernel::block::mq;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;
 use kernel::block::mq::TagSet;
 use kernel::cpu;
-use kernel::sync::atomic::Release;
+use kernel::sync::atomic::{Acquire, Atomic, Release};
 use kernel::sync::{aref::ARef, barrier, Arc, SpinLock, SpinLockIrq};
 use kernel::types::OwnableRefCounted;
 use kernel::{bindings, new_spinlock, new_spinlock_irq, prelude::*};
@@ -423,7 +423,21 @@ enum UfsRequestState {
         cmd: UfsCmd,
         prdt: Option<UfsPrdtMapping>,
     },
+    Recovering {
+        cmd: UfsCmd,
+        prdt: Option<UfsPrdtMapping>,
+    },
+    Completing {
+        status: u32,
+    },
     DeviceComplete(UfsDevCmd),
+}
+
+enum TimeoutDisposition {
+    StartRecovery(UfsCmd),
+    Recovering(UfsCmd),
+    Pending(UfsCmd),
+    Completed,
 }
 
 impl Default for UfsRequestInner {
@@ -475,10 +489,16 @@ impl UfsRequestInner {
         Ok(())
     }
 
-    fn take_in_flight(&mut self) -> Result<(UfsCmd, Option<UfsPrdtMapping>)> {
+    fn begin_completion(&mut self) -> Result<(UfsCmd, Option<UfsPrdtMapping>)> {
         let state = core::mem::replace(&mut self.state, UfsRequestState::Idle);
         match state {
-            UfsRequestState::InFlight { cmd, prdt } => Ok((cmd, prdt)),
+            UfsRequestState::InFlight { cmd, prdt }
+            | UfsRequestState::Recovering { cmd, prdt } => {
+                self.state = UfsRequestState::Completing {
+                    status: u32::from(bindings::BLK_STS_OK),
+                };
+                Ok((cmd, prdt))
+            }
             state => {
                 self.state = state;
                 Err(EIO)
@@ -486,18 +506,67 @@ impl UfsRequestInner {
         }
     }
 
-    fn in_flight_command(&self) -> Option<UfsCmd> {
-        match self.state {
-            UfsRequestState::InFlight { cmd, .. } => Some(cmd),
-            _ => None,
+    fn timeout(&mut self) -> TimeoutDisposition {
+        let state = core::mem::replace(&mut self.state, UfsRequestState::Idle);
+        match state {
+            UfsRequestState::Prepared { cmd, prdt } => {
+                self.state = UfsRequestState::Prepared { cmd, prdt };
+                TimeoutDisposition::Pending(cmd)
+            }
+            UfsRequestState::InFlight { cmd, prdt } => {
+                self.state = UfsRequestState::Recovering { cmd, prdt };
+                TimeoutDisposition::StartRecovery(cmd)
+            }
+            UfsRequestState::Recovering { cmd, prdt } => {
+                self.state = UfsRequestState::Recovering { cmd, prdt };
+                TimeoutDisposition::Recovering(cmd)
+            }
+            state => {
+                self.state = state;
+                TimeoutDisposition::Completed
+            }
         }
     }
 
     fn complete_device(&mut self, cmd: UfsDevCmd) -> Result<()> {
-        if !matches!(self.state, UfsRequestState::Idle) {
+        if !matches!(self.state, UfsRequestState::Completing { .. }) {
             return Err(EIO);
         }
         self.state = UfsRequestState::DeviceComplete(cmd);
+        Ok(())
+    }
+
+    fn set_completion_status(&mut self, status: u32) -> Result<()> {
+        let UfsRequestState::Completing {
+            status: completion_status,
+        } = &mut self.state
+        else {
+            return Err(EIO);
+        };
+        *completion_status = status;
+        Ok(())
+    }
+
+    pub(crate) fn finish_scheduled_completion(&mut self) -> Result<u32> {
+        let state = core::mem::replace(&mut self.state, UfsRequestState::Idle);
+        match state {
+            UfsRequestState::Completing { status } => Ok(status),
+            UfsRequestState::DeviceComplete(cmd) => {
+                self.state = UfsRequestState::DeviceComplete(cmd);
+                Ok(u32::from(bindings::BLK_STS_OK))
+            }
+            state => {
+                self.state = state;
+                Err(EIO)
+            }
+        }
+    }
+
+    fn finish_direct_completion(&mut self) -> Result<()> {
+        if !matches!(self.state, UfsRequestState::Completing { .. }) {
+            return Err(EIO);
+        }
+        self.state = UfsRequestState::Idle;
         Ok(())
     }
 
@@ -540,10 +609,17 @@ struct CompletedRequest {
     cqe: Option<CqEntry>,
 }
 
+#[derive(Clone, Copy)]
+struct CompletionFault {
+    reason: &'static str,
+    tag: usize,
+}
+
 struct CompletedRequests {
     requests: [Option<CompletedRequest>; COMPLETION_BATCH_SIZE],
     len: usize,
     pos: usize,
+    fault: Option<CompletionFault>,
 }
 
 impl CompletedRequests {
@@ -552,6 +628,7 @@ impl CompletedRequests {
             requests: [None; COMPLETION_BATCH_SIZE],
             len: 0,
             pos: 0,
+            fault: None,
         }
     }
 
@@ -581,6 +658,16 @@ impl CompletedRequests {
 
     fn is_full(&self) -> bool {
         self.len == self.requests.len()
+    }
+
+    fn record_fault(&mut self, reason: &'static str, tag: usize) {
+        if self.fault.is_none() {
+            self.fault = Some(CompletionFault { reason, tag });
+        }
+    }
+
+    fn take_fault(&mut self) -> Option<CompletionFault> {
+        self.fault.take()
     }
 
     fn take_next(&mut self) -> Option<CompletedRequest> {
@@ -642,8 +729,13 @@ impl McqHardwareQueue {
             while !completion.is_empty() && !completed_requests.is_full() {
                 consumed = true;
                 if let Some(cqe) = completion.consume_entry(&self.descriptor)? {
-                    let tag = dma.tag_from_cq_entry(&cqe)?;
-                    completed_requests.insert(tag, Some(cqe))?;
+                    match dma.tag_from_cq_entry(&cqe) {
+                        Ok(tag) => completed_requests.insert(tag, Some(cqe))?,
+                        Err(_) => completed_requests.record_fault(
+                            "invalid MCQ completion tag",
+                            usize::from(cqe.task_tag()),
+                        ),
+                    }
                 }
             }
             Ok(())
@@ -1175,6 +1267,10 @@ impl UfsRequestData {
         let queue_id = hw_queue.id();
         let tag = rq.tag();
 
+        if queue.recovery_required() {
+            return Err((rq, EBUSY));
+        }
+
         if rq.queue_index() != queue_id {
             return Err((rq, EINVAL));
         }
@@ -1206,25 +1302,38 @@ impl UfsRequestData {
         }
     }
 
-    pub(crate) fn timeout(rq: ARef<mq::Request<UfsLuBlockOps>>) -> bool {
-        let queue = match rq.queue_data() {
+    pub(crate) fn timeout(
+        request_data: &UfsRequestData,
+        queue_data: &QueueData,
+        tag: u32,
+    ) -> bool {
+        let queue = match queue_data {
             QueueData::Dev(queue) => queue.clone(),
             QueueData::Lu(lu) => lu.queue.clone(),
         };
-        queue.dump_backend_state(rq.tag() as usize, "request timeout");
+        queue.dump_backend_state(tag as usize, "request timeout");
 
-        let cmd = rq.data_ref().inner.lock().in_flight_command();
+        let disposition = request_data.inner.lock().timeout();
+        let cmd = match disposition {
+            TimeoutDisposition::StartRecovery(cmd) => {
+                queue.require_recovery("request timeout", tag as usize);
+                Some(cmd)
+            }
+            TimeoutDisposition::Recovering(cmd) => Some(cmd),
+            TimeoutDisposition::Pending(cmd) => Some(cmd),
+            TimeoutDisposition::Completed => return true,
+        };
 
         if let Some(UfsCmd::SCSI(cmd)) = cmd {
             let cdb = cmd.cdb();
             pr_err!(
                 "[RUFS] ufs_queue: SCSI request timeout tag={} lun={} opcode=0x{:02x}\n",
-                rq.tag(),
+                tag,
                 cmd.lun(),
                 cdb[0],
             );
         } else {
-            pr_err!("[RUFS] ufs_queue: request timeout tag={}\n", rq.tag());
+            pr_err!("[RUFS] ufs_queue: request timeout tag={}\n", tag);
         }
         // Do not release the tag until recovery has stopped hardware and
         // prevented a late completion from referring to a reused request.
@@ -1248,12 +1357,20 @@ impl UfsRequestData {
         cqe: Option<CqEntry>,
         target: CompletionTarget<'_>,
     ) -> bool {
-        let (cmd, prdt) = match rq.data_ref().inner.lock().take_in_flight() {
+        let request_queue = match rq.queue_data() {
+            QueueData::Dev(queue) => queue.clone(),
+            QueueData::Lu(lu) => lu.queue.clone(),
+        };
+        let (cmd, prdt) = match rq.data_ref().inner.lock().begin_completion() {
             Ok(state) => state,
             Err(_) => {
                 pr_err!(
                     "[RUFS] ufs_queue: completion for inactive request tag={}\n",
                     rq.tag(),
+                );
+                request_queue.require_recovery(
+                    "completion for inactive request",
+                    rq.tag() as usize,
                 );
                 return false;
             }
@@ -1264,42 +1381,38 @@ impl UfsRequestData {
                 let QueueData::Dev(queue) = rq.queue_data() else {
                     pr_err!("[RUFS] ufs_queue: device request has invalid context\n");
                     drop(prdt);
-                    rq.data_ref()
-                        .status
-                        .store(u32::from(bindings::BLK_STS_IOERR), Release);
-                    mq::Request::complete(rq);
-                    return true;
+                    let status = u32::from(bindings::BLK_STS_IOERR);
+                    let _ = rq.data_ref().inner.lock().set_completion_status(status);
+                    return Self::end_device_request(rq, request_queue, status, false);
                 };
                 let result = queue.fetch_dev(cmd, rq.tag() as usize, cqe);
                 drop(prdt);
-                match result {
+                let (status, preserve_result) = match result {
                     Ok(UfsCmd::Device(cmd)) => {
                         if rq.data_ref().inner.lock().complete_device(cmd).is_err() {
                             pr_err!("[RUFS] ufs_queue: invalid device completion state\n");
-                            rq.data_ref()
-                                .status
-                                .store(u32::from(bindings::BLK_STS_IOERR), Release);
+                            (u32::from(bindings::BLK_STS_IOERR), false)
+                        } else {
+                            (u32::from(bindings::BLK_STS_OK), true)
                         }
                     }
                     _ => {
                         pr_err!("[RUFS] ufs_queue: failed to fetch device response\n");
-                        rq.data_ref()
-                            .status
-                            .store(u32::from(bindings::BLK_STS_IOERR), Release);
+                        (u32::from(bindings::BLK_STS_IOERR), false)
                     }
+                };
+                if !preserve_result {
+                    let _ = rq.data_ref().inner.lock().set_completion_status(status);
                 }
-                mq::Request::complete(rq);
-                true
+                Self::end_device_request(rq, request_queue, status, preserve_result)
             }
             UfsCmd::SCSI(cmd) => {
                 let QueueData::Lu(lu) = rq.queue_data() else {
                     pr_err!("[RUFS] ufs_queue: SCSI request has invalid context\n");
                     drop(prdt);
-                    rq.data_ref()
-                        .status
-                        .store(u32::from(bindings::BLK_STS_IOERR), Release);
-                    mq::Request::complete(rq);
-                    return true;
+                    let status = u32::from(bindings::BLK_STS_IOERR);
+                    let _ = rq.data_ref().inner.lock().set_completion_status(status);
+                    return Self::end_device_request(rq, request_queue, status, false);
                 };
                 let queue = &lu.queue;
                 let result = queue.fetch_scsi_completion(rq.tag() as usize, cqe);
@@ -1310,12 +1423,36 @@ impl UfsRequestData {
             }
         }
     }
+
+    fn end_device_request(
+        rq: ARef<mq::Request<UfsLuBlockOps>>,
+        queue: Arc<UfsQueue>,
+        status: u32,
+        preserve_result: bool,
+    ) -> bool {
+        let tag = rq.tag();
+        let rq = match OwnableRefCounted::try_from_shared(rq) {
+            Ok(rq) => rq,
+            Err(_rq) => {
+                queue.require_recovery("device completion ownership conflict", tag as usize);
+                return false;
+            }
+        };
+
+        if !preserve_result && rq.data_ref().inner.lock().finish_direct_completion().is_err() {
+            queue.require_recovery("invalid device completion state", tag as usize);
+            return false;
+        }
+        rq.end(u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8));
+        true
+    }
 }
 
 #[pin_data]
 pub(crate) struct UfsQueue {
     pub(crate) tags: Arc<TagSet<UfsLuBlockOps>>,
     backend: UfsTransferBackend,
+    recovery_required: Atomic<u32>,
 }
 
 impl UfsQueue {
@@ -1361,11 +1498,27 @@ impl UfsQueue {
             try_pin_init!(Self {
                 tags <- tagset,
                 backend,
+                recovery_required: Atomic::new(0),
             }),
             GFP_KERNEL,
         )?;
 
         Ok(queue)
+    }
+
+    fn recovery_required(&self) -> bool {
+        self.recovery_required.load(Acquire) != 0
+    }
+
+    pub(crate) fn require_recovery(&self, reason: &str, tag: usize) {
+        if !self.recovery_required() {
+            pr_err!(
+                "[RUFS] ufs_queue: recovery required reason={} tag={}\n",
+                reason,
+                tag,
+            );
+        }
+        self.recovery_required.store(1, Release);
     }
 
     // Issuing
@@ -1402,20 +1555,29 @@ impl UfsQueue {
         self.backend.ops().dump_state(tag, reason);
     }
 
-    fn request_at_shared_tag(&self, tag: u32) -> ARef<mq::Request<UfsLuBlockOps>> {
+    fn request_at_shared_tag(
+        &self,
+        tag: u32,
+    ) -> Result<Option<ARef<mq::Request<UfsLuBlockOps>>>> {
         // TagHctxShared makes every hctx point at the same tag map. The UFS
         // task tag is therefore sufficient request identity; CQ identity is
         // only needed while draining the hardware queue.
-        self.tags
-            .tag_to_rq(0, tag)
-            .expect("Expected to find tag")
+        self.tags.try_tag_to_rq(0, tag)
     }
 
     fn complete_tag(&self, request: CompletedRequest) -> bool {
-        UfsRequestData::complete(
-            self.request_at_shared_tag(request.tag as u32),
-            request.cqe,
-        )
+        let tag = request.tag as u32;
+        match self.request_at_shared_tag(tag) {
+            Ok(Some(rq)) => UfsRequestData::complete(rq, request.cqe),
+            Ok(None) => {
+                self.require_recovery("completion tag has no request", request.tag);
+                false
+            }
+            Err(_) => {
+                self.require_recovery("completion request is not shareable", request.tag);
+                false
+            }
+        }
     }
 
     fn complete_polled_tag(
@@ -1423,11 +1585,18 @@ impl UfsQueue {
         request: CompletedRequest,
         batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>,
     ) -> bool {
-        UfsRequestData::complete_polled(
-            self.request_at_shared_tag(request.tag as u32),
-            request.cqe,
-            batch,
-        )
+        let tag = request.tag as u32;
+        match self.request_at_shared_tag(tag) {
+            Ok(Some(rq)) => UfsRequestData::complete_polled(rq, request.cqe, batch),
+            Ok(None) => {
+                self.require_recovery("polled completion tag has no request", request.tag);
+                false
+            }
+            Err(_) => {
+                self.require_recovery("polled request is not shareable", request.tag);
+                false
+            }
+        }
     }
 
     pub(crate) fn complete(self: &Arc<Self>) -> bool {
@@ -1440,18 +1609,25 @@ impl UfsQueue {
         let mut any_completed = false;
         loop {
             let mut requests = CompletedRequests::new();
-            if let Err(e) = self.collect_backend_completions(&mut requests) {
+            let collect_result = self.collect_backend_completions(&mut requests);
+
+            let batch_full = requests.is_full();
+            while let Some(request) = requests.take_next() {
+                any_completed |= self.complete_tag(request);
+            }
+
+            if let Some(fault) = requests.take_fault() {
+                self.require_recovery(fault.reason, fault.tag);
+                return any_completed;
+            }
+            if let Err(e) = collect_result {
                 pr_err!(
                     "[RUFS] ufs_queue: collect completions failed errno={}\n",
                     e.to_errno(),
                 );
                 self.dump_backend_state(0, "collect completions failed");
+                self.require_recovery("completion collection failed", 0);
                 return any_completed;
-            }
-
-            let batch_full = requests.is_full();
-            while let Some(request) = requests.take_next() {
-                any_completed |= self.complete_tag(request);
             }
             if !batch_full {
                 break;
@@ -1469,18 +1645,25 @@ impl UfsQueue {
         let mut any_completed = false;
         loop {
             let mut requests = CompletedRequests::new();
-            if let Err(e) = hw_queue.poll(&mut requests) {
+            let poll_result = hw_queue.poll(&mut requests);
+
+            let batch_full = requests.is_full();
+            while let Some(request) = requests.take_next() {
+                any_completed |= self.complete_polled_tag(request, batch);
+            }
+
+            if let Some(fault) = requests.take_fault() {
+                self.require_recovery(fault.reason, fault.tag);
+                return any_completed;
+            }
+            if let Err(e) = poll_result {
                 pr_err!(
                     "[RUFS] ufs_queue: poll queue {} failed errno={}\n",
                     hw_queue.id(),
                     e.to_errno(),
                 );
+                self.require_recovery("polled completion collection failed", hw_queue.id() as _);
                 return any_completed;
-            }
-
-            let batch_full = requests.is_full();
-            while let Some(request) = requests.take_next() {
-                any_completed |= self.complete_polled_tag(request, batch);
             }
             if !batch_full {
                 break;
@@ -1607,34 +1790,49 @@ impl UfsQueue {
         };
 
         let status = status as u32;
-        if requeue {
-            match OwnableRefCounted::try_from_shared(rq) {
-                Ok(rq) => rq.requeue(true),
-                Err(rq) => {
-                    rq.data_ref().status.store(status, Release);
-                    mq::Request::complete(rq);
-                }
+        if rq
+            .data_ref()
+            .inner
+            .lock()
+            .set_completion_status(status)
+            .is_err()
+        {
+            self.require_recovery("invalid SCSI completion state", tag as usize);
+            return;
+        }
+
+        let rq = match OwnableRefCounted::try_from_shared(rq) {
+            Ok(rq) => rq,
+            Err(_rq) => {
+                self.require_recovery("SCSI completion ownership conflict", tag as usize);
+                return;
             }
+        };
+        if rq
+            .data_ref()
+            .inner
+            .lock()
+            .finish_direct_completion()
+            .is_err()
+        {
+            self.require_recovery("invalid SCSI completion finalization", tag as usize);
+            return;
+        }
+
+        if requeue {
+            rq.requeue(true);
             return;
         }
 
         match target {
-            CompletionTarget::Direct => {
-                rq.data_ref().status.store(status, Release);
-                mq::Request::complete(rq);
-            }
+            CompletionTarget::Direct => rq.end(
+                u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8),
+            ),
             CompletionTarget::Poll(batch) => {
-                let rq = match OwnableRefCounted::try_from_shared(rq) {
-                    Ok(rq) => rq,
-                    Err(rq) => {
-                        rq.data_ref().status.store(status, Release);
-                        mq::Request::complete(rq);
-                        return;
-                    }
-                };
-
                 if status != u32::from(bindings::BLK_STS_OK) {
-                    rq.end(status as u8);
+                    rq.end(
+                        u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8),
+                    );
                     return;
                 }
 

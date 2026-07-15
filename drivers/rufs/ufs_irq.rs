@@ -69,6 +69,10 @@ impl irq::ThreadedHandler for UfsQueueHandler {
     fn handle_threaded(&self, _dev: &Device<Bound>) -> IrqReturn {
         let interrupt_status = self.interrupt_status.load(Acquire);
         self.reg.confirm_transfer_interrupts(interrupt_status);
+        if is_error_interrupt(interrupt_status) {
+            self.queue
+                .require_recovery("transfer error interrupt", 0);
+        }
         self.queue.complete();
         IrqReturn::Handled
     }
