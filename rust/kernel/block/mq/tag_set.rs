@@ -115,7 +115,12 @@ impl<T: Operations> TagSet<T> {
         // SAFETY: By type invariant, `this` points to a valid and initialized
         // `blk_mq_tag_set`.
         let flags_raw = unsafe { (*this).flags };
-        Flags::try_from(flags_raw).expect("Expected valid flags from C struct")
+
+        // The C block layer may add internal flags after tag-set allocation.
+        // Return the subset represented by the Rust API instead of rejecting
+        // otherwise valid tag sets that contain unknown bits.
+        Flags::try_from(flags_raw & Flags::all_bits())
+            .expect("masked tag-set flags must be valid")
     }
 
     /// Create a `TagSet<T>` from a raw pointer.
@@ -169,6 +174,35 @@ impl<T: Operations> TagSet<T> {
     pub fn hw_queue_count(&self) -> u32 {
         // SAFETY: By type invariant, `self.inner` is valid.
         unsafe { (*self.inner.get()).nr_hw_queues }
+    }
+
+    /// Update the number of hardware queues for this tag set.
+    ///
+    /// This operation may fail if memory for tags cannot be allocated.
+    pub fn update_hw_queue_count(&self, nr_hw_queues: u32) -> Result {
+        // SAFETY: blk_mq_update_nr_hw_queues applies internal synchronization.
+        unsafe { bindings::blk_mq_update_nr_hw_queues(self.inner.get(), nr_hw_queues) }
+
+        if self.hw_queue_count() == nr_hw_queues {
+            Ok(())
+        } else {
+            Err(ENOMEM)
+        }
+    }
+
+    /// Stop dispatch from every request queue that uses this tag set and wait
+    /// for in-progress dispatch callbacks to finish.
+    pub fn quiesce(&self) {
+        // SAFETY: By type invariant, `self.inner` is a valid tag set. The block
+        // layer provides the synchronization required by this operation.
+        unsafe { bindings::blk_mq_quiesce_tagset(self.inner.get()) }
+    }
+
+    /// Resume dispatch on every request queue that uses this tag set.
+    pub fn unquiesce(&self) {
+        // SAFETY: By type invariant, `self.inner` is a valid tag set. The block
+        // layer provides the synchronization required by this operation.
+        unsafe { bindings::blk_mq_unquiesce_tagset(self.inner.get()) }
     }
 
     /// Borrow the [`T::TagSetData`] associated with this tag set.
@@ -284,6 +318,23 @@ impl<T: Operations> TagSet<T> {
         // SAFETY: The successful increment above transfers one request
         // reference to the returned `ARef`.
         Ok(Some(unsafe { Request::aref_from_raw(rq_ptr) }))
+    }
+
+    /// Try to obtain a request from a tag shared by all hardware queues.
+    ///
+    /// This method is only valid for tag sets configured with
+    /// [`Flag::TagHctxShared`]. Unlike [`TagSet::tag_to_rq`], it does not wait
+    /// for a request that is currently owned by the block layer or through an
+    /// exclusive Rust reference. It returns [`EBUSY`] instead.
+    pub fn try_shared_tag_to_rq(&self, tag: u32) -> Result<Option<ARef<Request<T>>>> {
+        if !self.flags().contains(Flag::TagHctxShared) {
+            return Err(EINVAL);
+        }
+
+        // A shared tag set uses the same tag map for every hardware queue.
+        // Keep the representative queue selection inside the block API so
+        // drivers only depend on the shared-tag identity.
+        self.try_tag_to_rq(0, tag)
     }
 
     /// TODO
