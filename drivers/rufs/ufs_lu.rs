@@ -473,17 +473,32 @@ impl Operations for UfsLuBlockOps {
     }
 
     fn complete(rq: ARef<mq::Request<Self>>) {
-        match OwnableRefCounted::try_from_shared(rq) {
-            Ok(rq) => {
-                let status = rq
-                    .data_ref()
-                    .inner
-                    .lock()
-                    .finish_scheduled_completion()
-                    .unwrap_or(u32::from(bindings::BLK_STS_IOERR));
-                rq.end(u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8));
+        let queue = match rq.queue_data() {
+            QueueData::Dev(queue) => queue.clone(),
+            QueueData::Lu(lu) => lu.queue.clone(),
+        };
+        let tag = rq.tag() as usize;
+        let disposition = match rq.data_ref().inner.lock().take_scheduled_completion() {
+            Ok(disposition) => disposition,
+            Err(_) => {
+                pr_err!("[RUFS] ufs_lu: invalid scheduled completion state\n");
+                rq.data_ref().inner.lock().reset();
+                queue.require_recovery("invalid scheduled completion state", tag);
+                CompletionDisposition::End(u32::from(bindings::BLK_STS_IOERR))
             }
-            Err(_) => pr_err!("[RUFS] ufs_lu: scheduled completion ownership conflict\n"),
+        };
+
+        match OwnableRefCounted::try_from_shared(rq) {
+            Ok(rq) => match disposition {
+                CompletionDisposition::End(status) => rq.end(
+                    u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8),
+                ),
+                CompletionDisposition::Requeue => rq.requeue(true),
+            },
+            Err(_) => {
+                pr_err!("[RUFS] ufs_lu: scheduled completion ownership conflict\n");
+                queue.require_recovery("scheduled completion ownership conflict", tag);
+            }
         }
     }
 

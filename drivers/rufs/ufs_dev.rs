@@ -74,10 +74,6 @@ struct TmfQueue {
     queue: BoundRequestQueue<TaskManagementOps>,
 }
 
-// SAFETY: `TmfQueue` owns the blk-mq tag set, request queue, and request pointer
-// table. Access to it is serialized by `UfsDev::tmf_queue`.
-unsafe impl Send for TmfQueue {}
-
 impl TmfQueue {
     fn new(depth: usize) -> Result<Self> {
         let tag_set = Arc::pin_init(
@@ -137,7 +133,7 @@ impl From<u8> for DescIdn {
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, FromBytes)]
 pub(crate) struct DeviceDesc {
     length: u8,
     descriptor_idn: u8,
@@ -185,12 +181,12 @@ pub(crate) struct DeviceDesc {
 
 impl DeviceDesc {
     fn from_buffer(buffer: DescBuffer) -> Self {
-        unsafe { core::ptr::read_unaligned(buffer.data.as_ptr().cast::<Self>()) }
+        Self::read_from_bytes(&buffer.data).expect("UFS device descriptor size mismatch")
     }
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes)]
 pub(crate) struct GeometryDesc {
     length: u8,
     descriptor_idn: u8,
@@ -239,12 +235,12 @@ pub(crate) struct GeometryDesc {
 
 impl GeometryDesc {
     fn from_buffer(buffer: DescBuffer) -> Self {
-        unsafe { core::ptr::read_unaligned(buffer.data.as_ptr().cast::<Self>()) }
+        Self::read_from_bytes(&buffer.data).expect("UFS geometry descriptor size mismatch")
     }
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromBytes)]
 pub(crate) struct UnitDesc {
     length: u8,
     descriptor_idn: u8,
@@ -270,7 +266,7 @@ pub(crate) struct UnitDesc {
 
 impl UnitDesc {
     fn from_buffer(buffer: DescBuffer) -> Self {
-        unsafe { core::ptr::read_unaligned(buffer.data.as_ptr().cast::<Self>()) }
+        Self::read_from_bytes(&buffer.data).expect("UFS unit descriptor size mismatch")
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -282,11 +278,7 @@ impl UnitDesc {
     }
 
     pub(crate) fn logical_block_count(&self) -> u64 {
-        let ptr = core::ptr::addr_of!(self.logical_block_count);
-
-        // SAFETY: `UnitDesc` is packed, so integer fields may be unaligned.
-        // The descriptor stores multi-byte values in big-endian byte order.
-        unsafe { u64::from_be(core::ptr::read_unaligned(ptr)) }
+        u64::from_be(self.logical_block_count)
     }
 
     pub(crate) fn lu_queue_depth(&self) -> usize {

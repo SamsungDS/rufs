@@ -2,7 +2,6 @@
 
 #![allow(dead_code)]
 
-use crate::ufs_irq::*;
 use crate::ufs_reg::*;
 use kernel::sync::{Arc, Completion, Mutex, SpinLock};
 use kernel::time::Delta;
@@ -105,7 +104,6 @@ struct UfsUicRsp {
 #[pin_data]
 pub(crate) struct UfsUic {
     reg: Arc<UfsReg>,
-    irq: Arc<UfsIrq>,
 
     #[pin]
     cmd: Mutex<Option<UfsUicCmd>>,
@@ -116,11 +114,10 @@ pub(crate) struct UfsUic {
 }
 
 impl UfsUic {
-    pub(crate) fn new(reg: Arc<UfsReg>, irq: Arc<UfsIrq>) -> Result<Arc<Self>> {
+    pub(crate) fn new(reg: Arc<UfsReg>) -> Result<Arc<Self>> {
         Arc::pin_init(
             try_pin_init!(Self {
                 reg,
-                irq,
                 cmd <- new_mutex!(None),
                 rsp <- new_spinlock!(None),
                 completion <- Completion::new(),

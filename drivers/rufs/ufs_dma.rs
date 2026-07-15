@@ -32,6 +32,7 @@ const UFS_CDB_SIZE: usize = 16;
 const UFS_SENSE_SIZE: usize = 18;
 const MASK_OCS: u8 = 0x0F;
 const CQE_UCD_BASE_ADDR: u64 = genmask_u64(7..=63);
+const CQE_SQ_ID: u64 = genmask_u64(0..=4);
 const SAM_STAT_GOOD: u8 = 0x00;
 const SAM_STAT_CHECK_CONDITION: u8 = 0x02;
 const SAM_STAT_BUSY: u8 = 0x08;
@@ -1253,10 +1254,7 @@ pub(crate) struct CqEntry {
 
 impl CqEntry {
     pub(crate) fn command_desc_base_addr(&self) -> u64 {
-        let ptr = core::ptr::addr_of!(self.command_desc_base_addr);
-
-        // SAFETY: `CqEntry` is packed, so integer fields may be unaligned.
-        unsafe { u64::from_le(core::ptr::read_unaligned(ptr)) }
+        u64::from_le(self.command_desc_base_addr)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -1265,6 +1263,10 @@ impl CqEntry {
 
     pub(crate) fn task_tag(&self) -> u8 {
         self.task_tag
+    }
+
+    pub(crate) fn submission_queue_id(&self) -> u8 {
+        (self.command_desc_base_addr() & CQE_SQ_ID) as u8
     }
 
     pub(crate) fn lun(&self) -> u8 {
@@ -1437,6 +1439,10 @@ impl UfsMcqSubmissionQueue {
         self.sq_tail_slot
     }
 
+    pub(crate) fn set_sq_tail_slot(&mut self, slot: u32) {
+        self.sq_tail_slot = slot;
+    }
+
     fn sq_tail_index(&self, descriptor: &UfsMcqQueueDescriptor) -> Result<usize> {
         let index = self.sq_tail_slot as usize;
         if index >= descriptor.max_entries as usize {
@@ -1587,9 +1593,6 @@ pub(crate) struct UfsDma {
     utmrdl: dma::Coherent<[Utmrd]>,
 }
 
-// SAFETY: UfsDma itself doesn't have any thread-affinity
-unsafe impl Send for UfsDma {}
-
 pub(crate) enum UfsPrdtMapping {
     Sg(DmaMapIterMapped<MAX_PRD_ENTRIES, UfsLuBlockOps>),
     Unmap(UfsUnmapMapping),
@@ -1599,11 +1602,6 @@ pub(crate) struct UfsUnmapMapping {
     dev: ARef<device::Device>,
     buffer: Coherent<[u8]>,
 }
-
-// SAFETY: `UfsUnmapMapping` owns a DMA allocation associated with a refcounted
-// device and only frees it on drop. Moving the owner between threads does not
-// expose shared mutable access to the allocation.
-unsafe impl Send for UfsUnmapMapping {}
 
 struct UfsPrdt {
     mapping: Option<UfsPrdtMapping>,
@@ -1759,9 +1757,12 @@ impl UfsDma {
         Ok(io_project!(self.utrdl, [try: tag]).copy_read())
     }
 
-    pub(crate) fn tag_from_cq_entry(&self, cqe: &CqEntry) -> Result<usize> {
+    pub(crate) fn tag_from_cq_entry(&self, cqe: &CqEntry, queue_id: u32) -> Result<usize> {
         let tag = usize::from(cqe.task_tag());
         if tag >= self.transfer_slots {
+            return Err(EINVAL);
+        }
+        if u32::from(cqe.submission_queue_id()) != queue_id {
             return Err(EINVAL);
         }
 

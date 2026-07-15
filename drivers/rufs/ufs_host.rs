@@ -81,7 +81,7 @@ impl UfsHost {
             let first_irq_vector = *irq_vectors.start();
 
             let irq = UfsIrq::new()?;
-            let uic = UfsUic::new(reg.clone(), irq.clone())?;
+            let uic = UfsUic::new(reg.clone())?;
 
             let cleanup_reg = reg.clone();
             let init_guard = ScopeGuard::new(move || stop_hba_controller(&cleanup_reg));
@@ -96,7 +96,7 @@ impl UfsHost {
             reg.wait_for_ctrl_enable(1000, 50)?;
 
             /* ufshcd_link_startup() */
-            irq.request_uic_irq(pdev, first_irq_vector, reg.clone(), uic.clone())?;
+            irq.request_controller_irq(pdev, first_irq_vector, reg.clone(), uic.clone())?;
             uic.link_startup()?;
             dma.make_hba_operational()?;
 
@@ -118,12 +118,7 @@ impl UfsHost {
                 init_guard.dismiss();
 
                 /* ufshcd_verify_dev_init */
-                host.irq.request_queue_irq(
-                    pdev,
-                    first_irq_vector,
-                    host.reg.clone(),
-                    host.queue.clone(),
-                )?;
+                host.irq.attach_queue(host.queue.clone())?;
                 host.dev.verify_dev_init()?;
                 host.dev.complete_dev_init()?;
                 host.dev.device_params_init()?;

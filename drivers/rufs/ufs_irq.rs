@@ -12,45 +12,17 @@ use kernel::sync::{Arc, Mutex};
 use kernel::{c_str, new_mutex, pci, prelude::*};
 
 #[pin_data]
-struct UfsUicHandler {
+struct UfsControllerHandler {
     reg: Arc<UfsReg>,
     uic: Arc<UfsUic>,
+    queue: Arc<Mutex<Option<Arc<UfsQueue>>>>,
     interrupt_status: Atomic<u32>,
 }
 
-impl irq::ThreadedHandler for UfsUicHandler {
+impl irq::ThreadedHandler for UfsControllerHandler {
     fn handle(&self, _dev: &Device<Bound>) -> ThreadedIrqReturn {
-        let interrupt_status = self.reg.read_uic_interrupts();
-        if interrupt_status == 0 {
-            return ThreadedIrqReturn::None;
-        }
-
-        self.interrupt_status.store(interrupt_status, Release);
-
-        ThreadedIrqReturn::WakeThread
-    }
-
-    fn handle_threaded(&self, _dev: &Device<Bound>) -> IrqReturn {
-        let interrupt_status = self.interrupt_status.load(Acquire);
-        self.reg.confirm_uic_interrupts(interrupt_status);
-        if self.uic.handle_uic_completion(interrupt_status) {
-            self.uic.complete_uic_cmd();
-        }
-
-        IrqReturn::Handled
-    }
-}
-
-#[pin_data]
-pub(crate) struct UfsQueueHandler {
-    reg: Arc<UfsReg>,
-    queue: Arc<UfsQueue>,
-    interrupt_status: Atomic<u32>,
-}
-
-impl irq::ThreadedHandler for UfsQueueHandler {
-    fn handle(&self, _dev: &Device<Bound>) -> ThreadedIrqReturn {
-        let interrupt_status = self.reg.read_transfer_interrupts();
+        let interrupt_status =
+            self.reg.read_uic_interrupts() | self.reg.read_transfer_interrupts();
         if interrupt_status == 0 {
             return ThreadedIrqReturn::None;
         }
@@ -58,7 +30,7 @@ impl irq::ThreadedHandler for UfsQueueHandler {
         self.interrupt_status.store(interrupt_status, Release);
         if is_error_interrupt(interrupt_status) {
             pr_warn!(
-                "[RUFS] ufs_irq: transfer/error interrupt status=0x{:x}\n",
+                "[RUFS] ufs_irq: controller error interrupt status=0x{:x}\n",
                 interrupt_status
             );
         }
@@ -68,12 +40,21 @@ impl irq::ThreadedHandler for UfsQueueHandler {
 
     fn handle_threaded(&self, _dev: &Device<Bound>) -> IrqReturn {
         let interrupt_status = self.interrupt_status.load(Acquire);
-        let uic_errors = if is_uic_error_interrupt(interrupt_status) {
+        let uic_status = UfsReg::uic_interrupts(interrupt_status);
+        let transfer_status = UfsReg::transfer_interrupts(interrupt_status);
+        let uic_errors = if is_uic_error_interrupt(transfer_status) {
             Some(self.reg.read_uic_errors())
         } else {
             None
         };
-        self.reg.confirm_transfer_interrupts(interrupt_status);
+
+        self.reg.confirm_uic_interrupts(uic_status);
+        self.reg.confirm_transfer_interrupts(transfer_status);
+
+        if self.uic.handle_uic_completion(uic_status) {
+            self.uic.complete_uic_cmd();
+        }
+        let queue = self.queue.lock().clone();
         if let Some(errors) = uic_errors {
             pr_warn!(
                 "[RUFS] ufs_irq: UIC error phy=0x{:08x} dl=0x{:08x} nl=0x{:08x} tl=0x{:08x} dme=0x{:08x}\n",
@@ -84,14 +65,20 @@ impl irq::ThreadedHandler for UfsQueueHandler {
                 errors.dme,
             );
             if errors.requires_recovery() {
-                self.queue.require_recovery("fatal UIC error", 0);
+                if let Some(queue) = &queue {
+                    queue.require_uic_recovery(errors);
+                }
             }
         }
-        if is_transfer_recovery_interrupt(interrupt_status) {
-            self.queue
-                .require_recovery("transfer error interrupt", 0);
+        if let Some(queue) = queue {
+            if is_transfer_recovery_interrupt(transfer_status) {
+                queue.require_recovery("transfer error interrupt", 0);
+            }
+            if transfer_status != 0 {
+                queue.complete();
+            }
         }
-        self.queue.complete();
+
         IrqReturn::Handled
     }
 }
@@ -99,63 +86,51 @@ impl irq::ThreadedHandler for UfsQueueHandler {
 #[pin_data]
 pub(crate) struct UfsIrq {
     #[pin]
-    uic: Mutex<Option<Arc<irq::ThreadedRegistration<UfsUicHandler>>>>,
+    registration: Mutex<Option<Arc<irq::ThreadedRegistration<UfsControllerHandler>>>>,
     #[pin]
-    queue: Mutex<Option<Arc<irq::ThreadedRegistration<UfsQueueHandler>>>>,
+    queue: Arc<Mutex<Option<Arc<UfsQueue>>>>,
 }
 
 impl UfsIrq {
     pub(crate) fn new() -> Result<Arc<Self>> {
         Arc::pin_init(
             try_pin_init!(Self {
-                uic <- new_mutex!(None),
-                queue <- new_mutex!(None),
+                registration <- new_mutex!(None),
+                queue: Arc::pin_init(new_mutex!(None), GFP_KERNEL)?,
             }),
             GFP_KERNEL,
         )
     }
 
-    pub(crate) fn request_uic_irq(
+    pub(crate) fn request_controller_irq(
         &self,
         pdev: &pci::Device<Core<'_>>,
         vector: pci::IrqVector<'_>,
         reg: Arc<UfsReg>,
         uic: Arc<UfsUic>,
     ) -> Result<()> {
-        let handler = try_pin_init!(UfsUicHandler {
+        let handler = try_pin_init!(UfsControllerHandler {
             reg,
             uic,
+            queue: self.queue.clone(),
             interrupt_status: Atomic::new(0),
         });
 
         let flags = Flags::SHARED | Flags::ONESHOT;
-        let irq = pdev.request_threaded_irq(vector, flags, c_str!("ufshcd-uic"), handler);
+        let irq = pdev.request_threaded_irq(vector, flags, c_str!("rufs-controller"), handler);
 
         let reg = Arc::pin_init(irq, GFP_KERNEL)?;
-        self.uic.lock().replace(reg);
+        self.registration.lock().replace(reg);
 
         Ok(())
     }
 
-    pub(crate) fn request_queue_irq(
-        &self,
-        pdev: &pci::Device<Core<'_>>,
-        vector: pci::IrqVector<'_>,
-        reg: Arc<UfsReg>,
-        queue: Arc<UfsQueue>,
-    ) -> Result<()> {
-        let handler = try_pin_init!(UfsQueueHandler {
-            reg,
-            queue,
-            interrupt_status: Atomic::new(0),
-        });
-
-        let flags = Flags::SHARED | Flags::ONESHOT;
-        let irq = pdev.request_threaded_irq(vector, flags, c_str!("ufshcd-queue"), handler);
-
-        let irq = Arc::pin_init(irq, GFP_KERNEL)?;
-        self.queue.lock().replace(irq);
-
+    pub(crate) fn attach_queue(&self, queue: Arc<UfsQueue>) -> Result<()> {
+        let mut slot = self.queue.lock();
+        if slot.is_some() {
+            return Err(EBUSY);
+        }
+        *slot = Some(queue);
         Ok(())
     }
 }
