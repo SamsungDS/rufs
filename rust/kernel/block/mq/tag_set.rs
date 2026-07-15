@@ -242,6 +242,50 @@ impl<T: Operations> TagSet<T> {
         }
     }
 
+    /// Try to obtain a shared reference to a driver-owned request.
+    ///
+    /// Unlike [`TagSet::tag_to_rq`], this method does not wait for a request
+    /// that is currently owned by the block layer or through an exclusive Rust
+    /// reference. It returns [`EBUSY`] instead.
+    pub fn try_tag_to_rq(&self, qid: u32, tag: u32) -> Result<Option<ARef<Request<T>>>> {
+        if qid >= self.hw_queue_count() {
+            return Err(EINVAL);
+        }
+
+        // SAFETY: We checked that `qid` is within bounds.
+        let tags = unsafe { *(*self.inner.get()).tags.add(qid as usize) };
+        // SAFETY: We checked `qid` above, so `tags` is valid.
+        let rq_ptr = unsafe { bindings::blk_mq_tag_to_rq(tags, tag) };
+        if rq_ptr.is_null() {
+            return Ok(None);
+        }
+
+        // SAFETY: A non-null request returned by blk-mq has initialized driver
+        // private data.
+        let refcount_ptr = unsafe {
+            RequestDataWrapper::refcount_ptr(
+                Request::wrapper_ptr(rq_ptr.cast::<Request<T>>()).as_ptr(),
+            )
+        };
+        // SAFETY: The refcount remains valid while the request tag is active.
+        let atomic_ref = unsafe { &*refcount_ptr }.as_atomic();
+
+        loop {
+            let prev = atomic_ref.load(ordering::Acquire);
+            if prev < 1 {
+                return Err(EBUSY);
+            }
+            match atomic_ref.cmpxchg(prev, prev + 1, ordering::Relaxed) {
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+
+        // SAFETY: The successful increment above transfers one request
+        // reference to the returned `ARef`.
+        Ok(Some(unsafe { Request::aref_from_raw(rq_ptr) }))
+    }
+
     /// TODO
     pub fn queue_depth(&self) -> u32 {
         // SAFETY: By type invariant, `self.inner` is valid.
