@@ -516,20 +516,10 @@ impl Operations for UfsLuBlockOps {
 
     fn map_queues(tag_set: Pin<&mut TagSet<Self>>) {
         let layout = tag_set.data().queue_map;
-        let default_queues = layout.default_queues() as u32;
-        let read_queues = layout.read_queues() as u32;
-        let poll_queues = layout.poll_queues() as u32;
-
-        let mut offset = 0;
         let result = tag_set.update_maps(|mut qmap| {
-            let queue_count = match qmap.kind() {
-                mq::QueueType::Default => default_queues,
-                mq::QueueType::Read => read_queues,
-                mq::QueueType::Poll => poll_queues,
-            };
-            qmap.set_queue_count(queue_count);
-            qmap.set_offset(offset);
-            offset += queue_count;
+            let range = layout.range(qmap.kind());
+            qmap.set_queue_count(range.count() as u32);
+            qmap.set_offset(range.offset() as u32);
             qmap.map_queues();
         });
 

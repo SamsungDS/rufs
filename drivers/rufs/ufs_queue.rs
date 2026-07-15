@@ -123,20 +123,35 @@ impl UfsTransferConfig {
 }
 
 #[derive(Copy, Clone)]
+pub(crate) struct UfsQueueRange {
+    offset: usize,
+    count: usize,
+}
+
+#[derive(Copy, Clone)]
 pub(crate) struct UfsQueueMap {
     nr_hw_queues: usize,
-    default_queues: usize,
-    read_queues: usize,
-    poll_queues: usize,
+    default: UfsQueueRange,
+    read: UfsQueueRange,
+    poll: UfsQueueRange,
 }
 
 impl UfsQueueMap {
     fn sdb() -> Self {
         Self {
             nr_hw_queues: 1,
-            default_queues: 1,
-            read_queues: 0,
-            poll_queues: 0,
+            default: UfsQueueRange {
+                offset: 0,
+                count: 1,
+            },
+            read: UfsQueueRange {
+                offset: 0,
+                count: 0,
+            },
+            poll: UfsQueueRange {
+                offset: 0,
+                count: 1,
+            },
         }
     }
 
@@ -155,11 +170,25 @@ impl UfsQueueMap {
             return Err(EINVAL);
         }
 
+        let read_offset = default_queues;
+        let poll_offset = read_offset
+            .checked_add(read_queues)
+            .ok_or(EOVERFLOW)?;
+
         Ok(Self {
             nr_hw_queues,
-            default_queues,
-            read_queues,
-            poll_queues,
+            default: UfsQueueRange {
+                offset: 0,
+                count: default_queues,
+            },
+            read: UfsQueueRange {
+                offset: read_offset,
+                count: read_queues,
+            },
+            poll: UfsQueueRange {
+                offset: poll_offset,
+                count: poll_queues,
+            },
         })
     }
 
@@ -167,27 +196,33 @@ impl UfsQueueMap {
         self.nr_hw_queues
     }
 
-    pub(crate) fn default_queues(&self) -> usize {
-        self.default_queues
-    }
-
-    pub(crate) fn read_queues(&self) -> usize {
-        self.read_queues
-    }
-
-    pub(crate) fn poll_queues(&self) -> usize {
-        self.poll_queues
+    pub(crate) fn range(&self, kind: mq::QueueType) -> UfsQueueRange {
+        match kind {
+            mq::QueueType::Default => self.default,
+            mq::QueueType::Read => self.read,
+            mq::QueueType::Poll => self.poll,
+        }
     }
 
     /// Number of blk-mq queue maps required to express this layout.
     pub(crate) fn num_maps(&self) -> u32 {
-        if self.poll_queues > 0 {
+        if self.poll.count > 0 {
             3
-        } else if self.read_queues > 0 {
+        } else if self.read.count > 0 {
             2
         } else {
             1
         }
+    }
+}
+
+impl UfsQueueRange {
+    pub(crate) fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.count
     }
 }
 
@@ -595,6 +630,13 @@ struct SdbTransferBackend {
 #[derive(Default)]
 struct SdbCompletionState {
     outstanding: u32,
+    polled: u32,
+}
+
+#[derive(Copy, Clone)]
+enum SdbCompletionSource {
+    Interrupt,
+    Poll,
 }
 
 #[pin_data]
@@ -918,13 +960,21 @@ impl UfsHwQueue {
         }
     }
 
-    fn submit(&self, tag: u32) -> Result<()> {
+    fn submit(&self, tag: u32, polled: bool) -> Result<()> {
         match &self.inner {
             UfsHwQueueKind::Sdb { reg, state } => {
                 let mask = SdbTransferBackend::tag_mask(tag).ok_or(EINVAL)?;
                 let mut state = state.completion.lock();
 
+                if state.outstanding & mask != 0 {
+                    return Err(EBUSY);
+                }
                 state.outstanding |= mask;
+                if polled {
+                    state.polled |= mask;
+                } else {
+                    state.polled &= !mask;
+                }
                 barrier::dma_wmb();
                 reg.ring_utrl_doorbell(tag);
                 Ok(())
@@ -938,7 +988,12 @@ impl UfsHwQueue {
     fn poll(&self, completed: &mut CompletedRequests) -> Result<()> {
         match &self.inner {
             UfsHwQueueKind::Sdb { reg, state } => {
-                SdbTransferBackend::collect_state_completions(reg, state, completed)
+                SdbTransferBackend::collect_state_completions(
+                    reg,
+                    state,
+                    SdbCompletionSource::Poll,
+                    completed,
+                )
             }
             UfsHwQueueKind::Mcq {
                 reg,
@@ -986,23 +1041,34 @@ impl SdbTransferBackend {
     }
 
     fn collect_completions(&self, requests: &mut CompletedRequests) -> Result<()> {
-        Self::collect_state_completions(&self.reg, &self.state, requests)
+        Self::collect_state_completions(
+            &self.reg,
+            &self.state,
+            SdbCompletionSource::Interrupt,
+            requests,
+        )
     }
 
     fn collect_state_completions(
         reg: &UfsReg,
         state: &SdbTransferState,
+        source: SdbCompletionSource,
         requests: &mut CompletedRequests,
     ) -> Result<()> {
         let mut state = state.completion.lock();
         let doorbell = reg.read_utrl_doorbell();
         let completed = !doorbell & state.outstanding;
-        if completed != 0 {
+        let eligible = match source {
+            SdbCompletionSource::Interrupt => completed & !state.polled,
+            SdbCompletionSource::Poll => completed & state.polled,
+        };
+        if eligible != 0 {
             barrier::dma_rmb();
         }
-        let collected = requests.insert_sdb_mask(completed)?;
+        let collected = requests.insert_sdb_mask(eligible)?;
 
         state.outstanding &= !collected;
+        state.polled &= !collected;
         Ok(())
     }
 }
@@ -1037,10 +1103,11 @@ impl UfsTransferOps for SdbTransferBackend {
         let state = self.state.completion.lock();
 
         pr_err!(
-            "[RUFS] ufs_queue: SDB dump reason={} tag={} outstanding=0x{:x}\n",
+            "[RUFS] ufs_queue: SDB dump reason={} tag={} outstanding=0x{:x} polled=0x{:x}\n",
             reason,
             tag,
             state.outstanding,
+            state.polled,
         );
     }
 }
@@ -1271,6 +1338,7 @@ impl UfsRequestData {
         };
         let queue_id = hw_queue.id();
         let tag = rq.tag();
+        let polled = rq.flags().contains(mq::RequestFlag::Polled);
 
         if queue.recovery_required() {
             return Err((rq, EBUSY));
@@ -1291,7 +1359,7 @@ impl UfsRequestData {
         // dropping the DMA mapping's request reference.
         drop(rq);
 
-        match hw_queue.submit(tag) {
+        match hw_queue.submit(tag, polled) {
             Err(e) => {
                 // A failed submission did not make the request visible to
                 // hardware, so it is still owned by the driver and can be
