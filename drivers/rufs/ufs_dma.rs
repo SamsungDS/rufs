@@ -7,7 +7,7 @@ use crate::ufs_dev::*;
 use crate::ufs_lu::UfsLuBlockOps;
 use crate::ufs_queue::*;
 use crate::ufs_reg::*;
-use kernel::bits::genmask_u8;
+use kernel::bits::{genmask_u64, genmask_u8};
 use kernel::block::mq::dma_map_iter::DmaMapIterMapped;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;
 use kernel::dma;
@@ -31,6 +31,7 @@ pub(crate) const MAX_PRD_ENTRIES: usize = 256;
 const UFS_CDB_SIZE: usize = 16;
 const UFS_SENSE_SIZE: usize = 18;
 const MASK_OCS: u8 = 0x0F;
+const CQE_UCD_BASE_ADDR: u64 = genmask_u64(7..=63);
 const SAM_STAT_GOOD: u8 = 0x00;
 const SAM_STAT_CHECK_CONDITION: u8 = 0x02;
 const SAM_STAT_BUSY: u8 = 0x08;
@@ -1762,6 +1763,11 @@ impl UfsDma {
         let tag = usize::from(cqe.task_tag());
         if tag >= self.transfer_slots {
             return Err(EINVAL);
+        }
+
+        let expected = io_project!(self.ucdl, [try: tag]).dma_handle() as u64;
+        if cqe.command_desc_base_addr() & CQE_UCD_BASE_ADDR != expected & CQE_UCD_BASE_ADDR {
+            return Err(EIO);
         }
 
         Ok(tag)

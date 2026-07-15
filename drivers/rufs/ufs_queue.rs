@@ -733,7 +733,7 @@ impl McqHardwareQueue {
                     match dma.tag_from_cq_entry(&cqe) {
                         Ok(tag) => completed_requests.insert(tag, Some(cqe))?,
                         Err(_) => completed_requests.record_fault(
-                            "invalid MCQ completion tag",
+                            "invalid MCQ completion descriptor",
                             usize::from(cqe.task_tag()),
                         ),
                     }
