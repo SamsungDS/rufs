@@ -68,8 +68,26 @@ impl irq::ThreadedHandler for UfsQueueHandler {
 
     fn handle_threaded(&self, _dev: &Device<Bound>) -> IrqReturn {
         let interrupt_status = self.interrupt_status.load(Acquire);
+        let uic_errors = if is_uic_error_interrupt(interrupt_status) {
+            Some(self.reg.read_uic_errors())
+        } else {
+            None
+        };
         self.reg.confirm_transfer_interrupts(interrupt_status);
-        if is_error_interrupt(interrupt_status) {
+        if let Some(errors) = uic_errors {
+            pr_warn!(
+                "[RUFS] ufs_irq: UIC error phy=0x{:08x} dl=0x{:08x} nl=0x{:08x} tl=0x{:08x} dme=0x{:08x}\n",
+                errors.phy,
+                errors.data_link,
+                errors.network,
+                errors.transport,
+                errors.dme,
+            );
+            if errors.requires_recovery() {
+                self.queue.require_recovery("fatal UIC error", 0);
+            }
+        }
+        if is_transfer_recovery_interrupt(interrupt_status) {
             self.queue
                 .require_recovery("transfer error interrupt", 0);
         }

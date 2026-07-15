@@ -55,6 +55,15 @@ register! {
     UIC_ERROR_CODE_DATA_LINK_LAYER(u32) @ 0x3C {
         31:0 value;
     }
+    UIC_ERROR_CODE_NETWORK_LAYER(u32) @ 0x40 {
+        31:0 value;
+    }
+    UIC_ERROR_CODE_TRANSPORT_LAYER(u32) @ 0x44 {
+        31:0 value;
+    }
+    UIC_ERROR_CODE_DME(u32) @ 0x48 {
+        31:0 value;
+    }
     UTP_TRANSFER_REQ_INT_AGG_CONTROL(u32) @ 0x4C {
         31:0 value;
     }
@@ -196,6 +205,30 @@ const ERROR_MASK: u32 = UIC_ERROR
 
 const INT_AGGR_STATUS_BIT: u32 = 1 << 20;
 const INT_AGGR_ENABLE: u32 = 1 << 31;
+const UIC_ERROR_FLAG: u32 = 1 << 31;
+const UIC_DL_PA_INIT_ERROR: u32 = 1 << 13;
+const UIC_NL_ERROR_CODE_MASK: u32 = 0x7;
+const UIC_TL_ERROR_CODE_MASK: u32 = 0x7f;
+const UIC_DME_ERROR_CODE_MASK: u32 = 0x1;
+
+#[derive(Copy, Clone)]
+pub(crate) struct UicErrorStatus {
+    pub(crate) phy: u32,
+    pub(crate) data_link: u32,
+    pub(crate) network: u32,
+    pub(crate) transport: u32,
+    pub(crate) dme: u32,
+}
+
+impl UicErrorStatus {
+    pub(crate) fn requires_recovery(&self) -> bool {
+        self.data_link & (UIC_ERROR_FLAG | UIC_DL_PA_INIT_ERROR)
+            == UIC_ERROR_FLAG | UIC_DL_PA_INIT_ERROR
+            || self.network & (UIC_ERROR_FLAG | UIC_NL_ERROR_CODE_MASK) > UIC_ERROR_FLAG
+            || self.transport & (UIC_ERROR_FLAG | UIC_TL_ERROR_CODE_MASK) > UIC_ERROR_FLAG
+            || self.dme & (UIC_ERROR_FLAG | UIC_DME_ERROR_CODE_MASK) > UIC_ERROR_FLAG
+    }
+}
 
 pub(crate) enum PowerMode {
     OK = 0x00,
@@ -370,6 +403,31 @@ impl UfsReg {
     pub(crate) fn read_uic_error_phy(&self) -> u32 {
         let access = self.bar.try_access().unwrap();
         access.read(UIC_ERROR_CODE_PHY_ADAPTER_LAYER).value().get()
+    }
+
+    #[inline]
+    pub(crate) fn confirm_uic_error(&self) {
+        self.write_is(UIC_ERROR);
+    }
+
+    pub(crate) fn read_uic_errors(&self) -> UicErrorStatus {
+        let access = self.bar.try_access().unwrap();
+        UicErrorStatus {
+            phy: access
+                .read(UIC_ERROR_CODE_PHY_ADAPTER_LAYER)
+                .value()
+                .get(),
+            data_link: access
+                .read(UIC_ERROR_CODE_DATA_LINK_LAYER)
+                .value()
+                .get(),
+            network: access.read(UIC_ERROR_CODE_NETWORK_LAYER).value().get(),
+            transport: access
+                .read(UIC_ERROR_CODE_TRANSPORT_LAYER)
+                .value()
+                .get(),
+            dme: access.read(UIC_ERROR_CODE_DME).value().get(),
+        }
     }
 
     #[inline]
@@ -1147,4 +1205,14 @@ pub(crate) fn is_uic_power_mode(interrupt_status: u32) -> bool {
 #[inline]
 pub(crate) fn is_error_interrupt(interrupt_status: u32) -> bool {
     (interrupt_status & ERROR_MASK) != 0
+}
+
+#[inline]
+pub(crate) fn is_uic_error_interrupt(interrupt_status: u32) -> bool {
+    (interrupt_status & UIC_ERROR) != 0
+}
+
+#[inline]
+pub(crate) fn is_transfer_recovery_interrupt(interrupt_status: u32) -> bool {
+    (interrupt_status & (ERROR_MASK & !UIC_ERROR)) != 0
 }

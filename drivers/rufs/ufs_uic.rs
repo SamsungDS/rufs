@@ -139,6 +139,7 @@ impl UfsUic {
         })?;
 
         self.reg.read_uic_error_phy();
+        self.reg.confirm_uic_error();
 
         Ok(())
     }
