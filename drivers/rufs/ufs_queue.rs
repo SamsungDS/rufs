@@ -712,7 +712,7 @@ impl McqHardwareQueue {
         let sqe = dma.transfer_request_desc(tag as usize)?;
         let tail = submission.write_entry(&self.descriptor, sqe)?;
 
-        barrier::smp_wmb();
+        barrier::dma_wmb();
         reg.write_mcq_sq_tail(self.descriptor.oprs(), self.descriptor.id() as usize, tail)
     }
 
@@ -724,6 +724,7 @@ impl McqHardwareQueue {
     ) -> Result<()> {
         let mut completion = self.completion.lock();
         completion.update_tail(reg, &self.descriptor)?;
+        barrier::dma_rmb();
         let mut consumed = false;
         let result = (|| {
             while !completion.is_empty() && !completed_requests.is_full() {
@@ -924,6 +925,7 @@ impl UfsHwQueue {
                 let mut state = state.completion.lock();
 
                 state.outstanding |= mask;
+                barrier::dma_wmb();
                 reg.ring_utrl_doorbell(tag);
                 Ok(())
             }
@@ -995,6 +997,9 @@ impl SdbTransferBackend {
         let mut state = state.completion.lock();
         let doorbell = reg.read_utrl_doorbell();
         let completed = !doorbell & state.outstanding;
+        if completed != 0 {
+            barrier::dma_rmb();
+        }
         let collected = requests.insert_sdb_mask(completed)?;
 
         state.outstanding &= !collected;

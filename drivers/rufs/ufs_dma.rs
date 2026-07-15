@@ -14,11 +14,11 @@ use kernel::dma;
 use kernel::dma::Coherent;
 use kernel::io::io_project;
 use kernel::io::Io;
-use kernel::sync::{aref::ARef, Arc, SpinLock};
+use kernel::sync::{aref::ARef, Arc};
 use kernel::{
     block::mq,
     device::{self, Bound, Core},
-    new_spinlock, pci,
+    pci,
     prelude::*,
 };
 use zerocopy_derive::{Immutable, KnownLayout};
@@ -1335,12 +1335,6 @@ struct Utmrd {
     upiu_rsp: UpiuTmRsp,
 }
 
-struct UfsDmaInner {
-    ucdl: dma::Coherent<[Ucd]>,
-    utrdl: dma::Coherent<[Utrd]>,
-    utmrdl: dma::Coherent<[Utmrd]>,
-}
-
 pub(crate) struct UfsMcqQueue {
     descriptor: UfsMcqQueueDescriptor,
     submission: UfsMcqSubmissionQueue,
@@ -1578,14 +1572,18 @@ impl UfsMcqCompletionQueue {
     }
 }
 
-#[pin_data]
+/// Coherent transfer memory shared by all hardware queues.
+///
+/// The allocations are immutable, while each active blk-mq tag exclusively
+/// owns the corresponding UCD and UTRD contents. The request state machine
+/// prevents a tag from being composed, completed, or recovered concurrently.
 pub(crate) struct UfsDma {
     reg: Arc<UfsReg>,
     dev: ARef<device::Device>,
     transfer_slots: usize,
-
-    #[pin]
-    inner: SpinLock<UfsDmaInner>,
+    ucdl: dma::Coherent<[Ucd]>,
+    utrdl: dma::Coherent<[Utrd]>,
+    utmrdl: dma::Coherent<[Utmrd]>,
 }
 
 // SAFETY: UfsDma itself doesn't have any thread-affinity
@@ -1692,19 +1690,17 @@ impl UfsDma {
         let nutmrs = reg.nutmrs();
         let utmrdl = dma::Coherent::<Utmrd>::zeroed_slice(pdev.as_ref(), nutmrs, GFP_KERNEL)?;
 
-        Arc::pin_init(
-            pin_init!(Self {
+        Ok(Arc::new(
+            Self {
                 reg,
                 dev: pdev.as_ref().into(),
                 transfer_slots,
-                inner <- new_spinlock!(UfsDmaInner {
-                    ucdl,
-                    utrdl,
-                    utmrdl,
-                }),
-            }),
+                ucdl,
+                utrdl,
+                utmrdl,
+            },
             GFP_KERNEL,
-        )
+        )?)
     }
 
     pub(crate) fn transfer_slots(&self) -> usize {
@@ -1715,10 +1711,8 @@ impl UfsDma {
         self.reg.enable_interrupts();
         self.reg.disable_transfer_req_int_aggr();
 
-        self.reg
-            .set_utrdl_base(self.inner.lock().utrdl.dma_handle() as u64);
-        self.reg
-            .set_utmrdl_base(self.inner.lock().utmrdl.dma_handle() as u64);
+        self.reg.set_utrdl_base(self.utrdl.dma_handle() as u64);
+        self.reg.set_utmrdl_base(self.utmrdl.dma_handle() as u64);
 
         self.reg.wait_for_request_ready(1000, 50)?;
         self.reg.enable_run_stop();
@@ -1727,14 +1721,12 @@ impl UfsDma {
     }
 
     pub(crate) fn compose_devman_upiu(&self, cmd: UfsDevCmd, tag: u32) -> Result<()> {
-        let inner = self.inner.lock();
-
         let tag: usize = tag as _;
-        io_project!(inner.ucdl, [try: tag].cmd_upiu).copy_write(Upiu::device(cmd, tag));
-        io_project!(inner.ucdl, [try: tag].rsp_upiu).copy_write(Upiu::default());
+        io_project!(self.ucdl, [try: tag].cmd_upiu).copy_write(Upiu::device(cmd, tag));
+        io_project!(self.ucdl, [try: tag].rsp_upiu).copy_write(Upiu::default());
 
-        let utrd = io_project!(inner.utrdl, [try: tag]).copy_read();
-        io_project!(inner.utrdl, [try: tag]).copy_write(utrd.build(UfsCmd::Device(cmd)));
+        let utrd = io_project!(self.utrdl, [try: tag]).copy_read();
+        io_project!(self.utrdl, [try: tag]).copy_write(utrd.build(UfsCmd::Device(cmd)));
         Ok(())
     }
 
@@ -1745,27 +1737,25 @@ impl UfsDma {
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>> {
         let prdt = self.map_request_prdt(cmd, rq, mempool)?;
-        let inner = self.inner.lock();
         let tag: usize = rq.tag().try_into().unwrap();
 
-        io_project!(inner.ucdl, [try: tag].cmd_upiu).copy_write(Upiu::command(cmd, tag));
-        io_project!(inner.ucdl, [try: tag].rsp_upiu).copy_write(Upiu::default());
+        io_project!(self.ucdl, [try: tag].cmd_upiu).copy_write(Upiu::command(cmd, tag));
+        io_project!(self.ucdl, [try: tag].rsp_upiu).copy_write(Upiu::default());
 
         for (i, entry) in prdt.entries.iter().enumerate() {
-            io_project!(inner.ucdl, [try: tag].prdt[try: i]).copy_write(*entry);
+            io_project!(self.ucdl, [try: tag].prdt[try: i]).copy_write(*entry);
         }
 
-        let utrd = io_project!(inner.utrdl, [try: tag]).copy_read();
+        let utrd = io_project!(self.utrdl, [try: tag]).copy_read();
         let mut utrd = utrd.build(UfsCmd::SCSI(cmd));
         utrd.prd_table_length = (prdt.entries.len() as u16).to_le();
-        io_project!(inner.utrdl, [try: tag]).copy_write(utrd);
+        io_project!(self.utrdl, [try: tag]).copy_write(utrd);
 
         Ok(prdt.mapping)
     }
 
     pub(crate) fn transfer_request_desc(&self, tag: usize) -> Result<Utrd> {
-        let inner = self.inner.lock();
-        Ok(io_project!(inner.utrdl, [try: tag]).copy_read())
+        Ok(io_project!(self.utrdl, [try: tag]).copy_read())
     }
 
     pub(crate) fn tag_from_cq_entry(&self, cqe: &CqEntry) -> Result<usize> {
@@ -1866,12 +1856,10 @@ impl UfsDma {
     }
 
     pub(crate) fn fetch_devman_upiu(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
-        let inner = self.inner.lock();
-
-        let utrd = io_project!(inner.utrdl, [try: tag]).copy_read();
+        let utrd = io_project!(self.utrdl, [try: tag]).copy_read();
         utrd.check_response()?;
 
-        let rsp_upiu = io_project!(inner.ucdl, [try: tag].rsp_upiu).copy_read();
+        let rsp_upiu = io_project!(self.ucdl, [try: tag].rsp_upiu).copy_read();
         let cmd = rsp_upiu.fetch_dev(cmd)?;
 
         Ok(UfsCmd::Device(cmd))
@@ -1894,21 +1882,18 @@ impl UfsDma {
             _ => return Err(EIO),
         }
 
-        let inner = self.inner.lock();
-        let rsp_upiu = io_project!(inner.ucdl, [try: tag].rsp_upiu).copy_read();
+        let rsp_upiu = io_project!(self.ucdl, [try: tag].rsp_upiu).copy_read();
         let cmd = rsp_upiu.fetch_dev(cmd)?;
 
         Ok(UfsCmd::Device(cmd))
     }
 
     pub(crate) fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult {
-        let inner = self.inner.lock();
-
-        let utrd =
-            match (|| -> Result<_> { Ok(io_project!(inner.utrdl, [try: tag]).copy_read()) })() {
-                Ok(utrd) => utrd,
-                Err(_) => return UfsScsiResult::error(UtpOcs::InvalidCommandStatus as u8),
-            };
+        let utrd = match (|| -> Result<_> { Ok(io_project!(self.utrdl, [try: tag]).copy_read()) })()
+        {
+            Ok(utrd) => utrd,
+            Err(_) => return UfsScsiResult::error(UtpOcs::InvalidCommandStatus as u8),
+        };
         let ocs = utrd.ocs();
 
         if utrd.check_response().is_err() {
@@ -1918,7 +1903,7 @@ impl UfsDma {
             };
         }
 
-        match (|| -> Result<_> { Ok(io_project!(inner.ucdl, [try: tag].rsp_upiu).copy_read()) })() {
+        match (|| -> Result<_> { Ok(io_project!(self.ucdl, [try: tag].rsp_upiu).copy_read()) })() {
             Ok(rsp_upiu) => rsp_upiu.scsi_result(ocs),
             Err(_) => UfsScsiResult::error(ocs),
         }
@@ -1934,8 +1919,7 @@ impl UfsDma {
             };
         }
 
-        let inner = self.inner.lock();
-        match (|| -> Result<_> { Ok(io_project!(inner.ucdl, [try: tag].rsp_upiu).copy_read()) })() {
+        match (|| -> Result<_> { Ok(io_project!(self.ucdl, [try: tag].rsp_upiu).copy_read()) })() {
             Ok(rsp_upiu) => rsp_upiu.scsi_result(ocs),
             Err(_) => UfsScsiResult::error(UtpOcs::InvalidCommandStatus as u8),
         }
