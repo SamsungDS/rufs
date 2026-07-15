@@ -19,6 +19,12 @@ bool rust_helper_blk_mq_add_to_batch(struct request *req,
 {
 	return blk_mq_add_to_batch(req, iob, is_error, complete);
 }
+
+__rust_helper struct request *
+rust_helper_blk_mq_tag_to_rq(struct blk_mq_tags *tags, unsigned int tag)
+{
+	return blk_mq_tag_to_rq(tags, tag);
+}
 __rust_helper unsigned int rust_helper_blk_rq_payload_bytes(struct request *rq)
 {
 	return blk_rq_payload_bytes(rq);

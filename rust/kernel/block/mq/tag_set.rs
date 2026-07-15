@@ -4,6 +4,7 @@
 //!
 //! C header: [`include/linux/blk-mq.h`](srctree/include/linux/blk-mq.h)
 
+use super::Request;
 use crate::{
     alloc::NumaNode,
     bindings,
@@ -17,6 +18,7 @@ use crate::{
         Result, //
     },
     prelude::*,
+    sync::{aref::ARef, atomic::ordering},
     types::{
         ForeignOwnable,
         Opaque, //
@@ -55,6 +57,46 @@ pub struct TagSet<T: Operations> {
 }
 
 impl<T: Operations> TagSet<T> {
+    fn try_rq_from_tags(
+        tags: *mut bindings::blk_mq_tags,
+        tag: u32,
+    ) -> Result<Option<ARef<Request<T>>>> {
+        if tags.is_null() {
+            return Err(EINVAL);
+        }
+
+        // SAFETY: The caller obtained `tags` from this live tag set.
+        let rq_ptr = unsafe { bindings::blk_mq_tag_to_rq(tags, tag) };
+        if rq_ptr.is_null() {
+            return Ok(None);
+        }
+
+        // SAFETY: A non-null request returned by blk-mq has initialized driver
+        // private data.
+        let refcount_ptr = unsafe {
+            RequestDataWrapper::refcount_ptr(
+                Request::wrapper_ptr(rq_ptr.cast::<Request<T>>()).as_ptr(),
+            )
+        };
+        // SAFETY: The refcount remains valid while the request tag is active.
+        let atomic_ref = unsafe { &*refcount_ptr }.as_atomic();
+
+        loop {
+            let prev = atomic_ref.load(ordering::Acquire);
+            if prev < 1 {
+                return Err(EBUSY);
+            }
+            match atomic_ref.cmpxchg(prev, prev + 1, ordering::Relaxed) {
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+
+        // SAFETY: The successful increment above transfers one request
+        // reference to the returned `ARef`.
+        Ok(Some(unsafe { Request::aref_from_raw(rq_ptr) }))
+    }
+
     /// Try to create a new tag set
     pub fn new(
         nr_hw_queues: u32,
@@ -113,7 +155,11 @@ impl<T: Operations> TagSet<T> {
         // SAFETY: By type invariant, `this` points to a valid and initialized
         // `blk_mq_tag_set`.
         let flags_raw = unsafe { (*this).flags };
-        Flags::try_from(flags_raw).expect("Expected valid flags from C struct")
+
+        // The C block layer may add internal flags after tag-set allocation.
+        // Return the subset represented by the Rust API instead of rejecting
+        // otherwise valid tag sets that contain unknown bits.
+        Flags::try_from(flags_raw & Flags::all_bits()).expect("masked tag-set flags must be valid")
     }
 
     /// Create a `TagSet<T>` from a raw pointer.
@@ -169,6 +215,21 @@ impl<T: Operations> TagSet<T> {
         unsafe { (*self.inner.get()).nr_hw_queues }
     }
 
+    /// Stop dispatch from every request queue that uses this tag set and wait
+    /// for in-progress dispatch callbacks to finish.
+    pub fn quiesce(&self) {
+        // SAFETY: By type invariant, `self.inner` is a valid tag set. The block
+        // layer provides the synchronization required by this operation.
+        unsafe { bindings::blk_mq_quiesce_tagset(self.inner.get()) }
+    }
+
+    /// Resume dispatch on every request queue that uses this tag set.
+    pub fn unquiesce(&self) {
+        // SAFETY: By type invariant, `self.inner` is a valid tag set. The block
+        // layer provides the synchronization required by this operation.
+        unsafe { bindings::blk_mq_unquiesce_tagset(self.inner.get()) }
+    }
+
     /// Borrow the [`T::TagSetData`](Operations::TagSetData) associated with
     /// this tag set.
     pub fn data(&self) -> <T::TagSetData as ForeignOwnable>::Borrowed<'_> {
@@ -179,6 +240,23 @@ impl<T: Operations> TagSet<T> {
         // converted back with `from_foreign` while `&self` is live.
         unsafe { T::TagSetData::borrow(ptr) }
     }
+    /// Try to obtain a request from a tag shared by all hardware queues.
+    ///
+    /// This method is only valid for tag sets configured with
+    /// [`Flag::TagHctxShared`]. Unlike `TagSet::tag_to_rq`, it does not wait
+    /// for a request that is currently owned by the block layer or through an
+    /// exclusive Rust reference. It returns [`EBUSY`] instead.
+    pub fn try_shared_tag_to_rq(&self, tag: u32) -> Result<Option<ARef<Request<T>>>> {
+        if !self.flags().contains(Flag::TagHctxShared) {
+            return Err(EINVAL);
+        }
+
+        // SAFETY: `self.inner` is a live tag set, and the shared-tag flag
+        // requires blk-mq to allocate `shared_tags` during initialization.
+        let tags = unsafe { (*self.inner.get()).shared_tags };
+        Self::try_rq_from_tags(tags, tag)
+    }
+
     /// TODO
     pub fn queue_depth(&self) -> u32 {
         // SAFETY: By type invariant, `self.inner` is valid.
