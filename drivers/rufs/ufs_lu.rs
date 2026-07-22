@@ -10,6 +10,7 @@ use kernel::bindings;
 use kernel::block::error::code::BLK_STS_IOERR;
 use kernel::block::mq::gen_disk::BoundGenDisk;
 use kernel::block::mq::LimitsBuilder;
+use kernel::sync::atomic::{Atomic, Relaxed};
 use kernel::sync::{Arc, Mutex, SpinLock};
 use kernel::types::{OwnableRefCounted, Owned};
 use kernel::{
@@ -190,7 +191,7 @@ impl UfsLu {
         let request_queue = RequestQueue::new(
             self.queue.tags.clone(),
             limits,
-            KBox::new(QueueData::Lu(self.clone()), GFP_KERNEL)?,
+            KBox::new(QueueData::lu(self.clone()), GFP_KERNEL)?,
             self.queue_depth,
         )?;
 
@@ -287,17 +288,64 @@ pub(crate) struct TagSetData {
     pub(crate) hw_queues: KVec<UfsHwQueue>,
 }
 
-pub(crate) enum QueueData {
+enum QueueOwner {
     Dev(Arc<UfsQueue>),
     Lu(Arc<UfsLu>),
 }
 
+pub(crate) struct QueueData {
+    owner: QueueOwner,
+    // Best-effort completion-side restart hint. The delayed retry installed
+    // by the block API guarantees progress if this hint races with dispatch.
+    budget_waiting: Atomic<bool>,
+}
+
 impl QueueData {
-    fn queue(&self) -> &UfsQueue {
-        match self {
-            Self::Dev(queue) => queue,
-            Self::Lu(lu) => &lu.queue,
+    pub(crate) fn dev(queue: Arc<UfsQueue>) -> Self {
+        Self {
+            owner: QueueOwner::Dev(queue),
+            budget_waiting: Atomic::new(false),
         }
+    }
+
+    pub(crate) fn lu(lu: Arc<UfsLu>) -> Self {
+        Self {
+            owner: QueueOwner::Lu(lu),
+            budget_waiting: Atomic::new(false),
+        }
+    }
+
+    pub(crate) fn queue(&self) -> &UfsQueue {
+        self.queue_arc()
+    }
+
+    pub(crate) fn queue_arc(&self) -> &Arc<UfsQueue> {
+        match &self.owner {
+            QueueOwner::Dev(queue) => queue,
+            QueueOwner::Lu(lu) => &lu.queue,
+        }
+    }
+
+    pub(crate) fn dev_queue(&self) -> Option<&Arc<UfsQueue>> {
+        match &self.owner {
+            QueueOwner::Dev(queue) => Some(queue),
+            QueueOwner::Lu(_) => None,
+        }
+    }
+
+    pub(crate) fn logical_unit(&self) -> Option<&Arc<UfsLu>> {
+        match &self.owner {
+            QueueOwner::Dev(_) => None,
+            QueueOwner::Lu(lu) => Some(lu),
+        }
+    }
+
+    fn mark_budget_waiting(&self) {
+        self.budget_waiting.store(true, Relaxed);
+    }
+
+    fn take_budget_waiting(&self) -> bool {
+        self.budget_waiting.xchg(false, Relaxed)
     }
 }
 
@@ -316,11 +364,15 @@ impl Operations for UfsLuBlockOps {
     }
 
     fn get_budget(queue_data: &QueueData) -> Option<u32> {
-        queue_data.queue().try_get_budget()
+        let token = queue_data.queue().try_get_budget();
+        if token.is_none() {
+            queue_data.mark_budget_waiting();
+        }
+        token
     }
 
-    fn put_budget(queue_data: &QueueData, token: u32) {
-        queue_data.queue().put_budget(token)
+    fn put_budget(queue_data: &QueueData, token: u32) -> bool {
+        queue_data.queue().put_budget(token) && queue_data.take_budget_waiting()
     }
 
     fn queue_rq(
@@ -335,7 +387,7 @@ impl Operations for UfsLuBlockOps {
 
         let cmd = match command {
             mq::Command::Read | mq::Command::Write => {
-                let QueueData::Lu(lu) = lu else {
+                let Some(lu) = lu.logical_unit() else {
                     return Err(BLK_STS_IOERR);
                 };
                 let geometry = lu.geometry();
@@ -386,14 +438,14 @@ impl Operations for UfsLuBlockOps {
                 cmd
             }
             mq::Command::Flush => {
-                let QueueData::Lu(lu) = lu else {
+                let Some(lu) = lu.logical_unit() else {
                     return Err(BLK_STS_IOERR);
                 };
                 pr_debug!("[RUFS] ufs_lu: flush request on LU {}\n", lu.lun());
                 lu.build_scsi_cmd(command, 0, 0)?
             }
             mq::Command::Discard => {
-                let QueueData::Lu(lu) = lu else {
+                let Some(lu) = lu.logical_unit() else {
                     return Err(BLK_STS_IOERR);
                 };
                 let geometry = lu.geometry();
@@ -490,10 +542,7 @@ impl Operations for UfsLuBlockOps {
     }
 
     fn complete(rq: ARef<mq::Request<Self>>) {
-        let queue = match rq.queue_data() {
-            QueueData::Dev(queue) => queue.clone(),
-            QueueData::Lu(lu) => lu.queue.clone(),
-        };
+        let queue = rq.queue_data().queue_arc().clone();
         let tag = rq.tag() as usize;
         let disposition = match rq.data_ref().inner.lock().take_scheduled_completion() {
             Ok(disposition) => disposition,
@@ -540,7 +589,7 @@ impl Operations for UfsLuBlockOps {
         queue_data: &QueueData,
         batch: &mut mq::IoCompletionBatch<Self>,
     ) -> Result<mq::PollStatus> {
-        let QueueData::Lu(lu) = queue_data else {
+        let Some(lu) = queue_data.logical_unit() else {
             return Err(EIO);
         };
         Ok(if lu.queue.poll(hw_queue, batch) {

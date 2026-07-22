@@ -1558,7 +1558,7 @@ impl UfsRequestData {
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
         hw_queue: &UfsHwQueue,
     ) -> Result<()> {
-        if let QueueData::Dev(queue) = rq.queue_data() {
+        if let Some(queue) = rq.queue_data().dev_queue() {
             let cmd = rq.data_ref().inner.lock().prepared_command()?.get_device()?;
             let task_tag = Self::task_tag(rq)?;
             queue.compose_dev(cmd, task_tag)?;
@@ -1575,10 +1575,7 @@ impl UfsRequestData {
         hw_queue: &UfsHwQueue,
     ) -> Result<()> {
         let mempool = rq.queue().tag_set().data().dma_vec_mempool.clone();
-        let queue = match rq.queue_data() {
-            QueueData::Dev(queue) => queue,
-            QueueData::Lu(lu) => &lu.queue,
-        };
+        let queue = rq.queue_data().queue();
         let task_tag = Self::task_tag(rq)?;
         let prdt = UfsQueue::compose_scsi(rq, cmd, task_tag, &mempool)?;
 
@@ -1595,10 +1592,7 @@ impl UfsRequestData {
         rq: ARef<mq::Request<UfsLuBlockOps>>,
         hw_queue: &UfsHwQueue,
     ) -> core::result::Result<(), (ARef<mq::Request<UfsLuBlockOps>>, Error)> {
-        let queue = match rq.queue_data() {
-            QueueData::Dev(ufs_queue) => ufs_queue.clone(),
-            QueueData::Lu(ufs_lu) => ufs_lu.queue.clone(),
-        };
+        let queue = rq.queue_data().queue_arc().clone();
         let queue_id = hw_queue.id();
         let task_tag = match Self::task_tag(&rq) {
             Ok(task_tag) => task_tag,
@@ -1657,10 +1651,7 @@ impl UfsRequestData {
         queue_data: &QueueData,
         tag: u32,
     ) -> bool {
-        let queue = match queue_data {
-            QueueData::Dev(queue) => queue.clone(),
-            QueueData::Lu(lu) => lu.queue.clone(),
-        };
+        let queue = queue_data.queue_arc().clone();
         let disposition = request_data.inner.lock().timeout();
         let cmd = match disposition {
             TimeoutDisposition::StartRecovery(cmd) => {
@@ -1720,10 +1711,7 @@ impl UfsRequestData {
         cqe: Option<CqEntry>,
         target: CompletionTarget<'_>,
     ) -> CompletionOutcome {
-        let request_queue = match rq.queue_data() {
-            QueueData::Dev(queue) => queue.clone(),
-            QueueData::Lu(lu) => lu.queue.clone(),
-        };
+        let request_queue = rq.queue_data().queue_arc().clone();
         let (cmd, prdt) = match rq
             .data_ref()
             .inner
@@ -1746,7 +1734,7 @@ impl UfsRequestData {
 
         match cmd {
             UfsCmd::Device(cmd) => {
-                let QueueData::Dev(queue) = rq.queue_data() else {
+                let Some(queue) = rq.queue_data().dev_queue() else {
                     pr_err!("[RUFS] ufs_queue: device request has invalid context\n");
                     drop(prdt);
                     let status = u32::from(bindings::BLK_STS_IOERR);
@@ -1774,7 +1762,7 @@ impl UfsRequestData {
                 Self::end_device_request(rq, request_queue, status)
             }
             UfsCmd::SCSI(cmd) => {
-                let QueueData::Lu(lu) = rq.queue_data() else {
+                let Some(lu) = rq.queue_data().logical_unit() else {
                     pr_err!("[RUFS] ufs_queue: SCSI request has invalid context\n");
                     drop(prdt);
                     let status = u32::from(bindings::BLK_STS_IOERR);
@@ -1796,7 +1784,7 @@ impl UfsRequestData {
         status: u32,
     ) -> CompletionOutcome {
         let tag = rq.tag();
-        rq.release_budget();
+        rq.release_budget_and_run_queue();
         let rq = match OwnableRefCounted::try_from_shared(rq) {
             Ok(rq) => rq,
             Err(_rq) => {
@@ -1907,18 +1895,19 @@ impl UfsQueue {
         self.command_pool.lock().owner(task_tag).ok_or(EIO)
     }
 
-    pub(crate) fn put_budget(&self, token: u32) {
+    pub(crate) fn put_budget(&self, token: u32) -> bool {
         let Ok(task_tag) = TaskTag::new(token) else {
             pr_warn!("[RUFS] ufs_queue: invalid budget token={}\n", token);
-            return;
+            return false;
         };
         if self.command_pool.lock().release(task_tag).is_err() {
             pr_warn!(
                 "[RUFS] ufs_queue: invalid command slot release task_tag={}\n",
                 task_tag.value(),
             );
-            return;
+            return false;
         }
+        true
     }
 
     fn completion_pass_limit(&self) -> usize {
@@ -1987,10 +1976,7 @@ impl UfsQueue {
         task_tag: TaskTag,
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>> {
-        let queue = match rq.queue_data() {
-            QueueData::Dev(ufs_queue) => ufs_queue,
-            QueueData::Lu(ufs_lu) => &ufs_lu.queue,
-        };
+        let queue = rq.queue_data().queue();
 
         queue.backend.ops().compose_scsi(cmd, rq, task_tag, mempool)
     }
@@ -2271,7 +2257,7 @@ impl UfsQueue {
                     self.require_recovery("invalid SCSI completion state", tag as usize);
                     return CompletionOutcome::RetainedForRecovery;
                 }
-                rq.release_budget();
+                rq.release_budget_and_run_queue();
                 mq::Request::complete(rq);
                 CompletionOutcome::Returned
             }
@@ -2293,7 +2279,7 @@ impl UfsQueue {
                     self.require_recovery("invalid polled completion state", tag as usize);
                     return CompletionOutcome::RetainedForRecovery;
                 }
-                rq.release_budget();
+                rq.release_budget_and_run_queue();
 
                 if requeue {
                     rq.requeue(true);

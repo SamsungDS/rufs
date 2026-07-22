@@ -683,7 +683,7 @@ impl UfsDev {
         let request_queue = RequestQueue::new(
             ufs_queue.tags.clone(),
             limits,
-            KBox::new(QueueData::Dev(ufs_queue.clone()), GFP_KERNEL)?,
+            KBox::new(QueueData::dev(ufs_queue.clone()), GFP_KERNEL)?,
             ufs_queue.tags.queue_depth(),
         )?;
 
