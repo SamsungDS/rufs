@@ -10,14 +10,14 @@ use kernel::bindings;
 use kernel::block::error::code::BLK_STS_IOERR;
 use kernel::block::mq::gen_disk::BoundGenDisk;
 use kernel::block::mq::LimitsBuilder;
-use kernel::block::mq::RequestQueue;
 use kernel::sync::{Arc, Mutex, SpinLock};
 use kernel::types::{OwnableRefCounted, Owned};
 use kernel::{
     block::{
         error::BlkResult,
         mq::{
-            self, dma_map_iter::DmaMapMempool, gen_disk::GenDisk, IdleRequest, Operations, TagSet,
+            self, dma_map_iter::DmaMapMempool, gen_disk::GenDisk, IdleRequest, Operations,
+            RequestQueue, TagSet,
         },
         SECTOR_SIZE,
     },
@@ -292,6 +292,15 @@ pub(crate) enum QueueData {
     Lu(Arc<UfsLu>),
 }
 
+impl QueueData {
+    fn queue(&self) -> &UfsQueue {
+        match self {
+            Self::Dev(queue) => queue,
+            Self::Lu(lu) => &lu.queue,
+        }
+    }
+}
+
 #[vtable]
 impl Operations for UfsLuBlockOps {
     type RequestData = UfsRequestData;
@@ -304,6 +313,14 @@ impl Operations for UfsLuBlockOps {
         pin_init!(UfsRequestData {
             inner <- new_spinlock!(UfsRequestInner::default()),
         })
+    }
+
+    fn get_budget(queue_data: &QueueData) -> Option<u32> {
+        queue_data.queue().try_get_budget()
+    }
+
+    fn put_budget(queue_data: &QueueData, token: u32) {
+        queue_data.queue().put_budget(token)
     }
 
     fn queue_rq(
@@ -427,7 +444,7 @@ impl Operations for UfsLuBlockOps {
             }
             mq::Command::DriverIn | mq::Command::DriverOut => {
                 let rq = OwnableRefCounted::into_shared(rq.start());
-                if let Err(e) = UfsRequestData::compose_dev_request(&rq) {
+                if let Err(e) = UfsRequestData::compose_dev_request(&rq, hw_queue) {
                     complete_unsubmitted(rq, e);
                     return Ok(());
                 }
@@ -449,7 +466,7 @@ impl Operations for UfsLuBlockOps {
         // the same tag after releasing the DMA mapping.
         let rq = OwnableRefCounted::into_shared(rq.start());
 
-        if let Err(e) = UfsRequestData::compose_scsi_cmd(&rq, cmd) {
+        if let Err(e) = UfsRequestData::compose_scsi_cmd(&rq, cmd, hw_queue) {
             complete_unsubmitted(rq, e);
             return Ok(());
         }

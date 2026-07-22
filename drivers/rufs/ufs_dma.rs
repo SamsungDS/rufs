@@ -1579,11 +1579,6 @@ impl UfsMcqCompletionQueue {
     }
 }
 
-/// Coherent transfer memory shared by all hardware queues.
-///
-/// The allocations are immutable, while each active blk-mq tag exclusively
-/// owns the corresponding UCD and UTRD contents. The request state machine
-/// prevents a tag from being composed, completed, or recovered concurrently.
 pub(crate) struct UfsDma {
     reg: Arc<UfsReg>,
     dev: ARef<device::Device>,
@@ -1733,10 +1728,11 @@ impl UfsDma {
         &self,
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
         cmd: UfsSCSICmd,
+        task_tag: u8,
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>> {
         let prdt = self.map_request_prdt(cmd, rq, mempool)?;
-        let tag: usize = rq.tag().try_into().unwrap();
+        let tag = usize::from(task_tag);
 
         io_project!(self.ucdl, [try: tag].cmd_upiu).copy_write(Upiu::command(cmd, tag));
         io_project!(self.ucdl, [try: tag].rsp_upiu).copy_write(Upiu::default());

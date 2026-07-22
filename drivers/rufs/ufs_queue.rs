@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+use crate::ufs_command::{CommandOwner, CommandPool, TaskTag, TASK_TAG_COUNT};
 use crate::ufs_dev::*;
 use crate::ufs_dma::*;
 use crate::ufs_lu::{QueueData, TagSetData, UfsLuBlockOps, UfsRequestData};
@@ -22,7 +23,7 @@ const READ_16: u8 = 0x88;
 const WRITE_16: u8 = 0x8a;
 const UFS_MCQ_DEFAULT_READ_QUEUES: usize = 0;
 const UFS_MCQ_DEFAULT_POLL_QUEUES: usize = 1;
-const UFS_TASK_TAG_COUNT: usize = 256;
+const UFS_MCQ_SOFTWARE_QUEUE_DEPTH: usize = 256;
 const COMPLETION_BATCH_SIZE: usize = 16;
 
 fn possible_cpus() -> usize {
@@ -37,7 +38,9 @@ pub(crate) struct McqConfig {
     read_queues: usize,
     interrupt_queues: usize,
     poll_queues: usize,
-    tag_count: usize,
+    max_active_commands: usize,
+    task_tag_count: usize,
+    software_queue_depth: usize,
     ring_entries: usize,
 }
 
@@ -89,9 +92,11 @@ impl UfsTransferConfig {
         let total_queues = interrupt_queues
             .checked_add(poll_queues)
             .ok_or(EOVERFLOW)?;
-        let tag_count = core::cmp::min(reg.nutrs_mcq(), UFS_TASK_TAG_COUNT);
-        let ring_entries = tag_count.checked_add(1).ok_or(EOVERFLOW)?;
-        if interrupt_queues == 0 || tag_count == 0 {
+        let max_active_commands = core::cmp::min(reg.nutrs_mcq(), TASK_TAG_COUNT);
+        let task_tag_count = TASK_TAG_COUNT;
+        let software_queue_depth = UFS_MCQ_SOFTWARE_QUEUE_DEPTH;
+        let ring_entries = max_active_commands.checked_add(1).ok_or(EOVERFLOW)?;
+        if interrupt_queues == 0 || max_active_commands == 0 {
             return Err(EINVAL);
         }
 
@@ -102,7 +107,9 @@ impl UfsTransferConfig {
             read_queues,
             interrupt_queues,
             poll_queues,
-            tag_count,
+            max_active_commands,
+            task_tag_count,
+            software_queue_depth,
             ring_entries,
         }))
     }
@@ -110,7 +117,21 @@ impl UfsTransferConfig {
     pub(crate) fn tag_count(&self) -> usize {
         match self {
             Self::Sdb { tag_count } => *tag_count,
-            Self::Mcq(config) => config.tag_count,
+            Self::Mcq(config) => config.task_tag_count,
+        }
+    }
+
+    fn software_queue_depth(&self) -> usize {
+        match self {
+            Self::Sdb { tag_count } => *tag_count,
+            Self::Mcq(config) => config.software_queue_depth,
+        }
+    }
+
+    fn max_active_commands(&self) -> usize {
+        match self {
+            Self::Sdb { tag_count } => *tag_count,
+            Self::Mcq(config) => config.max_active_commands,
         }
     }
 
@@ -444,6 +465,18 @@ enum CompletionTarget<'a> {
     Poll(&'a mut mq::IoCompletionBatch<UfsLuBlockOps>),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompletionOutcome {
+    Returned,
+    RetainedForRecovery,
+}
+
+impl CompletionOutcome {
+    fn returned(self) -> bool {
+        self == Self::Returned
+    }
+}
+
 pub(crate) struct UfsRequestInner {
     state: UfsRequestState,
 }
@@ -560,11 +593,18 @@ impl UfsRequestInner {
         if !matches!(cmd, UfsCmd::Device(_)) || !matches!(self.state, UfsRequestState::Idle) {
             return Err(EINVAL);
         }
-        self.state = UfsRequestState::Prepared { cmd, prdt: None };
+        self.state = UfsRequestState::Prepared {
+            cmd,
+            prdt: None,
+        };
         Ok(())
     }
 
-    fn prepare_scsi(&mut self, cmd: UfsSCSICmd, prdt: Option<UfsPrdtMapping>) -> Result<()> {
+    fn prepare_scsi(
+        &mut self,
+        cmd: UfsSCSICmd,
+        prdt: Option<UfsPrdtMapping>,
+    ) -> Result<()> {
         if !matches!(self.state, UfsRequestState::Idle) {
             return Err(EBUSY);
         }
@@ -739,9 +779,35 @@ struct SdbTransferState {
 
 #[derive(Clone, Copy)]
 struct CompletedRequest {
-    tag: usize,
+    task_tag: TaskTag,
     queue_id: u32,
     cqe: Option<CqEntry>,
+}
+
+struct ResolvedCompletion {
+    rq: ARef<mq::Request<UfsLuBlockOps>>,
+    task_tag: TaskTag,
+    queue_id: u32,
+    cqe: Option<CqEntry>,
+}
+
+impl ResolvedCompletion {
+    fn complete(self) -> CompletionOutcome {
+        UfsRequestData::complete(self.rq, self.task_tag, self.queue_id, self.cqe)
+    }
+
+    fn complete_polled(
+        self,
+        batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>,
+    ) -> CompletionOutcome {
+        UfsRequestData::complete_polled(
+            self.rq,
+            self.task_tag,
+            self.queue_id,
+            self.cqe,
+            batch,
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -774,13 +840,18 @@ impl CompletedRequests {
         }
     }
 
-    fn insert(&mut self, tag: usize, queue_id: u32, cqe: Option<CqEntry>) -> Result<()> {
+    fn insert(
+        &mut self,
+        task_tag: TaskTag,
+        queue_id: u32,
+        cqe: Option<CqEntry>,
+    ) -> Result<()> {
         if self.len == self.requests.len() {
             return Err(ENOMEM);
         }
 
         self.requests[self.len] = Some(CompletedRequest {
-            tag,
+            task_tag,
             queue_id,
             cqe,
         });
@@ -795,7 +866,7 @@ impl CompletedRequests {
             let tag = mask.trailing_zeros();
             let tag_mask = 1u32 << tag;
             mask &= !tag_mask;
-            self.insert(tag as usize, 0, None)?;
+            self.insert(TaskTag::new(tag)?, 0, None)?;
             inserted |= tag_mask;
         }
 
@@ -906,11 +977,18 @@ impl McqHardwareQueue {
                 consumed = true;
                 if let Some(cqe) = completion.consume_entry(&self.descriptor)? {
                     match dma.tag_from_cq_entry(&cqe, self.descriptor.id()) {
-                        Ok(tag) => completed_requests.insert(
-                            tag,
-                            self.descriptor.id(),
-                            Some(cqe),
-                        )?,
+                        Ok(tag) => match TaskTag::from_index(tag) {
+                            Ok(task_tag) => completed_requests.insert(
+                                task_tag,
+                                self.descriptor.id(),
+                                Some(cqe),
+                            )?,
+                            Err(_) => completed_requests.record_fault(
+                                "invalid MCQ completion task tag",
+                                tag,
+                                Some(self.descriptor.id()),
+                            ),
+                        },
                         Err(_) => completed_requests.record_fault(
                             "invalid MCQ completion descriptor",
                             usize::from(cqe.task_tag()),
@@ -1157,17 +1235,19 @@ impl UfsHwQueue {
 
 trait UfsTransferOps: Send + Sync {
     fn hw_queues(&self) -> Result<KVec<UfsHwQueue>>;
-    fn compose_dev(&self, cmd: UfsDevCmd, tag: u32) -> Result<()>;
+    fn compose_dev(&self, cmd: UfsDevCmd, task_tag: TaskTag) -> Result<()>;
     fn compose_scsi(
         &self,
         cmd: UfsSCSICmd,
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        task_tag: TaskTag,
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>>;
     fn dump_state(&self, tag: usize, reason: &str);
     fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()>;
-    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize, cqe: Option<CqEntry>) -> Result<UfsCmd>;
-    fn fetch_scsi_completion(&self, tag: usize, cqe: Option<CqEntry>) -> UfsScsiResult;
+    fn fetch_dev(&self, cmd: UfsDevCmd, task_tag: TaskTag, cqe: Option<CqEntry>)
+        -> Result<UfsCmd>;
+    fn fetch_scsi_completion(&self, task_tag: TaskTag, cqe: Option<CqEntry>) -> UfsScsiResult;
 }
 
 impl SdbTransferBackend {
@@ -1234,29 +1314,37 @@ impl UfsTransferOps for SdbTransferBackend {
         Ok(queues)
     }
 
-    fn compose_dev(&self, cmd: UfsDevCmd, tag: u32) -> Result<()> {
-        self.dma.compose_devman_upiu(cmd, tag)
+    fn compose_dev(&self, cmd: UfsDevCmd, task_tag: TaskTag) -> Result<()> {
+        self.dma
+            .compose_devman_upiu(cmd, u32::from(task_tag.value()))
     }
 
     fn compose_scsi(
         &self,
         cmd: UfsSCSICmd,
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        task_tag: TaskTag,
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>> {
-        self.dma.compose_scsi_upiu(rq, cmd, mempool)
+        self.dma
+            .compose_scsi_upiu(rq, cmd, task_tag.value(), mempool)
     }
 
     fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()> {
         SdbTransferBackend::collect_completions(self, completed)
     }
 
-    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize, _cqe: Option<CqEntry>) -> Result<UfsCmd> {
-        self.dma.fetch_devman_upiu(cmd, tag)
+    fn fetch_dev(
+        &self,
+        cmd: UfsDevCmd,
+        task_tag: TaskTag,
+        _cqe: Option<CqEntry>,
+    ) -> Result<UfsCmd> {
+        self.dma.fetch_devman_upiu(cmd, task_tag.index())
     }
 
-    fn fetch_scsi_completion(&self, tag: usize, _cqe: Option<CqEntry>) -> UfsScsiResult {
-        self.dma.fetch_scsi_completion(tag)
+    fn fetch_scsi_completion(&self, task_tag: TaskTag, _cqe: Option<CqEntry>) -> UfsScsiResult {
+        self.dma.fetch_scsi_completion(task_tag.index())
     }
 
     fn dump_state(&self, tag: usize, reason: &str) {
@@ -1297,7 +1385,7 @@ impl McqTransferBackend {
     }
 
     fn queue_depth(&self) -> usize {
-        self.config.tag_count
+        self.config.max_active_commands
     }
 
     fn allocated_queues(&self) -> usize {
@@ -1342,17 +1430,20 @@ impl McqTransferBackend {
         Ok(())
     }
 
-    fn compose_dev(&self, cmd: UfsDevCmd, tag: u32) -> Result<()> {
-        self.dma.compose_devman_upiu(cmd, tag)
+    fn compose_dev(&self, cmd: UfsDevCmd, task_tag: TaskTag) -> Result<()> {
+        self.dma
+            .compose_devman_upiu(cmd, u32::from(task_tag.value()))
     }
 
     fn compose_scsi(
         &self,
         cmd: UfsSCSICmd,
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        task_tag: TaskTag,
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>> {
-        self.dma.compose_scsi_upiu(rq, cmd, mempool)
+        self.dma
+            .compose_scsi_upiu(rq, cmd, task_tag.value(), mempool)
     }
 
     fn dump_state(&self, tag: usize, reason: &str) {
@@ -1371,14 +1462,14 @@ impl McqTransferBackend {
         )
     }
 
-    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize, cqe: Option<CqEntry>) -> Result<UfsCmd> {
+    fn fetch_dev(&self, cmd: UfsDevCmd, task_tag: TaskTag, cqe: Option<CqEntry>) -> Result<UfsCmd> {
         self.dma
-            .fetch_mcq_devman_upiu(cmd, tag, cqe.ok_or(EIO)?)
+            .fetch_mcq_devman_upiu(cmd, task_tag.index(), cqe.ok_or(EIO)?)
     }
 
-    fn fetch_scsi_completion(&self, tag: usize, cqe: Option<CqEntry>) -> UfsScsiResult {
+    fn fetch_scsi_completion(&self, task_tag: TaskTag, cqe: Option<CqEntry>) -> UfsScsiResult {
         match cqe {
-            Some(cqe) => self.dma.fetch_mcq_scsi_completion(tag, cqe),
+            Some(cqe) => self.dma.fetch_mcq_scsi_completion(task_tag.index(), cqe),
             None => UfsScsiResult::error(0xf),
         }
     }
@@ -1389,17 +1480,18 @@ impl UfsTransferOps for McqTransferBackend {
         McqTransferBackend::hw_queues(self)
     }
 
-    fn compose_dev(&self, cmd: UfsDevCmd, tag: u32) -> Result<()> {
-        McqTransferBackend::compose_dev(self, cmd, tag)
+    fn compose_dev(&self, cmd: UfsDevCmd, task_tag: TaskTag) -> Result<()> {
+        McqTransferBackend::compose_dev(self, cmd, task_tag)
     }
 
     fn compose_scsi(
         &self,
         cmd: UfsSCSICmd,
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        task_tag: TaskTag,
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>> {
-        McqTransferBackend::compose_scsi(self, cmd, rq, mempool)
+        McqTransferBackend::compose_scsi(self, cmd, rq, task_tag, mempool)
     }
 
     fn dump_state(&self, tag: usize, reason: &str) {
@@ -1410,12 +1502,12 @@ impl UfsTransferOps for McqTransferBackend {
         McqTransferBackend::collect_completions(self, completed)
     }
 
-    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize, cqe: Option<CqEntry>) -> Result<UfsCmd> {
-        McqTransferBackend::fetch_dev(self, cmd, tag, cqe)
+    fn fetch_dev(&self, cmd: UfsDevCmd, task_tag: TaskTag, cqe: Option<CqEntry>) -> Result<UfsCmd> {
+        McqTransferBackend::fetch_dev(self, cmd, task_tag, cqe)
     }
 
-    fn fetch_scsi_completion(&self, tag: usize, cqe: Option<CqEntry>) -> UfsScsiResult {
-        McqTransferBackend::fetch_scsi_completion(self, tag, cqe)
+    fn fetch_scsi_completion(&self, task_tag: TaskTag, cqe: Option<CqEntry>) -> UfsScsiResult {
+        McqTransferBackend::fetch_scsi_completion(self, task_tag, cqe)
     }
 
 }
@@ -1458,10 +1550,20 @@ impl UfsTransferBackend {
 }
 
 impl UfsRequestData {
-    pub(crate) fn compose_dev_request(rq: &ARef<mq::Request<UfsLuBlockOps>>) -> Result<()> {
+    fn task_tag(rq: &mq::Request<UfsLuBlockOps>) -> Result<TaskTag> {
+        TaskTag::new(rq.dispatch_budget().ok_or(EIO)?)
+    }
+
+    pub(crate) fn compose_dev_request(
+        rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        hw_queue: &UfsHwQueue,
+    ) -> Result<()> {
         if let QueueData::Dev(queue) = rq.queue_data() {
             let cmd = rq.data_ref().inner.lock().prepared_command()?.get_device()?;
-            queue.compose_dev(cmd, rq.tag())
+            let task_tag = Self::task_tag(rq)?;
+            queue.compose_dev(cmd, task_tag)?;
+            queue.bind_command(task_tag, hw_queue.id(), rq.tag())?;
+            Ok(())
         } else {
             Err(EIO)
         }
@@ -1470,11 +1572,23 @@ impl UfsRequestData {
     pub(crate) fn compose_scsi_cmd(
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
         cmd: UfsSCSICmd,
+        hw_queue: &UfsHwQueue,
     ) -> Result<()> {
         let mempool = rq.queue().tag_set().data().dma_vec_mempool.clone();
-        let prdt = UfsQueue::compose_scsi(rq, cmd, &mempool)?;
+        let queue = match rq.queue_data() {
+            QueueData::Dev(queue) => queue,
+            QueueData::Lu(lu) => &lu.queue,
+        };
+        let task_tag = Self::task_tag(rq)?;
+        let prdt = UfsQueue::compose_scsi(rq, cmd, task_tag, &mempool)?;
 
-        rq.data_ref().inner.lock().prepare_scsi(cmd, prdt)
+        rq
+            .data_ref()
+            .inner
+            .lock()
+            .prepare_scsi(cmd, prdt)?;
+        queue.bind_command(task_tag, hw_queue.id(), rq.tag())?;
+        Ok(())
     }
 
     pub(crate) fn submit(
@@ -1486,7 +1600,10 @@ impl UfsRequestData {
             QueueData::Lu(ufs_lu) => ufs_lu.queue.clone(),
         };
         let queue_id = hw_queue.id();
-        let tag = rq.tag();
+        let task_tag = match Self::task_tag(&rq) {
+            Ok(task_tag) => task_tag,
+            Err(e) => return Err((rq, e)),
+        };
         let polled = rq.flags().contains(mq::RequestFlag::Polled);
 
         if queue.recovery_required() {
@@ -1498,7 +1615,7 @@ impl UfsRequestData {
         }
 
         let mut rq = Some(rq);
-        let outcome = hw_queue.submit(tag, polled, || {
+        let outcome = hw_queue.submit(u32::from(task_tag.value()), polled, || {
             let request = rq.as_ref().ok_or(EIO)?;
             request
                 .data_ref()
@@ -1517,7 +1634,7 @@ impl UfsRequestData {
             SubmissionOutcome::Submitted => Ok(()),
             SubmissionOutcome::NotSubmitted(e) => {
                 let Some(rq) = rq else {
-                    queue.require_recovery("invalid submission ownership", tag as usize);
+                    queue.require_recovery("invalid submission ownership", task_tag.index());
                     return Ok(());
                 };
                 Err((rq, e))
@@ -1525,11 +1642,11 @@ impl UfsRequestData {
             SubmissionOutcome::PublishFailed(e) => {
                 pr_err!(
                     "[RUFS] ufs_queue: submission publish failed tag={} queue={} errno={}\n",
-                    tag,
+                    task_tag.value(),
                     queue_id,
                     e.to_errno(),
                 );
-                queue.require_recovery("submission publish failed", tag as usize);
+                queue.require_recovery("submission publish failed", task_tag.index());
                 Ok(())
             }
         }
@@ -1544,8 +1661,6 @@ impl UfsRequestData {
             QueueData::Dev(queue) => queue.clone(),
             QueueData::Lu(lu) => lu.queue.clone(),
         };
-        queue.dump_backend_state(tag as usize, "request timeout");
-
         let disposition = request_data.inner.lock().timeout();
         let cmd = match disposition {
             TimeoutDisposition::StartRecovery(cmd) => {
@@ -1575,27 +1690,36 @@ impl UfsRequestData {
 
     fn complete(
         rq: ARef<mq::Request<UfsLuBlockOps>>,
+        task_tag: TaskTag,
         queue_id: u32,
         cqe: Option<CqEntry>,
-    ) -> bool {
-        Self::complete_with(rq, queue_id, cqe, CompletionTarget::Direct)
+    ) -> CompletionOutcome {
+        Self::complete_with(rq, task_tag, queue_id, cqe, CompletionTarget::Direct)
     }
 
     fn complete_polled(
         rq: ARef<mq::Request<UfsLuBlockOps>>,
+        task_tag: TaskTag,
         queue_id: u32,
         cqe: Option<CqEntry>,
         batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>,
-    ) -> bool {
-        Self::complete_with(rq, queue_id, cqe, CompletionTarget::Poll(batch))
+    ) -> CompletionOutcome {
+        Self::complete_with(
+            rq,
+            task_tag,
+            queue_id,
+            cqe,
+            CompletionTarget::Poll(batch),
+        )
     }
 
     fn complete_with(
         rq: ARef<mq::Request<UfsLuBlockOps>>,
+        task_tag: TaskTag,
         queue_id: u32,
         cqe: Option<CqEntry>,
         target: CompletionTarget<'_>,
-    ) -> bool {
+    ) -> CompletionOutcome {
         let request_queue = match rq.queue_data() {
             QueueData::Dev(queue) => queue.clone(),
             QueueData::Lu(lu) => lu.queue.clone(),
@@ -1616,7 +1740,7 @@ impl UfsRequestData {
                     "completion for inactive request",
                     rq.tag() as usize,
                 );
-                return false;
+                return CompletionOutcome::RetainedForRecovery;
             }
         };
 
@@ -1629,7 +1753,7 @@ impl UfsRequestData {
                     rq.data_ref().inner.lock().reset();
                     return Self::end_device_request(rq, request_queue, status);
                 };
-                let result = queue.fetch_dev(cmd, rq.tag() as usize, cqe);
+                let result = queue.fetch_dev(cmd, task_tag, cqe);
                 drop(prdt);
                 let status = match result {
                     Ok(UfsCmd::Device(cmd)) => {
@@ -1658,11 +1782,10 @@ impl UfsRequestData {
                     return Self::end_device_request(rq, request_queue, status);
                 };
                 let queue = &lu.queue;
-                let result = queue.fetch_scsi_completion(rq.tag() as usize, cqe);
+                let result = queue.fetch_scsi_completion(task_tag, cqe);
                 drop(prdt);
 
-                queue.clone().complete_scsi(cmd, result, rq, target);
-                true
+                queue.clone().complete_scsi(cmd, result, rq, target)
             }
         }
     }
@@ -1671,18 +1794,19 @@ impl UfsRequestData {
         rq: ARef<mq::Request<UfsLuBlockOps>>,
         queue: Arc<UfsQueue>,
         status: u32,
-    ) -> bool {
+    ) -> CompletionOutcome {
         let tag = rq.tag();
+        rq.release_budget();
         let rq = match OwnableRefCounted::try_from_shared(rq) {
             Ok(rq) => rq,
             Err(_rq) => {
                 queue.require_recovery("device completion ownership conflict", tag as usize);
-                return false;
+                return CompletionOutcome::RetainedForRecovery;
             }
         };
 
         rq.end(u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8));
-        true
+        CompletionOutcome::Returned
     }
 }
 
@@ -1694,6 +1818,8 @@ pub(crate) struct UfsQueue {
     recovery: SpinLock<RecoveryState>,
     #[pin]
     recovery_work: Work<UfsQueue>,
+    #[pin]
+    command_pool: SpinLock<CommandPool>,
 }
 
 impl_has_work! {
@@ -1710,8 +1836,15 @@ impl UfsQueue {
         let hw_queues = backend.hw_queues()?;
         let queue_map = config.queue_map()?;
         let nr_hw_queues = queue_map.nr_hw_queues();
-        let blk_mq_tag_count = config.tag_count();
-        if blk_mq_tag_count == 0 || nr_hw_queues == 0 || hw_queues.len() != nr_hw_queues {
+        let task_tag_count = config.tag_count();
+        let software_queue_depth = config.software_queue_depth();
+        let max_active_commands = config.max_active_commands();
+        if task_tag_count == 0
+            || software_queue_depth == 0
+            || max_active_commands == 0
+            || nr_hw_queues == 0
+            || hw_queues.len() != nr_hw_queues
+        {
             return Err(EINVAL);
         }
 
@@ -1719,25 +1852,23 @@ impl UfsQueue {
             TagSetData {
                 queue_map,
                 hw_queues,
-                // Every active shared tag may retain one detached DMA mapping
+                // Every active hardware command may retain one detached DMA mapping
                 // until completion. Reserve enough vector storage to make
                 // that mapping lifetime independent of atomic allocation
                 // success under memory pressure.
-                dma_vec_mempool: MemPool::new(blk_mq_tag_count)?,
+                dma_vec_mempool: MemPool::new(max_active_commands)?,
             },
             GFP_KERNEL,
         )?;
 
-        let mut tagset_flags = kernel::block::mq::tag_set::Flags::default();
-        tagset_flags |= kernel::block::mq::tag_set::Flag::TagHctxShared;
         let tagset = Arc::pin_init(
             TagSet::<UfsLuBlockOps>::new(
                 nr_hw_queues as u32,
                 tagset_data,
-                u32::try_from(blk_mq_tag_count).map_err(|_| EOVERFLOW)?,
+                u32::try_from(software_queue_depth).map_err(|_| EOVERFLOW)?,
                 queue_map.num_maps(),
                 kernel::alloc::NumaNode::NO_NODE,
-                tagset_flags,
+                kernel::block::mq::tag_set::Flags::default(),
             ),
             GFP_KERNEL,
         )?;
@@ -1748,11 +1879,51 @@ impl UfsQueue {
                 backend,
                 recovery <- new_spinlock!(RecoveryState::Operational),
                 recovery_work <- new_work!("UfsQueue::recovery"),
+                command_pool <- new_spinlock!(CommandPool::new(
+                    task_tag_count,
+                    max_active_commands,
+                )?),
             }),
             GFP_KERNEL,
         )?;
 
         Ok(queue)
+    }
+
+    pub(crate) fn try_get_budget(&self) -> Option<u32> {
+        let mut command_pool = self.command_pool.lock();
+        command_pool
+            .reserve()
+            .map(|task_tag| u32::from(task_tag.value()))
+    }
+
+    fn bind_command(&self, task_tag: TaskTag, queue_id: u32, blk_tag: u32) -> Result<()> {
+        self.command_pool
+            .lock()
+            .bind(task_tag, CommandOwner { queue_id, blk_tag })
+    }
+
+    fn command_owner(&self, task_tag: TaskTag) -> Result<CommandOwner> {
+        self.command_pool.lock().owner(task_tag).ok_or(EIO)
+    }
+
+    pub(crate) fn put_budget(&self, token: u32) {
+        let Ok(task_tag) = TaskTag::new(token) else {
+            pr_warn!("[RUFS] ufs_queue: invalid budget token={}\n", token);
+            return;
+        };
+        if self.command_pool.lock().release(task_tag).is_err() {
+            pr_warn!(
+                "[RUFS] ufs_queue: invalid command slot release task_tag={}\n",
+                task_tag.value(),
+            );
+            return;
+        }
+    }
+
+    fn completion_pass_limit(&self) -> usize {
+        let active = self.command_pool.lock().active();
+        core::cmp::max(1, active.div_ceil(COMPLETION_BATCH_SIZE))
     }
 
     fn recovery_required(&self) -> bool {
@@ -1806,13 +1977,14 @@ impl UfsQueue {
     }
 
     // Issuing
-    pub(crate) fn compose_dev(&self, cmd: UfsDevCmd, tag: u32) -> Result<()> {
-        self.backend.ops().compose_dev(cmd, tag)
+    pub(crate) fn compose_dev(&self, cmd: UfsDevCmd, task_tag: TaskTag) -> Result<()> {
+        self.backend.ops().compose_dev(cmd, task_tag)
     }
 
     fn compose_scsi(
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
         cmd: UfsSCSICmd,
+        task_tag: TaskTag,
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>> {
         let queue = match rq.queue_data() {
@@ -1820,15 +1992,15 @@ impl UfsQueue {
             QueueData::Lu(ufs_lu) => &ufs_lu.queue,
         };
 
-        queue.backend.ops().compose_scsi(cmd, rq, mempool)
+        queue.backend.ops().compose_scsi(cmd, rq, task_tag, mempool)
     }
 
-    fn fetch_dev(&self, cmd: UfsDevCmd, tag: usize, cqe: Option<CqEntry>) -> Result<UfsCmd> {
-        self.backend.ops().fetch_dev(cmd, tag, cqe)
+    fn fetch_dev(&self, cmd: UfsDevCmd, task_tag: TaskTag, cqe: Option<CqEntry>) -> Result<UfsCmd> {
+        self.backend.ops().fetch_dev(cmd, task_tag, cqe)
     }
 
-    fn fetch_scsi_completion(&self, tag: usize, cqe: Option<CqEntry>) -> UfsScsiResult {
-        self.backend.ops().fetch_scsi_completion(tag, cqe)
+    fn fetch_scsi_completion(&self, task_tag: TaskTag, cqe: Option<CqEntry>) -> UfsScsiResult {
+        self.backend.ops().fetch_scsi_completion(task_tag, cqe)
     }
 
     fn collect_backend_completions(&self, completed: &mut CompletedRequests) -> Result<()> {
@@ -1839,50 +2011,42 @@ impl UfsQueue {
         self.backend.ops().dump_state(tag, reason);
     }
 
-    fn request_at_shared_tag(
+    fn request_at_task_tag(
         &self,
-        tag: u32,
-    ) -> Result<Option<ARef<mq::Request<UfsLuBlockOps>>>> {
-        self.tags.try_shared_tag_to_rq(tag)
+        task_tag: TaskTag,
+    ) -> Result<(CommandOwner, Option<ARef<mq::Request<UfsLuBlockOps>>>)> {
+        let owner = self.command_owner(task_tag)?;
+        Ok((
+            owner,
+            self.tags.try_tag_to_rq(owner.queue_id, owner.blk_tag)?,
+        ))
     }
 
-    fn complete_tag(self: &Arc<Self>, request: CompletedRequest) -> bool {
-        let tag = request.tag as u32;
-        match self.request_at_shared_tag(tag) {
-            Ok(Some(rq)) => {
-                UfsRequestData::complete(rq, request.queue_id, request.cqe)
-            }
-            Ok(None) => {
-                self.require_recovery("completion tag has no request", request.tag);
-                false
-            }
-            Err(_) => {
-                self.require_recovery("completion request is not shareable", request.tag);
-                false
-            }
-        }
-    }
-
-    fn complete_polled_tag(
+    fn resolve_completion(
         self: &Arc<Self>,
         request: CompletedRequest,
-        batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>,
-    ) -> bool {
-        let tag = request.tag as u32;
-        match self.request_at_shared_tag(tag) {
-            Ok(Some(rq)) => UfsRequestData::complete_polled(
-                rq,
-                request.queue_id,
-                request.cqe,
-                batch,
-            ),
-            Ok(None) => {
-                self.require_recovery("polled completion tag has no request", request.tag);
-                false
+    ) -> Option<ResolvedCompletion> {
+        let task_tag = request.task_tag;
+        match self.request_at_task_tag(task_tag) {
+            Ok((owner, Some(rq))) => {
+                if owner.queue_id != request.queue_id {
+                    self.require_recovery("completion queue mismatch", task_tag.index());
+                    return None;
+                }
+                Some(ResolvedCompletion {
+                    rq,
+                    task_tag,
+                    queue_id: request.queue_id,
+                    cqe: request.cqe,
+                })
+            }
+            Ok((_, None)) => {
+                self.require_recovery("completion tag has no request", task_tag.index());
+                None
             }
             Err(_) => {
-                self.require_recovery("polled request is not shareable", request.tag);
-                false
+                self.require_recovery("completion request is not shareable", task_tag.index());
+                None
             }
         }
     }
@@ -1895,13 +2059,15 @@ impl UfsQueue {
         // blk-mq. Once those lock domains are IRQ-safe, this path can move into
         // hard IRQ context.
         let mut any_completed = false;
-        loop {
+        for _ in 0..self.completion_pass_limit() {
             let mut requests = CompletedRequests::new();
             let collect_result = self.collect_backend_completions(&mut requests);
 
             let batch_full = requests.is_full();
             while let Some(request) = requests.take_next() {
-                any_completed |= self.complete_tag(request);
+                if let Some(completion) = self.resolve_completion(request) {
+                    any_completed |= completion.complete().returned();
+                }
             }
 
             if let Some(fault) = requests.take_fault() {
@@ -1935,13 +2101,15 @@ impl UfsQueue {
         batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>,
     ) -> bool {
         let mut any_completed = false;
-        loop {
+        for _ in 0..self.completion_pass_limit() {
             let mut requests = CompletedRequests::new();
             let poll_result = hw_queue.poll(&mut requests);
 
             let batch_full = requests.is_full();
             while let Some(request) = requests.take_next() {
-                any_completed |= self.complete_polled_tag(request, batch);
+                if let Some(completion) = self.resolve_completion(request) {
+                    any_completed |= completion.complete_polled(batch).returned();
+                }
             }
 
             if let Some(fault) = requests.take_fault() {
@@ -1975,7 +2143,7 @@ impl UfsQueue {
         result: UfsScsiResult,
         rq: ARef<mq::Request<UfsLuBlockOps>>,
         target: CompletionTarget<'_>,
-    ) {
+    ) -> CompletionOutcome {
         let tag = rq.tag();
         let sense_len = result.sense_data_len.min(result.sense_data.len());
         let sense = parse_scsi_sense(&result.sense_data, sense_len);
@@ -2101,16 +2269,18 @@ impl UfsQueue {
                     .is_err()
                 {
                     self.require_recovery("invalid SCSI completion state", tag as usize);
-                    return;
+                    return CompletionOutcome::RetainedForRecovery;
                 }
+                rq.release_budget();
                 mq::Request::complete(rq);
+                CompletionOutcome::Returned
             }
             CompletionTarget::Poll(batch) => {
                 let rq = match OwnableRefCounted::try_from_shared(rq) {
                     Ok(rq) => rq,
                     Err(_rq) => {
                         self.require_recovery("polled completion ownership conflict", tag as usize);
-                        return;
+                        return CompletionOutcome::RetainedForRecovery;
                     }
                 };
                 if rq
@@ -2121,23 +2291,25 @@ impl UfsQueue {
                     .is_err()
                 {
                     self.require_recovery("invalid polled completion state", tag as usize);
-                    return;
+                    return CompletionOutcome::RetainedForRecovery;
                 }
+                rq.release_budget();
 
                 if requeue {
                     rq.requeue(true);
-                    return;
+                    return CompletionOutcome::Returned;
                 }
                 if status != u32::from(bindings::BLK_STS_OK) {
                     rq.end(
                         u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8),
                     );
-                    return;
+                    return CompletionOutcome::Returned;
                 }
 
                 if let Err(rq) = batch.add_request(rq, false) {
                     rq.end(status as u8);
                 }
+                CompletionOutcome::Returned
             }
         }
     }

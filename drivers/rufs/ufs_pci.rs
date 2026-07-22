@@ -6,6 +6,7 @@
 
 use kernel::{device::Core, pci, prelude::*};
 
+mod ufs_command;
 mod ufs_dev;
 mod ufs_dma;
 mod ufs_host;
