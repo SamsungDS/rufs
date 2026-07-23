@@ -82,6 +82,10 @@ impl UfsHost {
 
             let irq = UfsIrq::new()?;
             let uic = UfsUic::new(reg.clone())?;
+            let interrupt_policy = match transfer_config {
+                UfsTransferConfig::Sdb { .. } => UfsInterruptPolicy::EagerAck,
+                UfsTransferConfig::Mcq(_) => UfsInterruptPolicy::ThreadedAck,
+            };
 
             let cleanup_reg = reg.clone();
             let init_guard = ScopeGuard::new(move || stop_hba_controller(&cleanup_reg));
@@ -96,7 +100,13 @@ impl UfsHost {
             reg.wait_for_ctrl_enable(1000, 50)?;
 
             /* ufshcd_link_startup() */
-            irq.request_controller_irq(pdev, first_irq_vector, reg.clone(), uic.clone())?;
+            irq.request_controller_irq(
+                pdev,
+                first_irq_vector,
+                reg.clone(),
+                uic.clone(),
+                interrupt_policy,
+            )?;
             uic.link_startup()?;
             dma.make_hba_operational()?;
 
