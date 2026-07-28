@@ -1,20 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 menuconfig RUFS
-       tristate "Rust UFS (PCI) driver"
+       tristate "Rust UFS host controller driver"
        depends on RUST && PCI
        help
-        Enables the Rust UFS PCI driver (experimental).
-        This driver brings up a UFS host controller over PCI using
-        the Rust-for-Linux infrastructure.
-
-if RUFS
-
-config RUFS_PCI
-       tristate "PCI binding for RUFS"
-       depends on RUFS && PCI
-       default y if RUFS=y
-       help
-        Build the PCI front-end for the Rust UFS driver.
-
-endif # RUFS
+        Enables the Rust UFS host controller driver (experimental).

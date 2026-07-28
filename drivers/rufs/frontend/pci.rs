@@ -1,25 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! Driver for UFS devices.
-//!
-//! Based on the C driver written by Santosh Yaraganavi <santosh.sy@samsung.com>.
+//! PCI frontend for the UFS driver.
 
 use kernel::{device::Core, pci, prelude::*};
 
-mod ufs_command;
-mod ufs_dev;
-mod ufs_dma;
-mod ufs_host;
-mod ufs_irq;
-mod ufs_lu;
-mod ufs_queue;
-mod ufs_reg;
-mod ufs_uic;
-
-use ufs_host::UfsHost;
+use crate::host::UfsHost;
 
 #[derive(Clone, Copy)]
-enum UfsPciPlatform {
+pub(crate) enum UfsPciVariant {
     Qemu,
     Samsung,
     IntelCnl,
@@ -29,7 +17,7 @@ enum UfsPciPlatform {
     IntelMtl,
 }
 
-impl UfsPciPlatform {
+impl UfsPciVariant {
     const fn name(self) -> &'static str {
         match self {
             Self::Qemu => "qemu",
@@ -51,74 +39,74 @@ kernel::pci_device_table!(
         // Match the PCI IDs handled by drivers/ufs/host/ufshcd-pci.c.
         (
             pci::DeviceId::from_id(pci::Vendor::REDHAT, 0x0013),
-            UfsPciPlatform::Qemu,
+            UfsPciVariant::Qemu,
         ),
         (
             pci::DeviceId::from_id(pci::Vendor::SAMSUNG, 0xc00c),
-            UfsPciPlatform::Samsung,
+            UfsPciVariant::Samsung,
         ),
         (
             pci::DeviceId::from_id(pci::Vendor::INTEL, 0x9dfa),
-            UfsPciPlatform::IntelCnl,
+            UfsPciVariant::IntelCnl,
         ),
         (
             pci::DeviceId::from_id(pci::Vendor::INTEL, 0x4b41),
-            UfsPciPlatform::IntelEhl,
+            UfsPciVariant::IntelEhl,
         ),
         (
             pci::DeviceId::from_id(pci::Vendor::INTEL, 0x4b43),
-            UfsPciPlatform::IntelEhl,
+            UfsPciVariant::IntelEhl,
         ),
         (
             pci::DeviceId::from_id(pci::Vendor::INTEL, 0x98fa),
-            UfsPciPlatform::IntelLkf,
+            UfsPciVariant::IntelLkf,
         ),
         (
             pci::DeviceId::from_id(pci::Vendor::INTEL, 0x51ff),
-            UfsPciPlatform::IntelAdl,
+            UfsPciVariant::IntelAdl,
         ),
         (
             pci::DeviceId::from_id(pci::Vendor::INTEL, 0x54ff),
-            UfsPciPlatform::IntelAdl,
+            UfsPciVariant::IntelAdl,
         ),
         (
             pci::DeviceId::from_id(pci::Vendor::INTEL, 0x7e47),
-            UfsPciPlatform::IntelMtl,
+            UfsPciVariant::IntelMtl,
         ),
         (
             pci::DeviceId::from_id(pci::Vendor::INTEL, 0xa847),
-            UfsPciPlatform::IntelMtl,
+            UfsPciVariant::IntelMtl,
         ),
         (
             pci::DeviceId::from_id(pci::Vendor::INTEL, 0x7747),
-            UfsPciPlatform::IntelMtl,
+            UfsPciVariant::IntelMtl,
         ),
         (
             pci::DeviceId::from_id(pci::Vendor::INTEL, 0xe447),
-            UfsPciPlatform::IntelMtl,
+            UfsPciVariant::IntelMtl,
         ),
         (
             pci::DeviceId::from_id(pci::Vendor::INTEL, 0x4d47),
-            UfsPciPlatform::IntelMtl,
+            UfsPciVariant::IntelMtl,
         ),
         (
             pci::DeviceId::from_id(pci::Vendor::INTEL, 0xd335),
-            UfsPciPlatform::IntelMtl,
+            UfsPciVariant::IntelMtl,
         ),
     ]
 );
 
-struct UfsPci;
+pub(crate) struct UfsPci;
 
 #[pin_data]
-struct UfsPciData<'a> {
+pub(crate) struct UfsPciData<'a> {
     pdev: &'a pci::Device,
     #[pin]
     host: UfsHost,
 }
 
 impl pci::Driver for UfsPci {
-    type IdInfo = UfsPciPlatform;
+    type IdInfo = UfsPciVariant;
     type Data<'a> = UfsPciData<'a>;
     const ID_TABLE: pci::IdTable<Self::IdInfo> = &PCI_TABLE;
 
@@ -153,12 +141,4 @@ impl pci::Driver for UfsPci {
         dev_dbg!(pdev.as_ref(), "Remove Rust UFS driver.\n");
         this.host.remove();
     }
-}
-
-kernel::module_pci_driver! {
-    type: UfsPci,
-    name: "rufs_pci",
-    authors: ["Jaemyung Lee"],
-    description: "Rust UFS (RUFS) PCI driver",
-    license: "GPL v2",
 }

@@ -3,10 +3,10 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
-use crate::ufs_dev::*;
-use crate::ufs_lu::UfsLuBlockOps;
-use crate::ufs_queue::*;
-use crate::ufs_reg::*;
+use crate::device::*;
+use crate::lu::UfsLuBlockOps;
+use crate::queue::*;
+use crate::reg::*;
 use kernel::bits::{genmask_u64, genmask_u8};
 use kernel::block::mq::dma_map_iter::DmaMapIterMapped;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;

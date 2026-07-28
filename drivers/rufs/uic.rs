@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use crate::ufs_reg::*;
+use crate::reg::*;
 use kernel::sync::{Arc, Completion, Mutex, SpinLock};
 use kernel::time::Delta;
 use kernel::{new_mutex, new_spinlock, prelude::*};

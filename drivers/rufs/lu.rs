@@ -4,8 +4,8 @@
 
 #![allow(dead_code)]
 
-use crate::ufs_dma::{MAX_PRD_ENTRIES, PRDT_DATA_BYTE_COUNT_MAX};
-use crate::ufs_queue::*;
+use crate::dma::{MAX_PRD_ENTRIES, PRDT_DATA_BYTE_COUNT_MAX};
+use crate::queue::*;
 use kernel::bindings;
 use kernel::block::error::code::BLK_STS_IOERR;
 use kernel::block::mq::gen_disk::BoundGenDisk;

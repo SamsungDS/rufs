@@ -4,9 +4,9 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use crate::ufs_dma::{DescBuffer, MAX_PRD_ENTRIES};
-use crate::ufs_lu::{QueueData, UfsLuBlockOps};
-use crate::ufs_queue::*;
+use crate::dma::{DescBuffer, MAX_PRD_ENTRIES};
+use crate::lu::{QueueData, UfsLuBlockOps};
+use crate::queue::*;
 use kernel::alloc::mempool::MemPool;
 use kernel::block::error::BlkResult;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;

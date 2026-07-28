@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 
-use crate::ufs_command::{CommandOwner, CommandPool, TaskTag, TASK_TAG_COUNT};
-use crate::ufs_dev::*;
-use crate::ufs_dma::*;
-use crate::ufs_lu::{QueueData, TagSetData, UfsLuBlockOps, UfsRequestData};
-use crate::ufs_reg::*;
+use crate::command::{CommandOwner, CommandPool, TaskTag, TASK_TAG_COUNT};
+use crate::device::*;
+use crate::dma::*;
+use crate::lu::{QueueData, TagSetData, UfsLuBlockOps, UfsRequestData};
+use crate::reg::*;
 use kernel::alloc::mempool::MemPool;
 use kernel::block::mq;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;

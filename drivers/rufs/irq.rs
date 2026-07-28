@@ -2,9 +2,9 @@
 
 #![allow(dead_code)]
 
-use crate::ufs_queue::*;
-use crate::ufs_reg::*;
-use crate::ufs_uic::*;
+use crate::queue::*;
+use crate::reg::*;
+use crate::uic::*;
 use kernel::device::{Bound, Core, Device};
 use kernel::irq::{self, Flags, IrqReturn, ThreadedIrqReturn};
 use kernel::sync::atomic::{Acquire, Atomic, Relaxed, Release};

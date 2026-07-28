@@ -10,13 +10,13 @@ use kernel::types::ScopeGuard;
 use kernel::{device::Core, new_mutex, new_spinlock, pci, prelude::*};
 use pin_init::pin_init_scope;
 
-use crate::ufs_dev::*;
-use crate::ufs_dma::*;
-use crate::ufs_irq::*;
-use crate::ufs_lu::*;
-use crate::ufs_queue::*;
-use crate::ufs_reg::*;
-use crate::ufs_uic::*;
+use crate::device::*;
+use crate::dma::*;
+use crate::irq::*;
+use crate::lu::*;
+use crate::queue::*;
+use crate::reg::*;
+use crate::uic::*;
 
 const HBA_ENABLE_DELAY_US: i64 = 1000;
 
