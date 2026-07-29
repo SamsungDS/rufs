@@ -53,6 +53,20 @@ pub(crate) struct PrdEntry {
     pub(crate) size: u32,
 }
 
+impl PrdEntry {
+    pub(crate) fn new(addr: u64, length: u32) -> Result<Self> {
+        if length == 0 {
+            return Err(EINVAL);
+        }
+
+        Ok(Self {
+            addr: addr.to_le(),
+            reserved: 0,
+            size: (length - 1).to_le(),
+        })
+    }
+}
+
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub(crate) struct Ucd {

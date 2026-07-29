@@ -3,16 +3,16 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
+mod prdt;
+
 use crate::lu::UfsLuBlockOps;
 use crate::protocol::query::*;
 use crate::protocol::scsi::*;
 use crate::protocol::upiu::Upiu;
 use crate::protocol::UfsCmd;
 use crate::reg::*;
-use kernel::block::mq::dma_map_iter::DmaMapIterMapped;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;
 use kernel::dma;
-use kernel::dma::Coherent;
 use kernel::io::io_project;
 use kernel::io::Io;
 use kernel::sync::{aref::ARef, Arc};
@@ -23,12 +23,10 @@ use kernel::{
     prelude::*,
 };
 
-use crate::hci::descriptor::{PrdEntry, SqEntry, Ucd, Utmrd, UtpOcs, Utrd};
 pub(crate) use crate::hci::descriptor::{CqEntry, MAX_PRD_ENTRIES};
-
-pub(crate) const PRDT_DATA_BYTE_COUNT_MAX: u32 = 0x00040000; // SZ_256K
-const PRDT_DATA_BYTE_COUNT_PAD: usize = 4;
-const UNMAP_PARAM_LIST_SIZE: usize = 24;
+use crate::hci::descriptor::{SqEntry, Ucd, Utmrd, UtpOcs, Utrd};
+use prdt::UfsPrdt;
+pub(crate) use prdt::{UfsPrdtMapping, PRDT_DATA_BYTE_COUNT_MAX};
 
 pub(crate) struct UfsMcqQueue {
     descriptor: UfsMcqQueueDescriptor,
@@ -276,55 +274,6 @@ pub(crate) struct UfsDma {
     utmrdl: dma::Coherent<[Utmrd]>,
 }
 
-pub(crate) enum UfsPrdtMapping {
-    Sg(DmaMapIterMapped<MAX_PRD_ENTRIES, UfsLuBlockOps>),
-    Unmap(UfsUnmapMapping),
-}
-
-pub(crate) struct UfsUnmapMapping {
-    dev: ARef<device::Device>,
-    buffer: Coherent<[u8]>,
-}
-
-struct UfsPrdt {
-    mapping: Option<UfsPrdtMapping>,
-    entries: KVec<PrdEntry>,
-}
-
-fn append_prd_entries(
-    entries: &mut KVec<PrdEntry>,
-    segment_address: u64,
-    segment_length: u32,
-) -> Result<()> {
-    if segment_length == 0 || segment_length % PRDT_DATA_BYTE_COUNT_PAD as u32 != 0 {
-        return Err(EINVAL);
-    }
-
-    let mut segment_offset = 0;
-    while segment_offset < segment_length {
-        if entries.len() == MAX_PRD_ENTRIES {
-            return Err(EINVAL);
-        }
-
-        let prd_len = core::cmp::min(PRDT_DATA_BYTE_COUNT_MAX, segment_length - segment_offset);
-        let addr = segment_address
-            .checked_add(u64::from(segment_offset))
-            .ok_or(EOVERFLOW)?;
-
-        entries.push(
-            PrdEntry {
-                addr: addr.to_le(),
-                reserved: 0,
-                size: (prd_len - 1).to_le(),
-            },
-            GFP_ATOMIC,
-        )?;
-        segment_offset += prd_len;
-    }
-
-    Ok(())
-}
-
 impl UfsDma {
     pub(crate) fn dev(&self) -> &device::Device<Bound> {
         // SAFETY: `UfsDma` is owned by the bound RUFS driver instance. MCQ queue
@@ -411,23 +360,24 @@ impl UfsDma {
         task_tag: u8,
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Option<UfsPrdtMapping>> {
-        let prdt = self.map_request_prdt(cmd, rq, mempool)?;
+        let prdt = UfsPrdt::map(&self.dev, cmd, rq, mempool)?;
         let tag = usize::from(task_tag);
 
         io_project!(self.ucdl, [try: tag].cmd_upiu).copy_write(Upiu::command(cmd, tag));
         io_project!(self.ucdl, [try: tag].rsp_upiu).copy_write(Upiu::default());
 
-        for (i, entry) in prdt.entries.iter().enumerate() {
+        for (i, entry) in prdt.entries().iter().enumerate() {
             io_project!(self.ucdl, [try: tag].prdt[try: i]).copy_write(*entry);
         }
 
+        let prd_entries = prdt.entries().len();
         let utrd = io_project!(self.utrdl, [try: tag]).copy_read();
         let utrd = utrd
             .build(UfsCmd::SCSI(cmd))
-            .set_prd_table_length(prdt.entries.len())?;
+            .set_prd_table_length(prd_entries)?;
         io_project!(self.utrdl, [try: tag]).copy_write(utrd);
 
-        Ok(prdt.mapping)
+        Ok(prdt.into_mapping())
     }
 
     pub(crate) fn transfer_request_desc(&self, tag: usize) -> Result<Utrd> {
@@ -449,94 +399,6 @@ impl UfsDma {
         }
 
         Ok(tag)
-    }
-
-    fn map_request_prdt(
-        &self,
-        cmd: UfsSCSICmd,
-        rq: &ARef<mq::Request<UfsLuBlockOps>>,
-        mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
-    ) -> Result<UfsPrdt> {
-        let entries = KVec::new();
-        if cmd.data_len() == 0 {
-            return Ok(UfsPrdt {
-                mapping: None,
-                entries,
-            });
-        }
-
-        if cmd.is_unmap() {
-            return self.map_unmap_prdt(cmd);
-        }
-
-        let mut iter = rq
-            .clone()
-            .dma_map_iter(&self.dev, mempool.clone())
-            .map_err(|_error| ENOMEM)?;
-        let mut remaining = cmd.data_len();
-        let mut entries = KVec::new();
-        loop {
-            let segment_address = iter.address();
-            let segment_length = iter.length();
-            if segment_length == 0 || segment_length > remaining {
-                return Err(EINVAL);
-            }
-
-            append_prd_entries(&mut entries, segment_address, segment_length)?;
-
-            remaining = remaining.saturating_sub(segment_length);
-            if remaining == 0 {
-                break;
-            }
-
-            iter.next()?;
-        }
-        // SAFETY: The mapping is stored in this request's private data. blk-mq
-        // keeps the request alive by its tag until RUFS takes and drops the
-        // mapping before completing or requeuing the request.
-        let iter = unsafe { iter.finish_detached() };
-
-        Ok(UfsPrdt {
-            mapping: Some(UfsPrdtMapping::Sg(iter)),
-            entries,
-        })
-    }
-
-    fn map_unmap_prdt(&self, cmd: UfsSCSICmd) -> Result<UfsPrdt> {
-        if cmd.unmap_blocks() == 0 {
-            return Err(EINVAL);
-        }
-
-        let mut data = [0u8; UNMAP_PARAM_LIST_SIZE];
-
-        // TODO: Define a type for this
-        data[0..2].copy_from_slice(&22u16.to_be_bytes());
-        data[2..4].copy_from_slice(&16u16.to_be_bytes());
-        data[8..16].copy_from_slice(&cmd.unmap_lba().to_be_bytes());
-        data[16..20].copy_from_slice(&cmd.unmap_blocks().to_be_bytes());
-
-        // TODO: Consider using a dma pool instead of allocating for each unmap
-        let buffer: Coherent<[u8]> = Coherent::from_slice(self.dev(), &data, GFP_ATOMIC)?;
-
-        let mapping = UfsUnmapMapping {
-            dev: self.dev.clone(),
-            buffer,
-        };
-
-        let mut entries = KVec::with_capacity(1, GFP_ATOMIC)?;
-        entries.push(
-            PrdEntry {
-                addr: mapping.buffer.dma_handle().to_le(),
-                reserved: 0,
-                size: ((UNMAP_PARAM_LIST_SIZE as u32) - 1).to_le(),
-            },
-            GFP_ATOMIC,
-        )?;
-
-        Ok(UfsPrdt {
-            mapping: Some(UfsPrdtMapping::Unmap(mapping)),
-            entries,
-        })
     }
 
     pub(crate) fn fetch_devman_upiu(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
