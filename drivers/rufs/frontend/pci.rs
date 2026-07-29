@@ -5,6 +5,7 @@
 use kernel::{device::Core, pci, prelude::*};
 
 use crate::host::UfsHost;
+use crate::resource::{HciMmio, HostResources};
 
 #[derive(Clone, Copy)]
 pub(crate) enum UfsPciVariant {
@@ -129,7 +130,8 @@ impl pci::Driver for UfsPci {
             pdev.enable_device_mem()?;
             pdev.set_master();
 
-            let host = UfsHost::new(pdev);
+            let resources = HostResources::new(pdev.as_ref().into(), HciMmio::from_pci(pdev)?)?;
+            let host = UfsHost::new(resources, pdev);
 
             pr_info!("rufs: probe done");
 

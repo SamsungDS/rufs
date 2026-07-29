@@ -10,10 +10,9 @@ use kernel::io::{
     Io, IoLoc, Region,
 };
 use kernel::time::Delta;
-use kernel::{c_str, device::Core, devres::Devres, pci, prelude::*, sync::Arc};
+use kernel::{prelude::*, sync::Arc};
 
-const UFS_BAR0_LEN: usize = 0x1000;
-type Bar0 = pci::Bar<'static, UFS_BAR0_LEN>;
+use crate::resource::{HostResources, HCI_MMIO_SIZE};
 
 register! {
     CONTROLLER_CAPABILITIES(u32) @ 0x00 {
@@ -169,7 +168,7 @@ impl<T> DynamicRegisterLoc<T> {
     }
 }
 
-impl<T> IoLoc<Region<UFS_BAR0_LEN>, T> for DynamicRegisterLoc<T>
+impl<T> IoLoc<Region<HCI_MMIO_SIZE>, T> for DynamicRegisterLoc<T>
 where
     T: Register<Storage = u32> + From<u32>,
     u32: From<T>,
@@ -349,19 +348,12 @@ impl UfsMcqOprSet {
 }
 
 pub(crate) struct UfsReg {
-    bar: Devres<Bar0>,
+    resources: Arc<HostResources>,
 }
 
 impl UfsReg {
-    pub(crate) fn new(pdev: &pci::Device<Core<'_>>) -> Result<Arc<Self>> {
-        Ok(Arc::new(
-            Self {
-                bar: pdev
-                    .iomap_region_sized::<UFS_BAR0_LEN>(0, c_str!("rufs_pci"))?
-                    .into_devres()?,
-            },
-            GFP_KERNEL,
-        )?)
+    pub(crate) fn new(resources: Arc<HostResources>) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self { resources }, GFP_KERNEL)?)
     }
 
     #[inline(always)]
@@ -377,67 +369,67 @@ impl UfsReg {
     // Basic Controller/Version/Interrupt
     #[inline]
     pub(crate) fn read_cap_lo(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(CONTROLLER_CAPABILITIES).into_raw()
     }
 
     #[inline]
     pub(crate) fn read_cap_hi(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(CONTROLLER_CAPABILITIES_H).value().get()
     }
 
     #[inline]
     pub(crate) fn read_version(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(UFS_VERSION).value().get()
     }
 
     #[inline]
     pub(crate) fn read_is(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(INTERRUPT_STATUS).value().get()
     }
 
     #[inline]
     pub(crate) fn write_is(&self, value: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(INTERRUPT_STATUS::zeroed().with_value(value))
     }
 
     #[inline]
     pub(crate) fn read_ie(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(INTERRUPT_ENABLE).value().get()
     }
 
     #[inline]
     pub(crate) fn write_ie(&self, value: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(INTERRUPT_ENABLE::zeroed().with_value(value))
     }
 
     #[inline]
     pub(crate) fn read_hcs(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(CONTROLLER_STATUS).into_raw()
     }
 
     #[inline]
     pub(crate) fn read_hce(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(CONTROLLER_ENABLE_REG).into_raw()
     }
 
     #[inline]
     pub(crate) fn write_hce(&self, value: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(CONTROLLER_ENABLE_REG::from_raw(value))
     }
 
     #[inline]
     pub(crate) fn read_uic_error_phy(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(UIC_ERROR_CODE_PHY_ADAPTER_LAYER).value().get()
     }
 
@@ -447,7 +439,7 @@ impl UfsReg {
     }
 
     pub(crate) fn read_uic_errors(&self) -> UicErrorStatus {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         UicErrorStatus {
             phy: access
                 .read(UIC_ERROR_CODE_PHY_ADAPTER_LAYER)
@@ -468,198 +460,198 @@ impl UfsReg {
 
     #[inline]
     pub(crate) fn write_uic_error_phy(&self, value: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UIC_ERROR_CODE_PHY_ADAPTER_LAYER::zeroed().with_value(value))
     }
 
     // UTRL(Transfer)
     #[inline]
     pub(crate) fn write_utrlba(&self, low: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UTP_TRANSFER_REQ_LIST_BASE_L::zeroed().with_value(low))
     }
 
     #[inline]
     pub(crate) fn write_utrlbau(&self, high: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UTP_TRANSFER_REQ_LIST_BASE_H::zeroed().with_value(high))
     }
 
     #[inline]
     pub(crate) fn read_utrl_doorbell(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(UTP_TRANSFER_REQ_DOOR_BELL).value().get()
     }
 
     #[inline]
     pub(crate) fn ring_utrl_doorbell(&self, tag: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UTP_TRANSFER_REQ_DOOR_BELL::zeroed().with_value(1u32 << tag))
     }
 
     #[inline]
     pub(crate) fn write_utrl_runstop(&self, value: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UTP_TRANSFER_REQ_LIST_RUN_STOP::zeroed().with_value(value))
     }
 
     #[inline]
     pub(crate) fn clear_utrl_slots(&self, mask: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UTP_TRANSFER_REQ_LIST_CLEAR::zeroed().with_value(mask))
     }
 
     // UTMRL(Task Management)
     #[inline]
     pub(crate) fn write_utmrlba(&self, low: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UTP_TASK_REQ_LIST_BASE_L::zeroed().with_value(low))
     }
 
     #[inline]
     pub(crate) fn write_utmrlbau(&self, high: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UTP_TASK_REQ_LIST_BASE_H::zeroed().with_value(high))
     }
 
     #[inline]
     pub(crate) fn read_utmrl_doorbell(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(UTP_TASK_REQ_DOOR_BELL).value().get()
     }
 
     #[inline]
     pub(crate) fn ring_utmrl_doorbell(&self, mask: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UTP_TASK_REQ_DOOR_BELL::zeroed().with_value(mask))
     }
 
     #[inline]
     pub(crate) fn write_utmrl_runstop(&self, value: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UTP_TASK_REQ_LIST_RUN_STOP::zeroed().with_value(value))
     }
 
     #[inline]
     pub(crate) fn clear_utmrl_slots(&self, mask: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UTP_TASK_REQ_LIST_CLEAR::zeroed().with_value(mask))
     }
 
     // UIC command
     #[inline]
     pub(crate) fn read_uic_cmd(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(UIC_COMMAND).value().get()
     }
 
     #[inline]
     pub(crate) fn write_uic_cmd(&self, value: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UIC_COMMAND::zeroed().with_value(value))
     }
 
     #[inline]
     pub(crate) fn read_uic_arg1(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(UIC_ARG1).value().get()
     }
 
     #[inline]
     pub(crate) fn write_uic_arg1(&self, value: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UIC_ARG1::zeroed().with_value(value))
     }
 
     #[inline]
     pub(crate) fn read_uic_arg2(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(UIC_ARG2).into_raw()
     }
 
     #[inline]
     pub(crate) fn write_uic_arg2(&self, value: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UIC_ARG2::from_raw(value))
     }
 
     #[inline]
     pub(crate) fn read_uic_arg3(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(UIC_ARG3).value().get()
     }
 
     #[inline]
     pub(crate) fn write_uic_arg3(&self, value: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UIC_ARG3::zeroed().with_value(value))
     }
 
     // MCQ global configuration
     #[inline]
     pub(crate) fn read_mcq_cap(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(MCQCAP).into_raw()
     }
 
     #[inline]
     pub(crate) fn mcq_max_queues(&self) -> usize {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(MCQCAP).max_queue_supported().get() as usize + 1
     }
 
     #[inline]
     pub(crate) fn mcq_queue_cfg_base(&self) -> usize {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(MCQCAP).queue_config_pointer().get() as usize * MCQ_QCFGPTR_UNIT
     }
 
     #[inline]
     pub(crate) fn read_ufs_mem_cfg(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(UFS_MEM_CFG).into_raw()
     }
 
     #[inline]
     pub(crate) fn write_ufs_mem_cfg(&self, value: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UFS_MEM_CFG::from_raw(value))
     }
 
     #[inline]
     pub(crate) fn enable_mcq_mode(&self) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.update(UFS_MEM_CFG, |reg| reg.with_mcq_mode_select(true));
     }
 
     #[inline]
     pub(crate) fn disable_mcq_mode(&self) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.update(UFS_MEM_CFG, |reg| reg.with_mcq_mode_select(false));
     }
 
     #[inline]
     pub(crate) fn enable_mcq_esi(&self) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.update(UFS_MEM_CFG, |reg| reg.with_esi_enable(true));
     }
 
     #[inline]
     pub(crate) fn config_mcq_esi(&self, addr: u64) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UFS_ESILBA::zeroed().with_value(Self::dma_addr_lo(addr)));
         access.write_reg(UFS_ESIUBA::zeroed().with_value(Self::dma_addr_hi(addr)));
     }
 
     #[inline]
     pub(crate) fn read_mcq_cfg(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(UFS_MCQ_CFG).into_raw()
     }
 
     #[inline]
     pub(crate) fn write_mcq_cfg(&self, value: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UFS_MCQ_CFG::from_raw(value))
     }
 
@@ -668,7 +660,7 @@ impl UfsReg {
             return Err(EINVAL);
         }
 
-        let access = self.bar.try_access().ok_or(ENODEV)?;
+        let access = self.resources.hci_access()?;
         let value = access
             .read(UFS_MCQ_CFG)
             .try_with_max_active_cmds(max_active_cmds - 1)?;
@@ -694,7 +686,7 @@ impl UfsReg {
         T: Register<Storage = u32> + From<u32>,
         u32: From<T>,
     {
-        let access = self.bar.try_access().ok_or(ENODEV)?;
+        let access = self.resources.hci_access()?;
         access.try_read(self.mcq_queue_cfg_loc(queue))
     }
 
@@ -704,7 +696,7 @@ impl UfsReg {
         T: Register<Storage = u32> + From<u32>,
         u32: From<T>,
     {
-        let access = self.bar.try_access().ok_or(ENODEV)?;
+        let access = self.resources.hci_access()?;
         access.try_write(self.mcq_queue_cfg_loc(queue), value)
     }
 
@@ -859,7 +851,7 @@ impl UfsReg {
         T: Register<Storage = u32> + From<u32>,
         u32: From<T>,
     {
-        let access = self.bar.try_access().ok_or(ENODEV)?;
+        let access = self.resources.hci_access()?;
         access.try_read(self.mcq_opr_loc(oprs, region, queue))
     }
 
@@ -875,7 +867,7 @@ impl UfsReg {
         T: Register<Storage = u32> + From<u32>,
         u32: From<T>,
     {
-        let access = self.bar.try_access().ok_or(ENODEV)?;
+        let access = self.resources.hci_access()?;
         access.try_write(self.mcq_opr_loc(oprs, region, queue), value)
     }
 
@@ -1067,7 +1059,7 @@ impl UfsReg {
     // Helpers
     #[inline]
     pub(crate) fn nutrs(&self) -> usize {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access
             .read(CONTROLLER_CAPABILITIES)
             .transfer_request_slots_sdb()
@@ -1077,13 +1069,13 @@ impl UfsReg {
 
     #[inline]
     pub(crate) fn mcq_supported(&self) -> bool {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(CONTROLLER_CAPABILITIES).mcq_supported()
     }
 
     #[inline]
     pub(crate) fn nutrs_mcq(&self) -> usize {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access
             .read(CONTROLLER_CAPABILITIES_MCQ)
             .transfer_request_slots()
@@ -1093,7 +1085,7 @@ impl UfsReg {
 
     #[inline]
     pub(crate) fn nutmrs(&self) -> usize {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access
             .read(CONTROLLER_CAPABILITIES)
             .task_management_request_slots()
@@ -1103,7 +1095,7 @@ impl UfsReg {
 
     #[inline]
     pub(crate) fn autoh8(&self) -> bool {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access
             .read(CONTROLLER_CAPABILITIES)
             .auto_hibern8_supported()
@@ -1111,7 +1103,7 @@ impl UfsReg {
 
     #[inline]
     pub(crate) fn ctrl_enable(&self) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.update(CONTROLLER_ENABLE_REG, |reg| {
             reg.with_controller_enable(true)
         });
@@ -1119,13 +1111,13 @@ impl UfsReg {
 
     #[inline]
     pub(crate) fn ctrl_disable(&self) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(CONTROLLER_ENABLE_REG::zeroed());
     }
 
     #[inline]
     pub(crate) fn ctrl_enabled(&self) -> bool {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(CONTROLLER_ENABLE_REG).controller_enable()
     }
 
@@ -1159,7 +1151,7 @@ impl UfsReg {
         pr_info!("[RUFS] drivers/rufs/ufs_reg: wait_for_ctrl_enable");
         match read_poll_timeout(
             || {
-                let access = self.bar.try_access().ok_or(ENODEV)?;
+                let access = self.resources.hci_access()?;
                 Ok(access.read(CONTROLLER_ENABLE_REG))
             },
             |v: &CONTROLLER_ENABLE_REG| v.controller_enable(),
@@ -1175,7 +1167,7 @@ impl UfsReg {
     pub(crate) fn wait_for_ctrl_disable(&self, interval_us: i64, timeout_ms: i64) -> Result<()> {
         match read_poll_timeout(
             || {
-                let access = self.bar.try_access().ok_or(ENODEV)?;
+                let access = self.resources.hci_access()?;
                 Ok(access.read(CONTROLLER_ENABLE_REG))
             },
             |v: &CONTROLLER_ENABLE_REG| !v.controller_enable(),
@@ -1204,7 +1196,7 @@ impl UfsReg {
     }
 
     pub(crate) fn get_uic_cmd_result(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.read(UIC_ARG2).command_result().get()
     }
 
@@ -1213,7 +1205,7 @@ impl UfsReg {
     }
 
     pub(crate) fn get_power_mode_change_status(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access
             .read(CONTROLLER_STATUS)
             .power_mode_change_request_status()
@@ -1223,7 +1215,7 @@ impl UfsReg {
     pub(crate) fn wait_for_uic_cmd_ready(&self, interval_us: i64, timeout_ms: i64) -> Result<()> {
         match read_poll_timeout(
             || {
-                let access = self.bar.try_access().ok_or(ENODEV)?;
+                let access = self.resources.hci_access()?;
                 Ok(access.read(CONTROLLER_STATUS))
             },
             |v: &CONTROLLER_STATUS| v.uic_command_ready(),
@@ -1254,7 +1246,7 @@ impl UfsReg {
     }
 
     pub(crate) fn disable_transfer_req_int_aggr(&self) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UTP_TRANSFER_REQ_INT_AGG_CONTROL::zeroed().with_value(0 as u32));
         let value = access.read(UTP_TRANSFER_REQ_INT_AGG_CONTROL).value().get();
         let int_enable = (value & INT_AGGR_ENABLE) != 0;
@@ -1275,7 +1267,7 @@ impl UfsReg {
     pub(crate) fn wait_for_request_ready(&self, interval_us: i64, timeout_ms: i64) -> Result<()> {
         match read_poll_timeout(
             || {
-                let access = self.bar.try_access().ok_or(ENODEV)?;
+                let access = self.resources.hci_access()?;
                 Ok(access.read(CONTROLLER_STATUS))
             },
             |v: &CONTROLLER_STATUS| {
@@ -1302,7 +1294,7 @@ impl UfsReg {
     }
 
     pub(crate) fn utrlcnr(&self) -> u32 {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access
             .read(UTP_TRANSFER_REQ_LIST_COMPLETION_NOTIFICATION)
             .value()
@@ -1310,7 +1302,7 @@ impl UfsReg {
     }
 
     pub(crate) fn write_utrlcnr(&self, value: u32) {
-        let access = self.bar.try_access().unwrap();
+        let access = self.resources.hci_access().unwrap();
         access.write_reg(UTP_TRANSFER_REQ_LIST_COMPLETION_NOTIFICATION::zeroed().with_value(value))
     }
 }

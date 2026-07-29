@@ -18,8 +18,7 @@ use kernel::io::Io;
 use kernel::sync::{aref::ARef, Arc};
 use kernel::{
     block::mq,
-    device::{self, Bound, Core},
-    pci,
+    device::{self, Bound},
     prelude::*,
 };
 
@@ -45,16 +44,16 @@ impl UfsDma {
     }
 
     pub(crate) fn new(
-        pdev: &pci::Device<Core<'_>>,
+        dev: &device::Device<Bound>,
         reg: Arc<UfsReg>,
         transfer_slots: usize,
     ) -> Result<Arc<Self>> {
         if transfer_slots == 0 {
             return Err(EINVAL);
         }
-        let ucdl = dma::Coherent::<Ucd>::zeroed_slice(pdev.as_ref(), transfer_slots, GFP_KERNEL)?;
+        let ucdl = dma::Coherent::<Ucd>::zeroed_slice(dev, transfer_slots, GFP_KERNEL)?;
 
-        let utrdl = dma::Coherent::<Utrd>::zeroed_slice(pdev.as_ref(), transfer_slots, GFP_KERNEL)?;
+        let utrdl = dma::Coherent::<Utrd>::zeroed_slice(dev, transfer_slots, GFP_KERNEL)?;
 
         for tag in 0..transfer_slots {
             // The controller DMA-reads the UTP command descriptor for this tag,
@@ -74,12 +73,12 @@ impl UfsDma {
         }
 
         let nutmrs = reg.nutmrs();
-        let utmrdl = dma::Coherent::<Utmrd>::zeroed_slice(pdev.as_ref(), nutmrs, GFP_KERNEL)?;
+        let utmrdl = dma::Coherent::<Utmrd>::zeroed_slice(dev, nutmrs, GFP_KERNEL)?;
 
         Ok(Arc::new(
             Self {
                 reg,
-                dev: pdev.as_ref().into(),
+                dev: dev.into(),
                 transfer_slots,
                 ucdl,
                 utrdl,

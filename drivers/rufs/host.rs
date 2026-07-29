@@ -16,6 +16,7 @@ use crate::irq::*;
 use crate::lu::*;
 use crate::queue::*;
 use crate::reg::*;
+use crate::resource::HostResources;
 use crate::transport::UfsTransferConfig;
 use crate::uic::*;
 
@@ -49,6 +50,7 @@ pub(crate) enum HostState {
 
 #[pin_data(PinnedDrop)]
 pub(crate) struct UfsHost {
+    resources: Arc<HostResources>,
     reg: Arc<UfsReg>,
     dma: Arc<UfsDma>,
     irq: Arc<UfsIrq>,
@@ -67,11 +69,18 @@ pub(crate) struct UfsHost {
 }
 
 impl UfsHost {
-    pub(crate) fn new<'a>(pdev: &'a pci::Device<Core<'a>>) -> impl PinInit<Self, Error> + 'a {
+    pub(crate) fn new<'a>(
+        resources: Arc<HostResources>,
+        pdev: &'a pci::Device<Core<'a>>,
+    ) -> impl PinInit<Self, Error> + 'a {
         pin_init_scope(move || {
-            let reg = UfsReg::new(pdev)?;
+            let reg = UfsReg::new(resources.clone())?;
             let transfer_config = UfsTransferConfig::new(&reg)?;
-            let dma = UfsDma::new(pdev, reg.clone(), transfer_config.tag_count())?;
+            let dma = UfsDma::new(
+                resources.device(),
+                reg.clone(),
+                transfer_config.tag_count(),
+            )?;
 
             reg.clear_all_interrupts();
             reg.disable_interrupts();
@@ -114,6 +123,7 @@ impl UfsHost {
             let ufs_queue = UfsQueue::new(transfer_config, reg.clone(), dma.clone())?;
             let dev = UfsDev::new(ufs_queue.clone())?;
             let host = try_pin_init!(Self {
+                resources,
                 reg,
                 dma,
                 irq,
