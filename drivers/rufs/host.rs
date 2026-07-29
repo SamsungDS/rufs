@@ -16,6 +16,7 @@ use crate::irq::*;
 use crate::lu::*;
 use crate::queue::*;
 use crate::reg::*;
+use crate::transport::UfsTransferConfig;
 use crate::uic::*;
 
 const HBA_ENABLE_DELAY_US: i64 = 1000;

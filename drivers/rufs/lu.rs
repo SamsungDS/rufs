@@ -7,6 +7,7 @@
 use crate::dma::{MAX_PRD_ENTRIES, PRDT_DATA_BYTE_COUNT_MAX};
 use crate::protocol::scsi::UfsSCSICmd;
 use crate::queue::*;
+use crate::transport::UfsHwQueue;
 use kernel::bindings;
 use kernel::block::error::code::BLK_STS_IOERR;
 use kernel::block::mq::gen_disk::BoundGenDisk;

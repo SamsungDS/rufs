@@ -17,6 +17,7 @@ mod lu;
 mod protocol;
 mod queue;
 mod reg;
+mod transport;
 mod uic;
 
 use frontend::pci::UfsPci;
