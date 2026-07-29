@@ -212,6 +212,10 @@ impl UfsMcqCompletionQueue {
         }
 
         let cqe = io_project!(self.cqe, [try: index]).copy_read();
+        if cqe.is_empty() {
+            return Ok(None);
+        }
+
         io_project!(self.cqe, [try: index]).copy_write(CqEntry::default());
 
         self.cq_head_slot += 1;
@@ -219,11 +223,7 @@ impl UfsMcqCompletionQueue {
             self.cq_head_slot = 0;
         }
 
-        if cqe.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(cqe))
-        }
+        Ok(Some(cqe))
     }
 
     fn commit_head(&self, reg: &UfsReg, descriptor: &UfsMcqQueueDescriptor) -> Result<()> {
@@ -301,27 +301,34 @@ impl McqHardwareQueue {
         let mut consumed = false;
         let result = (|| {
             while !completion.is_empty() && !completed_requests.is_full() {
+                let Some(cqe) = completion.consume_entry(&self.descriptor)? else {
+                    completed_requests.record_fault(
+                        "empty MCQ completion entry",
+                        completion.head_slot() as usize,
+                        Some(self.descriptor.id()),
+                    );
+                    break;
+                };
+
                 consumed = true;
-                if let Some(cqe) = completion.consume_entry(&self.descriptor)? {
-                    match dma.tag_from_cq_entry(&cqe, self.descriptor.id()) {
-                        Ok(tag) => match TaskTag::from_index(tag) {
-                            Ok(task_tag) => completed_requests.insert(
-                                task_tag,
-                                self.descriptor.id(),
-                                TransferCompletion::Mcq(cqe),
-                            )?,
-                            Err(_) => completed_requests.record_fault(
-                                "invalid MCQ completion task tag",
-                                tag,
-                                Some(self.descriptor.id()),
-                            ),
-                        },
+                match dma.tag_from_cq_entry(&cqe, self.descriptor.id()) {
+                    Ok(tag) => match TaskTag::from_index(tag) {
+                        Ok(task_tag) => completed_requests.insert(
+                            task_tag,
+                            self.descriptor.id(),
+                            TransferCompletion::Mcq(cqe),
+                        )?,
                         Err(_) => completed_requests.record_fault(
-                            "invalid MCQ completion descriptor",
-                            usize::from(cqe.task_tag()),
+                            "invalid MCQ completion task tag",
+                            tag,
                             Some(self.descriptor.id()),
                         ),
-                    }
+                    },
+                    Err(_) => completed_requests.record_fault(
+                        "invalid MCQ completion descriptor",
+                        usize::from(cqe.task_tag()),
+                        Some(self.descriptor.id()),
+                    ),
                 }
             }
             Ok(())

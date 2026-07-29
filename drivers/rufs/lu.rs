@@ -266,10 +266,20 @@ pub(crate) struct UfsLuBlockOps;
 // Because the command was not submitted, no hardware completion can race with
 // returning the request to blk-mq.
 fn complete_unsubmitted(rq: ARef<mq::Request<UfsLuBlockOps>>, e: Error) {
+    let queue = rq.queue_data().queue_arc().clone();
+    let tag = rq.tag() as usize;
+
     rq.data_ref().inner.lock().reset();
-    let rq = OwnableRefCounted::try_from_shared(rq)
-        .map_err(|_e| kernel::error::code::EIO)
-        .expect("Failed to complete request");
+    let Ok(rq) = OwnableRefCounted::try_from_shared(rq) else {
+        pr_err!(
+            "[RUFS] ufs_lu: unsubmitted request ownership conflict tag={}\n",
+            tag,
+        );
+        // TODO: Error handling must decide the final request disposition after
+        // quiescing the queue and excluding every competing request owner.
+        queue.require_recovery("unsubmitted request ownership conflict", tag);
+        return;
+    };
 
     if e == EBUSY {
         rq.requeue(true);
