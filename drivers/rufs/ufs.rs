@@ -10,6 +10,7 @@ mod command;
 mod device;
 mod dma;
 mod frontend;
+mod hci;
 mod host;
 mod irq;
 mod lu;
