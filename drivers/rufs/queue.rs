@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 
 use crate::command::{CommandOwner, CommandPool, TaskTag, TASK_TAG_COUNT};
-use crate::device::*;
 use crate::dma::*;
 use crate::lu::{QueueData, TagSetData, UfsLuBlockOps, UfsRequestData};
+use crate::protocol::scsi::*;
+use crate::protocol::{query::UfsDevCmd, UfsCmd};
 use crate::reg::*;
 use kernel::alloc::mempool::MemPool;
 use kernel::block::mq;
@@ -15,12 +16,6 @@ use kernel::types::OwnableRefCounted;
 use kernel::workqueue::{self, impl_has_work, new_work, Work, WorkItem};
 use kernel::{bindings, new_spinlock, new_spinlock_irq, prelude::*};
 
-const READ_10: u8 = 0x28;
-const WRITE_10: u8 = 0x2a;
-const SYNCHRONIZE_CACHE: u8 = 0x35;
-const UNMAP: u8 = 0x42;
-const READ_16: u8 = 0x88;
-const WRITE_16: u8 = 0x8a;
 const UFS_MCQ_DEFAULT_READ_QUEUES: usize = 0;
 const UFS_MCQ_DEFAULT_POLL_QUEUES: usize = 1;
 const UFS_SOFTWARE_QUEUE_DEPTH: usize = 256;
@@ -28,6 +23,18 @@ const COMPLETION_BATCH_SIZE: usize = 16;
 
 fn possible_cpus() -> usize {
     (cpu::nr_cpu_ids() as usize).max(1)
+}
+
+fn retryable_check_condition(sense: Option<&ScsiSense>) -> bool {
+    matches!(sense, Some(sense) if sense.is_unit_attention())
+}
+
+fn should_requeue_scsi(completion: UfsScsiCompletion, sense: Option<&ScsiSense>) -> bool {
+    matches!(
+        completion,
+        UfsScsiCompletion::Busy | UfsScsiCompletion::TaskSetFull | UfsScsiCompletion::Requeue
+    ) || (matches!(completion, UfsScsiCompletion::CheckCondition)
+        && retryable_check_condition(sense))
 }
 
 #[derive(Copy, Clone)]
@@ -78,20 +85,14 @@ impl UfsTransferConfig {
         let max_queues = reg.mcq_max_queues();
         let read_queues = UFS_MCQ_DEFAULT_READ_QUEUES;
         let poll_queues = UFS_MCQ_DEFAULT_POLL_QUEUES;
-        let reserved_queues = read_queues
-            .checked_add(poll_queues)
-            .ok_or(EOVERFLOW)?;
+        let reserved_queues = read_queues.checked_add(poll_queues).ok_or(EOVERFLOW)?;
         if max_queues <= reserved_queues {
             return Err(ENOTSUPP);
         }
 
         let default_queues = core::cmp::min(max_queues - reserved_queues, possible_cpus());
-        let interrupt_queues = default_queues
-            .checked_add(read_queues)
-            .ok_or(EOVERFLOW)?;
-        let total_queues = interrupt_queues
-            .checked_add(poll_queues)
-            .ok_or(EOVERFLOW)?;
+        let interrupt_queues = default_queues.checked_add(read_queues).ok_or(EOVERFLOW)?;
+        let total_queues = interrupt_queues.checked_add(poll_queues).ok_or(EOVERFLOW)?;
         let max_active_commands = core::cmp::min(reg.nutrs_mcq(), TASK_TAG_COUNT);
         let task_tag_count = TASK_TAG_COUNT;
         let software_queue_depth = UFS_SOFTWARE_QUEUE_DEPTH;
@@ -194,9 +195,7 @@ impl UfsQueueMap {
         }
 
         let read_offset = default_queues;
-        let poll_offset = read_offset
-            .checked_add(read_queues)
-            .ok_or(EOVERFLOW)?;
+        let poll_offset = read_offset.checked_add(read_queues).ok_or(EOVERFLOW)?;
 
         Ok(Self {
             nr_hw_queues,
@@ -246,219 +245,6 @@ impl UfsQueueRange {
 
     pub(crate) fn count(&self) -> usize {
         self.count
-    }
-}
-
-#[derive(PartialEq, Copy, Clone, Debug)]
-pub(crate) enum UfsScsiDataDirection {
-    None,
-    Read,
-    Write,
-}
-
-struct ScsiSense {
-    response_code: u8,
-    sense_key: u8,
-    asc: u8,
-    ascq: u8,
-    additional_len: u8,
-}
-
-const SCSI_SENSE_UNIT_ATTENTION: u8 = 0x6;
-const SCSI_ASC_POWER_ON_RESET: u8 = 0x29;
-const SCSI_ASCQ_POWER_ON_RESET: u8 = 0x00;
-
-fn parse_scsi_sense(data: &[u8], len: usize) -> Option<ScsiSense> {
-    if len == 0 {
-        return None;
-    }
-
-    let response_code = data[0] & 0x7f;
-    match response_code {
-        // Fixed format sense data.
-        0x70 | 0x71 if len >= 14 => Some(ScsiSense {
-            response_code,
-            sense_key: data[2] & 0x0f,
-            asc: data[12],
-            ascq: data[13],
-            additional_len: data[7],
-        }),
-        // Descriptor format sense data.
-        0x72 | 0x73 if len >= 4 => Some(ScsiSense {
-            response_code,
-            sense_key: data[1] & 0x0f,
-            asc: data[2],
-            ascq: data[3],
-            additional_len: 0,
-        }),
-        _ => None,
-    }
-}
-
-fn retryable_check_condition(sense: Option<&ScsiSense>) -> bool {
-    matches!(sense, Some(sense) if sense.sense_key == SCSI_SENSE_UNIT_ATTENTION)
-}
-
-fn boot_unit_attention(sense: Option<&ScsiSense>) -> bool {
-    matches!(
-        sense,
-        Some(sense)
-            if sense.sense_key == SCSI_SENSE_UNIT_ATTENTION
-                && sense.asc == SCSI_ASC_POWER_ON_RESET
-                && sense.ascq == SCSI_ASCQ_POWER_ON_RESET
-    )
-}
-
-fn should_requeue_scsi(completion: UfsScsiCompletion, sense: Option<&ScsiSense>) -> bool {
-    matches!(
-        completion,
-        UfsScsiCompletion::Busy | UfsScsiCompletion::TaskSetFull | UfsScsiCompletion::Requeue
-    ) || (matches!(completion, UfsScsiCompletion::CheckCondition)
-        && retryable_check_condition(sense))
-}
-
-fn sense_key_name(key: u8) -> &'static str {
-    match key {
-        0x0 => "NO_SENSE",
-        0x1 => "RECOVERED_ERROR",
-        0x2 => "NOT_READY",
-        0x3 => "MEDIUM_ERROR",
-        0x4 => "HARDWARE_ERROR",
-        0x5 => "ILLEGAL_REQUEST",
-        0x6 => "UNIT_ATTENTION",
-        0x7 => "DATA_PROTECT",
-        0x8 => "BLANK_CHECK",
-        0x9 => "VENDOR_SPECIFIC",
-        0xb => "ABORTED_COMMAND",
-        0xd => "VOLUME_OVERFLOW",
-        0xe => "MISCOMPARE",
-        _ => "UNKNOWN",
-    }
-}
-
-#[derive(Copy, Clone)]
-pub(crate) struct UfsSCSICmd {
-    lun: u8,
-    direction: UfsScsiDataDirection,
-    data_len: u32,
-    cdb: [u8; 16],
-    unmap_lba: u64,
-    unmap_blocks: u32,
-}
-
-impl UfsSCSICmd {
-    pub(crate) fn read_write(
-        lun: u8,
-        write: bool,
-        lba: u64,
-        blocks: u32,
-        data_len: u32,
-        fua: bool,
-    ) -> Self {
-        let mut cdb = [0u8; 16];
-        let direction = if write {
-            UfsScsiDataDirection::Write
-        } else {
-            UfsScsiDataDirection::Read
-        };
-        let flags = if fua { 0x8 } else { 0 };
-
-        match (u32::try_from(lba), u16::try_from(blocks)) {
-            (Ok(lba), Ok(blocks)) => {
-                cdb[0] = if write { WRITE_10 } else { READ_10 };
-                cdb[1] = flags;
-                cdb[2..6].copy_from_slice(&lba.to_be_bytes());
-                cdb[7..9].copy_from_slice(&blocks.to_be_bytes());
-            }
-            _ => {
-                cdb[0] = if write { WRITE_16 } else { READ_16 };
-                cdb[1] = flags;
-                cdb[2..10].copy_from_slice(&lba.to_be_bytes());
-                cdb[10..14].copy_from_slice(&blocks.to_be_bytes());
-            }
-        }
-
-        Self {
-            lun,
-            direction,
-            data_len,
-            cdb,
-            unmap_lba: 0,
-            unmap_blocks: 0,
-        }
-    }
-
-    pub(crate) fn flush(lun: u8) -> Self {
-        let mut cdb = [0u8; 16];
-        cdb[0] = SYNCHRONIZE_CACHE;
-
-        Self {
-            lun,
-            direction: UfsScsiDataDirection::None,
-            data_len: 0,
-            cdb,
-            unmap_lba: 0,
-            unmap_blocks: 0,
-        }
-    }
-
-    pub(crate) fn unmap(lun: u8, lba: u64, blocks: u32) -> Self {
-        let mut cdb = [0u8; 16];
-        let data_len = 24u32;
-        cdb[0] = UNMAP;
-        cdb[7..9].copy_from_slice(&(data_len as u16).to_be_bytes());
-
-        Self {
-            lun,
-            direction: UfsScsiDataDirection::Write,
-            data_len,
-            cdb,
-            unmap_lba: lba,
-            unmap_blocks: blocks,
-        }
-    }
-
-    pub(crate) fn lun(&self) -> u8 {
-        self.lun
-    }
-
-    pub(crate) fn direction(&self) -> UfsScsiDataDirection {
-        self.direction
-    }
-
-    pub(crate) fn data_len(&self) -> u32 {
-        self.data_len
-    }
-
-    pub(crate) fn cdb(&self) -> [u8; 16] {
-        self.cdb
-    }
-
-    pub(crate) fn is_unmap(&self) -> bool {
-        self.cdb[0] == UNMAP
-    }
-
-    pub(crate) fn unmap_lba(&self) -> u64 {
-        self.unmap_lba
-    }
-
-    pub(crate) fn unmap_blocks(&self) -> u32 {
-        self.unmap_blocks
-    }
-}
-
-#[derive(Copy, Clone)]
-pub(crate) enum UfsCmd {
-    Device(UfsDevCmd),
-    SCSI(UfsSCSICmd),
-}
-
-impl UfsCmd {
-    pub(crate) fn get_device(&self) -> Result<UfsDevCmd> {
-        match *self {
-            Self::Device(cmd) => Ok(cmd),
-            _ => Err(EINVAL),
-        }
     }
 }
 
@@ -595,18 +381,11 @@ impl UfsRequestInner {
         if !matches!(cmd, UfsCmd::Device(_)) || !matches!(self.state, UfsRequestState::Idle) {
             return Err(EINVAL);
         }
-        self.state = UfsRequestState::Prepared {
-            cmd,
-            prdt: None,
-        };
+        self.state = UfsRequestState::Prepared { cmd, prdt: None };
         Ok(())
     }
 
-    fn prepare_scsi(
-        &mut self,
-        cmd: UfsSCSICmd,
-        prdt: Option<UfsPrdtMapping>,
-    ) -> Result<()> {
+    fn prepare_scsi(&mut self, cmd: UfsSCSICmd, prdt: Option<UfsPrdtMapping>) -> Result<()> {
         if !matches!(self.state, UfsRequestState::Idle) {
             return Err(EBUSY);
         }
@@ -640,10 +419,7 @@ impl UfsRequestInner {
         Ok(())
     }
 
-    fn begin_completion(
-        &mut self,
-        queue_id: u32,
-    ) -> Result<(UfsCmd, Option<UfsPrdtMapping>)> {
+    fn begin_completion(&mut self, queue_id: u32) -> Result<(UfsCmd, Option<UfsPrdtMapping>)> {
         let state = core::mem::replace(&mut self.state, UfsRequestState::Idle);
         match state {
             UfsRequestState::InFlight {
@@ -802,13 +578,7 @@ impl ResolvedCompletion {
         self,
         batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>,
     ) -> CompletionOutcome {
-        UfsRequestData::complete_polled(
-            self.rq,
-            self.task_tag,
-            self.queue_id,
-            self.cqe,
-            batch,
-        )
+        UfsRequestData::complete_polled(self.rq, self.task_tag, self.queue_id, self.cqe, batch)
     }
 }
 
@@ -842,12 +612,7 @@ impl CompletedRequests {
         }
     }
 
-    fn insert(
-        &mut self,
-        task_tag: TaskTag,
-        queue_id: u32,
-        cqe: Option<CqEntry>,
-    ) -> Result<()> {
+    fn insert(&mut self, task_tag: TaskTag, queue_id: u32, cqe: Option<CqEntry>) -> Result<()> {
         if self.len == self.requests.len() {
             return Err(ENOMEM);
         }
@@ -926,13 +691,7 @@ impl McqHardwareQueue {
         )
     }
 
-    fn submit<F>(
-        &self,
-        reg: &UfsReg,
-        dma: &UfsDma,
-        tag: u32,
-        publish: F,
-    ) -> SubmissionOutcome
+    fn submit<F>(&self, reg: &UfsReg, dma: &UfsDma, tag: u32, publish: F) -> SubmissionOutcome
     where
         F: FnOnce() -> Result<()>,
     {
@@ -1066,9 +825,7 @@ impl McqQueueSet {
             let cq_tail = reg
                 .read_mcq_cq_tail(descriptor.oprs(), id)
                 .unwrap_or(u32::MAX);
-            let cqis = reg
-                .read_mcq_cqis(descriptor.oprs(), id)
-                .unwrap_or(u32::MAX);
+            let cqis = reg.read_mcq_cqis(descriptor.oprs(), id).unwrap_or(u32::MAX);
             let sq_tail_slot = queue.submission.lock().sq_tail_slot();
             let completion = queue.completion.lock();
 
@@ -1212,14 +969,12 @@ impl UfsHwQueue {
 
     fn poll(&self, completed: &mut CompletedRequests) -> Result<()> {
         match &self.inner {
-            UfsHwQueueKind::Sdb { reg, state } => {
-                SdbTransferBackend::collect_state_completions(
-                    reg,
-                    state,
-                    SdbCompletionSource::Poll,
-                    completed,
-                )
-            }
+            UfsHwQueueKind::Sdb { reg, state } => SdbTransferBackend::collect_state_completions(
+                reg,
+                state,
+                SdbCompletionSource::Poll,
+                completed,
+            ),
             UfsHwQueueKind::Mcq {
                 reg,
                 dma,
@@ -1247,8 +1002,7 @@ trait UfsTransferOps: Send + Sync {
     ) -> Result<Option<UfsPrdtMapping>>;
     fn dump_state(&self, tag: usize, reason: &str);
     fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()>;
-    fn fetch_dev(&self, cmd: UfsDevCmd, task_tag: TaskTag, cqe: Option<CqEntry>)
-        -> Result<UfsCmd>;
+    fn fetch_dev(&self, cmd: UfsDevCmd, task_tag: TaskTag, cqe: Option<CqEntry>) -> Result<UfsCmd>;
     fn fetch_scsi_completion(&self, task_tag: TaskTag, cqe: Option<CqEntry>) -> UfsScsiResult;
 }
 
@@ -1265,7 +1019,9 @@ impl SdbTransferBackend {
     }
 
     fn tag_mask(tag: u32) -> Option<u32> {
-        u32::try_from(tag).ok().and_then(|tag| 1u32.checked_shl(tag))
+        u32::try_from(tag)
+            .ok()
+            .and_then(|tag| 1u32.checked_shl(tag))
     }
 
     fn collect_completions(&self, requests: &mut CompletedRequests) -> Result<()> {
@@ -1511,7 +1267,6 @@ impl UfsTransferOps for McqTransferBackend {
     fn fetch_scsi_completion(&self, task_tag: TaskTag, cqe: Option<CqEntry>) -> UfsScsiResult {
         McqTransferBackend::fetch_scsi_completion(self, task_tag, cqe)
     }
-
 }
 
 impl UfsTransferBackend {
@@ -1561,7 +1316,12 @@ impl UfsRequestData {
         hw_queue: &UfsHwQueue,
     ) -> Result<()> {
         if let Some(queue) = rq.queue_data().dev_queue() {
-            let cmd = rq.data_ref().inner.lock().prepared_command()?.get_device()?;
+            let cmd = rq
+                .data_ref()
+                .inner
+                .lock()
+                .prepared_command()?
+                .get_device()?;
             let task_tag = Self::task_tag(rq)?;
             queue.compose_dev(cmd, task_tag)?;
             queue.bind_command(task_tag, hw_queue.id(), rq.tag())?;
@@ -1581,11 +1341,7 @@ impl UfsRequestData {
         let task_tag = Self::task_tag(rq)?;
         let prdt = UfsQueue::compose_scsi(rq, cmd, task_tag, &mempool)?;
 
-        rq
-            .data_ref()
-            .inner
-            .lock()
-            .prepare_scsi(cmd, prdt)?;
+        rq.data_ref().inner.lock().prepare_scsi(cmd, prdt)?;
         queue.bind_command(task_tag, hw_queue.id(), rq.tag())?;
         Ok(())
     }
@@ -1613,11 +1369,7 @@ impl UfsRequestData {
         let mut rq = Some(rq);
         let outcome = hw_queue.submit(u32::from(task_tag.value()), polled, || {
             let request = rq.as_ref().ok_or(EIO)?;
-            request
-                .data_ref()
-                .inner
-                .lock()
-                .mark_in_flight(queue_id)?;
+            request.data_ref().inner.lock().mark_in_flight(queue_id)?;
 
             // Drop the submit-side reference at the publish boundary. From
             // this point hardware may complete the command immediately and
@@ -1648,11 +1400,7 @@ impl UfsRequestData {
         }
     }
 
-    pub(crate) fn timeout(
-        request_data: &UfsRequestData,
-        queue_data: &QueueData,
-        tag: u32,
-    ) -> bool {
+    pub(crate) fn timeout(request_data: &UfsRequestData, queue_data: &QueueData, tag: u32) -> bool {
         let queue = queue_data.queue_arc().clone();
         let disposition = request_data.inner.lock().timeout();
         let cmd = match disposition {
@@ -1697,13 +1445,7 @@ impl UfsRequestData {
         cqe: Option<CqEntry>,
         batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>,
     ) -> CompletionOutcome {
-        Self::complete_with(
-            rq,
-            task_tag,
-            queue_id,
-            cqe,
-            CompletionTarget::Poll(batch),
-        )
+        Self::complete_with(rq, task_tag, queue_id, cqe, CompletionTarget::Poll(batch))
     }
 
     fn complete_with(
@@ -1714,22 +1456,15 @@ impl UfsRequestData {
         target: CompletionTarget<'_>,
     ) -> CompletionOutcome {
         let request_queue = rq.queue_data().queue_arc().clone();
-        let (cmd, prdt) = match rq
-            .data_ref()
-            .inner
-            .lock()
-            .begin_completion(queue_id)
-        {
+        let (cmd, prdt) = match rq.data_ref().inner.lock().begin_completion(queue_id) {
             Ok(state) => state,
             Err(_) => {
                 pr_err!(
                     "[RUFS] ufs_queue: completion for inactive request tag={}\n",
                     rq.tag(),
                 );
-                request_queue.require_recovery(
-                    "completion for inactive request",
-                    rq.tag() as usize,
-                );
+                request_queue
+                    .require_recovery("completion for inactive request", rq.tag() as usize);
                 return CompletionOutcome::RetainedForRecovery;
             }
         };
@@ -2136,7 +1871,7 @@ impl UfsQueue {
         let sense_len = result.sense_data_len.min(result.sense_data.len());
         let sense = parse_scsi_sense(&result.sense_data, sense_len);
         let suppress_log = matches!(result.completion, UfsScsiCompletion::CheckCondition)
-            && boot_unit_attention(sense.as_ref());
+            && matches!(sense.as_ref(), Some(sense) if sense.is_power_on_reset());
         let requeue = should_requeue_scsi(result.completion, sense.as_ref());
 
         if !matches!(result.completion, UfsScsiCompletion::Good) && !suppress_log {
@@ -2288,9 +2023,7 @@ impl UfsQueue {
                     return CompletionOutcome::Returned;
                 }
                 if status != u32::from(bindings::BLK_STS_OK) {
-                    rq.end(
-                        u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8),
-                    );
+                    rq.end(u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8));
                     return CompletionOutcome::Returned;
                 }
 

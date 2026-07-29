@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 use crate::dma::{MAX_PRD_ENTRIES, PRDT_DATA_BYTE_COUNT_MAX};
+use crate::protocol::scsi::UfsSCSICmd;
 use crate::queue::*;
 use kernel::bindings;
 use kernel::block::error::code::BLK_STS_IOERR;
@@ -556,9 +557,9 @@ impl Operations for UfsLuBlockOps {
 
         match OwnableRefCounted::try_from_shared(rq) {
             Ok(rq) => match disposition {
-                CompletionDisposition::End(status) => rq.end(
-                    u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8),
-                ),
+                CompletionDisposition::End(status) => {
+                    rq.end(u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8))
+                }
                 CompletionDisposition::Requeue => rq.requeue(true),
             },
             Err(_) => {

@@ -13,6 +13,7 @@ mod frontend;
 mod host;
 mod irq;
 mod lu;
+mod protocol;
 mod queue;
 mod reg;
 mod uic;
