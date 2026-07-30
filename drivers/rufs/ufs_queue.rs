@@ -23,7 +23,7 @@ const READ_16: u8 = 0x88;
 const WRITE_16: u8 = 0x8a;
 const UFS_MCQ_DEFAULT_READ_QUEUES: usize = 0;
 const UFS_MCQ_DEFAULT_POLL_QUEUES: usize = 1;
-const UFS_MCQ_SOFTWARE_QUEUE_DEPTH: usize = 256;
+const UFS_SOFTWARE_QUEUE_DEPTH: usize = 256;
 const COMPLETION_BATCH_SIZE: usize = 16;
 
 fn possible_cpus() -> usize {
@@ -94,7 +94,7 @@ impl UfsTransferConfig {
             .ok_or(EOVERFLOW)?;
         let max_active_commands = core::cmp::min(reg.nutrs_mcq(), TASK_TAG_COUNT);
         let task_tag_count = TASK_TAG_COUNT;
-        let software_queue_depth = UFS_MCQ_SOFTWARE_QUEUE_DEPTH;
+        let software_queue_depth = UFS_SOFTWARE_QUEUE_DEPTH;
         let ring_entries = max_active_commands.checked_add(1).ok_or(EOVERFLOW)?;
         if interrupt_queues == 0 || max_active_commands == 0 {
             return Err(EINVAL);
@@ -123,7 +123,9 @@ impl UfsTransferConfig {
 
     fn software_queue_depth(&self) -> usize {
         match self {
-            Self::Sdb { tag_count } => *tag_count,
+            // Keep submitters from blocking on blk-mq tags before they can
+            // reap polled commands. The command pool still limits SDB to NUTRS.
+            Self::Sdb { .. } => UFS_SOFTWARE_QUEUE_DEPTH,
             Self::Mcq(config) => config.software_queue_depth,
         }
     }
