@@ -131,7 +131,11 @@ impl pci::Driver for UfsPci {
             pdev.set_master();
 
             let resources = HostResources::new(pdev.as_ref().into(), HciMmio::from_pci(pdev)?)?;
-            let host = UfsHost::new(resources, pdev);
+            // Until MCQ ESI routing is implemented, all UIC and transfer
+            // completions use the controller's single global interrupt.
+            let irq_vectors = pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?;
+            let controller_irq = (*irq_vectors.start()).try_into()?;
+            let host = UfsHost::new(resources, controller_irq);
 
             pr_info!("rufs: probe done");
 

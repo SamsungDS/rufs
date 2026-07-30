@@ -7,7 +7,7 @@
 use kernel::sync::{Arc, Mutex, SpinLock};
 use kernel::time::{delay::*, Delta};
 use kernel::types::ScopeGuard;
-use kernel::{device::Core, new_mutex, new_spinlock, pci, prelude::*};
+use kernel::{irq, new_mutex, new_spinlock, prelude::*};
 use pin_init::pin_init_scope;
 
 use crate::device::*;
@@ -71,7 +71,7 @@ pub(crate) struct UfsHost {
 impl UfsHost {
     pub(crate) fn new<'a>(
         resources: Arc<HostResources>,
-        pdev: &'a pci::Device<Core<'a>>,
+        controller_irq: irq::IrqRequest<'a>,
     ) -> impl PinInit<Self, Error> + 'a {
         pin_init_scope(move || {
             let reg = UfsReg::new(resources.clone())?;
@@ -84,11 +84,6 @@ impl UfsHost {
 
             reg.clear_all_interrupts();
             reg.disable_interrupts();
-
-            // Until MCQ ESI routing is implemented, all UIC and transfer
-            // completions use the controller's single global interrupt.
-            let irq_vectors = pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?;
-            let first_irq_vector = *irq_vectors.start();
 
             let irq = UfsIrq::new()?;
             let uic = UfsUic::new(reg.clone())?;
@@ -111,8 +106,7 @@ impl UfsHost {
 
             /* ufshcd_link_startup() */
             irq.request_controller_irq(
-                pdev,
-                first_irq_vector,
+                controller_irq,
                 reg.clone(),
                 uic.clone(),
                 interrupt_policy,

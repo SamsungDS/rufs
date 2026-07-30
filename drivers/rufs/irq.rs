@@ -5,11 +5,11 @@
 use crate::queue::*;
 use crate::reg::*;
 use crate::uic::*;
-use kernel::device::{Bound, Core, Device};
-use kernel::irq::{self, Flags, IrqReturn, ThreadedIrqReturn};
+use kernel::device::{Bound, Device};
+use kernel::irq::{self, Flags, IrqRequest, IrqReturn, ThreadedIrqReturn};
 use kernel::sync::atomic::{Acquire, Atomic, Relaxed, Release};
 use kernel::sync::{Arc, Mutex};
-use kernel::{c_str, new_mutex, pci, prelude::*};
+use kernel::{c_str, new_mutex, prelude::*};
 
 #[derive(Clone, Copy)]
 pub(crate) enum UfsInterruptPolicy {
@@ -144,10 +144,9 @@ impl UfsIrq {
         )
     }
 
-    pub(crate) fn request_controller_irq(
+    pub(crate) fn request_controller_irq<'a>(
         &self,
-        pdev: &pci::Device<Core<'_>>,
-        vector: pci::IrqVector<'_>,
+        request: IrqRequest<'a>,
         reg: Arc<UfsReg>,
         uic: Arc<UfsUic>,
         policy: UfsInterruptPolicy,
@@ -164,7 +163,12 @@ impl UfsIrq {
             UfsInterruptPolicy::EagerAck => Flags::SHARED,
             UfsInterruptPolicy::ThreadedAck => Flags::SHARED | Flags::ONESHOT,
         };
-        let irq = pdev.request_threaded_irq(vector, flags, c_str!("rufs-controller"), handler);
+        let irq = irq::ThreadedRegistration::new(
+            request,
+            flags,
+            c_str!("rufs-controller"),
+            handler,
+        );
 
         let reg = Arc::pin_init(irq, GFP_KERNEL)?;
         self.registration.lock().replace(reg);
