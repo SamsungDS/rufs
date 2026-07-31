@@ -1,7 +1,28 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 menuconfig RUFS
-       tristate "Rust UFS host controller driver"
-       depends on RUST && PCI
-       help
-        Enables the Rust UFS host controller driver (experimental).
+	tristate "Rust UFS host controller driver"
+	depends on RUST
+	help
+	  Enables the Rust UFS host controller driver (experimental).
+
+if RUFS
+
+config RUFS_PCI
+	bool "PCI bus frontend"
+	depends on PCI
+	default y if PCI
+	help
+	  Build the PCI frontend for QEMU and PCI-attached UFS controllers.
+
+config RUFS_QCOM
+	bool "Qualcomm platform frontend"
+	depends on OF
+	depends on ARCH_QCOM || COMPILE_TEST
+	help
+	  Build the Qualcomm platform frontend skeleton.
+
+	  The Qualcomm hardware initialization sequence is not implemented yet,
+	  so this frontend does not currently bind to hardware.
+
+endif
