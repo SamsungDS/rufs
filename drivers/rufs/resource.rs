@@ -2,12 +2,15 @@
 
 //! Resources owned by a UFS host-controller frontend.
 
+use kernel::alloc::KBox;
 use kernel::device::{self, Bound};
 use kernel::devres::Devres;
 use kernel::io::mem::IoMem;
 use kernel::io::{IoBase, Mmio, MmioBackend, Region};
 use kernel::sync::{aref::ARef, Arc};
 use kernel::{c_str, pci, prelude::*};
+
+use crate::variant::UfsVariantOps;
 
 pub(crate) const HCI_MMIO_SIZE: usize = 0x1000;
 
@@ -59,14 +62,20 @@ impl<'a> IoBase<'a> for HciMmioAccess<'a> {
 pub(crate) struct HostResources {
     device: ARef<device::Device>,
     hci: Arc<HciMmio>,
+    variant: KBox<dyn UfsVariantOps>,
 }
 
 impl HostResources {
-    pub(crate) fn new(device: ARef<device::Device>, hci: HciMmio) -> Result<Arc<Self>> {
+    pub(crate) fn new(
+        device: ARef<device::Device>,
+        hci: HciMmio,
+        variant: KBox<dyn UfsVariantOps>,
+    ) -> Result<Arc<Self>> {
         Ok(Arc::new(
             Self {
                 device,
                 hci: Arc::new(hci, GFP_KERNEL)?,
+                variant,
             },
             GFP_KERNEL,
         )?)
@@ -80,5 +89,9 @@ impl HostResources {
 
     pub(crate) fn hci_access(&self) -> Result<HciMmioAccess<'_>> {
         self.hci.access(self.device())
+    }
+
+    pub(crate) fn variant(&self) -> &dyn UfsVariantOps {
+        &*self.variant
     }
 }

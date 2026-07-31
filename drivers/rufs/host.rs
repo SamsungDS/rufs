@@ -19,6 +19,7 @@ use crate::reg::*;
 use crate::resource::HostResources;
 use crate::transport::UfsTransferConfig;
 use crate::uic::*;
+use crate::variant::NotifyPhase;
 
 const HBA_ENABLE_DELAY_US: i64 = 1000;
 
@@ -100,9 +101,15 @@ impl UfsHost {
                 stop_hba_controller(&reg);
             }
 
+            resources
+                .variant()
+                .hce_enable_notify(&reg, NotifyPhase::Pre)?;
             reg.ctrl_enable();
             fsleep(Delta::from_micros(HBA_ENABLE_DELAY_US));
             reg.wait_for_ctrl_enable(1000, 50)?;
+            resources
+                .variant()
+                .hce_enable_notify(&reg, NotifyPhase::Post)?;
 
             /* ufshcd_link_startup() */
             irq.request_controller_irq(
@@ -111,7 +118,13 @@ impl UfsHost {
                 uic.clone(),
                 interrupt_policy,
             )?;
+            resources
+                .variant()
+                .link_startup_notify(&reg, NotifyPhase::Pre)?;
             uic.link_startup()?;
+            resources
+                .variant()
+                .link_startup_notify(&reg, NotifyPhase::Post)?;
             dma.make_hba_operational()?;
 
             let ufs_queue = UfsQueue::new(transfer_config, reg.clone(), dma.clone())?;
@@ -137,7 +150,7 @@ impl UfsHost {
                 host.dev.verify_dev_init()?;
                 host.dev.complete_dev_init()?;
                 host.dev.device_params_init()?;
-                if let Err(e) = host.uic.configure_max_power_mode() {
+                if let Err(e) = host.configure_power_mode() {
                     pr_warn!(
                         "[RUFS] ufs_host: power mode configuration failed errno={}, continue with current mode\n",
                         e.to_errno(),
@@ -150,6 +163,15 @@ impl UfsHost {
 
             Ok(host)
         })
+    }
+
+    fn configure_power_mode(&self) -> Result<()> {
+        let variant = self.resources.variant();
+        let mode = variant.constrain_power_mode(self.uic.max_power_mode()?)?;
+
+        variant.power_mode_notify(&self.reg, mode, NotifyPhase::Pre)?;
+        self.uic.change_power_mode(mode)?;
+        variant.power_mode_notify(&self.reg, mode, NotifyPhase::Post)
     }
 
     fn alloc_luns(&self) -> Result<()> {

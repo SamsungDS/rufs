@@ -20,6 +20,7 @@ mod reg;
 mod resource;
 mod transport;
 mod uic;
+mod variant;
 
 use frontend::pci::UfsPci;
 

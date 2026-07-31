@@ -30,20 +30,20 @@ enum UicCmdTimeoutMs {
 }
 
 #[derive(Copy, Clone, Debug)]
-enum UfsPaPwrMode {
+pub(crate) enum UfsPaPwrMode {
     Fast = 1,
     Slow = 2,
 }
 
 #[derive(Copy, Clone)]
-struct UfsPaLayerAttr {
-    gear_rx: u32,
-    gear_tx: u32,
-    lane_rx: u32,
-    lane_tx: u32,
-    pwr_rx: UfsPaPwrMode,
-    pwr_tx: UfsPaPwrMode,
-    hs_rate: u32,
+pub(crate) struct UfsPaLayerAttr {
+    pub(crate) gear_rx: u32,
+    pub(crate) gear_tx: u32,
+    pub(crate) lane_rx: u32,
+    pub(crate) lane_tx: u32,
+    pub(crate) pwr_rx: UfsPaPwrMode,
+    pub(crate) pwr_tx: UfsPaPwrMode,
+    pub(crate) hs_rate: u32,
 }
 
 #[derive(Copy, Clone)]
@@ -141,24 +141,7 @@ impl UfsUic {
         Ok(())
     }
 
-    pub(crate) fn configure_max_power_mode(self: &Arc<Self>) -> Result<()> {
-        let pwr_mode = self.max_power_mode()?;
-
-        pr_info!(
-            "[RUFS] ufs_uic: configure power mode gear_rx={} gear_tx={} lane_rx={} lane_tx={} pwr_rx={:?} pwr_tx={:?} hs_rate={}\n",
-            pwr_mode.gear_rx,
-            pwr_mode.gear_tx,
-            pwr_mode.lane_rx,
-            pwr_mode.lane_tx,
-            pwr_mode.pwr_rx,
-            pwr_mode.pwr_tx,
-            pwr_mode.hs_rate,
-        );
-
-        self.change_power_mode(pwr_mode)
-    }
-
-    fn max_power_mode(&self) -> Result<UfsPaLayerAttr> {
+    pub(crate) fn max_power_mode(&self) -> Result<UfsPaLayerAttr> {
         let lane_rx = self.dme_get(PA_CONNECTEDRXDATALANES)?;
         let lane_tx = self.dme_get(PA_CONNECTEDTXDATALANES)?;
         if lane_rx == 0 || lane_tx == 0 || lane_rx != lane_tx {
@@ -203,7 +186,18 @@ impl UfsUic {
         })
     }
 
-    fn change_power_mode(&self, pwr_mode: UfsPaLayerAttr) -> Result<()> {
+    pub(crate) fn change_power_mode(&self, pwr_mode: UfsPaLayerAttr) -> Result<()> {
+        pr_info!(
+            "[RUFS] ufs_uic: configure power mode gear_rx={} gear_tx={} lane_rx={} lane_tx={} pwr_rx={:?} pwr_tx={:?} hs_rate={}\n",
+            pwr_mode.gear_rx,
+            pwr_mode.gear_tx,
+            pwr_mode.lane_rx,
+            pwr_mode.lane_tx,
+            pwr_mode.pwr_rx,
+            pwr_mode.pwr_tx,
+            pwr_mode.hs_rate,
+        );
+
         self.dme_set(PA_RXGEAR, pwr_mode.gear_rx)?;
         self.dme_set(PA_ACTIVERXDATALANES, pwr_mode.lane_rx)?;
         self.dme_set(PA_RXTERMINATION, pwr_mode.pwr_rx.uses_termination() as u32)?;

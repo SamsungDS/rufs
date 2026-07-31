@@ -6,6 +6,7 @@ use kernel::{device::Core, pci, prelude::*};
 
 use crate::host::UfsHost;
 use crate::resource::{HciMmio, HostResources};
+use crate::variant::UfsVariantOps;
 
 #[derive(Clone, Copy)]
 pub(crate) enum UfsPciVariant {
@@ -31,6 +32,8 @@ impl UfsPciVariant {
         }
     }
 }
+
+impl UfsVariantOps for UfsPciVariant {}
 
 kernel::pci_device_table!(
     PCI_TABLE,
@@ -130,7 +133,12 @@ impl pci::Driver for UfsPci {
             pdev.enable_device_mem()?;
             pdev.set_master();
 
-            let resources = HostResources::new(pdev.as_ref().into(), HciMmio::from_pci(pdev)?)?;
+            let variant = KBox::new(*platform, GFP_KERNEL)? as KBox<dyn UfsVariantOps>;
+            let resources = HostResources::new(
+                pdev.as_ref().into(),
+                HciMmio::from_pci(pdev)?,
+                variant,
+            )?;
             // Until MCQ ESI routing is implemented, all UIC and transfer
             // completions use the controller's single global interrupt.
             let irq_vectors = pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?;
