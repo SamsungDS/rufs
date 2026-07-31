@@ -2,7 +2,7 @@
 
 //! Host-controller variant operations.
 
-use crate::reg::UfsReg;
+use crate::reg::{McqRegisterLayout, UfsReg};
 use crate::uic::UfsPaLayerAttr;
 use kernel::prelude::*;
 
@@ -13,6 +13,10 @@ pub(crate) enum NotifyPhase {
 }
 
 pub(crate) trait UfsVariantOps: Send + Sync {
+    fn mcq_register_layout(&self, reg: &UfsReg) -> Result<McqRegisterLayout> {
+        reg.standard_mcq_register_layout()
+    }
+
     fn hce_enable_notify(&self, _reg: &UfsReg, _phase: NotifyPhase) -> Result<()> {
         Ok(())
     }

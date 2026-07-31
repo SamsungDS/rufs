@@ -22,6 +22,27 @@ pub(crate) enum HciMmio {
     Platform(Devres<IoMem<'static, HCI_MMIO_SIZE>>),
 }
 
+/// An optional, separately mapped MCQ register region.
+///
+/// Some platform controllers expose MCQ queue configuration and operation
+/// registers through a named resource rather than the standard HCI region.
+#[allow(dead_code)]
+pub(crate) struct McqMmio(Devres<IoMem<'static>>);
+
+#[allow(dead_code)]
+impl McqMmio {
+    pub(crate) fn from_platform(mmio: Devres<IoMem<'static>>) -> Self {
+        Self(mmio)
+    }
+
+    fn access<'a>(
+        &'a self,
+        dev: &'a device::Device<Bound>,
+    ) -> Result<&'a IoMem<'static>> {
+        self.0.access(dev)
+    }
+}
+
 impl HciMmio {
     pub(crate) fn from_pci(pdev: &pci::Device<Bound>) -> Result<Self> {
         Ok(Self::Pci(
@@ -62,6 +83,7 @@ impl<'a> IoBase<'a> for HciMmioAccess<'a> {
 pub(crate) struct HostResources {
     device: ARef<device::Device>,
     hci: Arc<HciMmio>,
+    mcq: Option<Arc<McqMmio>>,
     variant: KBox<dyn UfsVariantOps>,
 }
 
@@ -69,12 +91,16 @@ impl HostResources {
     pub(crate) fn new(
         device: ARef<device::Device>,
         hci: HciMmio,
+        mcq: Option<McqMmio>,
         variant: KBox<dyn UfsVariantOps>,
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(
             Self {
                 device,
                 hci: Arc::new(hci, GFP_KERNEL)?,
+                mcq: mcq
+                    .map(|mcq| Arc::new(mcq, GFP_KERNEL))
+                    .transpose()?,
                 variant,
             },
             GFP_KERNEL,
@@ -89,6 +115,10 @@ impl HostResources {
 
     pub(crate) fn hci_access(&self) -> Result<HciMmioAccess<'_>> {
         self.hci.access(self.device())
+    }
+
+    pub(crate) fn mcq_access(&self) -> Result<&IoMem<'static>> {
+        self.mcq.as_ref().ok_or(ENODEV)?.access(self.device())
     }
 
     pub(crate) fn variant(&self) -> &dyn UfsVariantOps {

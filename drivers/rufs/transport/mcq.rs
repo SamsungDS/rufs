@@ -5,7 +5,7 @@
 use crate::command::TaskTag;
 use crate::dma::UfsDma;
 use crate::hci::descriptor::{CqEntry, SqEntry};
-use crate::reg::{UfsMcqOprRegion, UfsMcqOprSet, UfsReg};
+use crate::reg::{McqRegisterLayout, UfsMcqOprRegion, UfsMcqOprSet, UfsReg};
 use crate::transport::{
     CompletedRequests, McqConfig, SubmissionOutcome, TransferCompletion, UfsHwQueue, UfsTransferOps,
 };
@@ -451,6 +451,7 @@ impl McqQueueSet {
     fn configure_registers_with_interrupt_queues(
         &self,
         reg: &UfsReg,
+        layout: &McqRegisterLayout,
         interrupt_queues: usize,
     ) -> Result<()> {
         if interrupt_queues > self.queues.len() {
@@ -465,22 +466,26 @@ impl McqQueueSet {
             let sq_dma_addr = submission.dma_addr() as u64;
             let cq_dma_addr = completion.dma_addr() as u64;
 
-            reg.set_mcq_sq_base_addr(id, sq_dma_addr)?;
+            reg.set_mcq_sq_base_addr(layout, id, sq_dma_addr)?;
             reg.write_mcq_sqdao(
+                layout,
                 id,
                 reg.mcq_opr_region_offset(descriptor.oprs(), UfsMcqOprRegion::Sqd, id),
             )?;
             reg.write_mcq_sqisao(
+                layout,
                 id,
                 reg.mcq_opr_region_offset(descriptor.oprs(), UfsMcqOprRegion::Sqis, id),
             )?;
 
-            reg.set_mcq_cq_base_addr(id, cq_dma_addr)?;
+            reg.set_mcq_cq_base_addr(layout, id, cq_dma_addr)?;
             reg.write_mcq_cqdao(
+                layout,
                 id,
                 reg.mcq_opr_region_offset(descriptor.oprs(), UfsMcqOprRegion::Cqd, id),
             )?;
             reg.write_mcq_cqisao(
+                layout,
                 id,
                 reg.mcq_opr_region_offset(descriptor.oprs(), UfsMcqOprRegion::Cqis, id),
             )?;
@@ -490,8 +495,8 @@ impl McqQueueSet {
             if id < interrupt_queues {
                 reg.enable_mcq_cq_tail_push_intr(descriptor.oprs(), id)?;
             }
-            reg.enable_mcq_cq(id, descriptor.max_entries() as usize)?;
-            reg.enable_mcq_sq(id, descriptor.max_entries() as usize, id)?;
+            reg.enable_mcq_cq(layout, id, descriptor.max_entries() as usize)?;
+            reg.enable_mcq_sq(layout, id, descriptor.max_entries() as usize, id)?;
         }
 
         Ok(())
@@ -502,12 +507,14 @@ pub(crate) struct McqTransferBackend {
     reg: Arc<UfsReg>,
     dma: Arc<UfsDma>,
     config: McqConfig,
+    register_layout: McqRegisterLayout,
     queues: Arc<McqQueueSet>,
 }
 
 impl McqTransferBackend {
     pub(crate) fn new(config: McqConfig, reg: Arc<UfsReg>, dma: Arc<UfsDma>) -> Result<Self> {
-        let oprs = reg.mcq_default_opr_set()?;
+        let register_layout = reg.mcq_register_layout()?;
+        let oprs = register_layout.oprs();
         let mut hardware_queues = KVec::new();
         let ring_entries = u32::try_from(config.ring_entries).map_err(|_| EOVERFLOW)?;
         for id in 0..config.total_queues {
@@ -525,6 +532,7 @@ impl McqTransferBackend {
             reg,
             dma,
             config,
+            register_layout,
             queues,
         })
     }
@@ -556,7 +564,11 @@ impl McqTransferBackend {
 
     fn prepare(&self) -> Result<()> {
         self.queues
-            .configure_registers_with_interrupt_queues(&self.reg, self.config.interrupt_queues)
+            .configure_registers_with_interrupt_queues(
+                &self.reg,
+                &self.register_layout,
+                self.config.interrupt_queues,
+            )
     }
 
     fn enable(&self) {

@@ -137,6 +137,7 @@ impl pci::Driver for UfsPci {
             let resources = HostResources::new(
                 pdev.as_ref().into(),
                 HciMmio::from_pci(pdev)?,
+                None,
                 variant,
             )?;
             // Until MCQ ESI routing is implemented, all UIC and transfer
