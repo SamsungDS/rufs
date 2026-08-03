@@ -537,6 +537,18 @@ impl<T: ?Sized, const ID: u64> Work<T, ID> {
         // the compiler does not complain that the `work` field is unused.
         unsafe { Opaque::cast_into(core::ptr::addr_of!((*ptr).work)) }
     }
+
+    /// Waits for this work item to finish if it is pending or running.
+    ///
+    /// Callers must not invoke this from the work item's own callback.
+    pub fn flush(self: Pin<&Self>) -> bool {
+        // SAFETY:
+        // - `self` is pinned, so the embedded `work_struct` remains at the
+        //   address used when it was initialized and queued.
+        // - `flush_work` waits for a pending or running callback before
+        //   returning, so the work remains valid for the entire call.
+        unsafe { bindings::flush_work(Self::raw_get(self.get_ref())) }
+    }
 }
 
 /// Declares that a type contains a [`Work<T, ID>`].
