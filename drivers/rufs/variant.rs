@@ -13,6 +13,14 @@ pub(crate) enum NotifyPhase {
 }
 
 pub(crate) trait UfsVariantOps: Send + Sync {
+    /// Prepare controller-specific resources before common host initialization.
+    fn initialize(&self, _reg: &UfsReg) -> Result<()> {
+        Ok(())
+    }
+
+    /// Release controller-specific resources after the common host is stopped.
+    fn shutdown(&self, _reg: &UfsReg) {}
+
     fn mcq_register_layout(&self, reg: &UfsReg) -> Result<McqRegisterLayout> {
         reg.standard_mcq_register_layout()
     }

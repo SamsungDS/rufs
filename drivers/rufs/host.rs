@@ -78,6 +78,15 @@ impl UfsHost {
     ) -> impl PinInit<Self, Error> + 'a {
         pin_init_scope(move || {
             let reg = UfsReg::new(resources.clone())?;
+            resources.variant().initialize(&reg)?;
+
+            let cleanup_resources = resources.clone();
+            let cleanup_reg = reg.clone();
+            let init_guard = ScopeGuard::new(move || {
+                stop_hba_controller(&cleanup_reg);
+                cleanup_resources.variant().shutdown(&cleanup_reg);
+            });
+
             let transfer_config = UfsTransferConfig::new(&reg)?;
             let dma = UfsDma::new(
                 resources.device(),
@@ -94,9 +103,6 @@ impl UfsHost {
                 UfsTransferConfig::Sdb { .. } => UfsInterruptPolicy::EagerAck,
                 UfsTransferConfig::Mcq(_) => UfsInterruptPolicy::ThreadedAck,
             };
-
-            let cleanup_reg = reg.clone();
-            let init_guard = ScopeGuard::new(move || stop_hba_controller(&cleanup_reg));
 
             if reg.ctrl_enabled() {
                 pr_info!("[RUFS] ufs_host: controller is active, stop before enable\n");
@@ -250,6 +256,7 @@ impl UfsHost {
         self.irq.shutdown();
         self.queue.flush_recovery_work();
         stop_hba_controller(&self.reg);
+        self.resources.variant().shutdown(&self.reg);
         self.finish_shutdown();
     }
 
