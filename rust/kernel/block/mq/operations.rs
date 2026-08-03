@@ -30,6 +30,7 @@ use crate::{
         ForeignOwnable,
         Owned, //
     },
+    ThisModule,
 };
 use core::marker::PhantomData;
 use pin_init::PinInit;
@@ -50,6 +51,12 @@ type ForeignBorrowed<'a, T> = <T as ForeignOwnable>::Borrowed<'a>;
 /// [module level documentation]: kernel::block::mq
 #[macros::vtable]
 pub trait Operations: Sized {
+    /// The module that owns the block device operations.
+    ///
+    /// Open block devices hold a reference to this module, preventing the
+    /// operations from being unloaded while they may still be called.
+    const MODULE: &'static ThisModule;
+
     /// Data associated with a request. This data is located next to the request
     /// structure.
     ///

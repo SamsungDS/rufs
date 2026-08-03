@@ -11,8 +11,8 @@ use kernel::{
         error::BlkResult,
         mq::{
             self,
-            gen_disk::{self, GenDisk},
-            Operations, TagSet,
+            gen_disk::{BoundGenDisk, GenDisk},
+            LimitsBuilder, Operations, TagSet,
         },
     },
     prelude::*,
@@ -53,7 +53,7 @@ impl NullBlkDevice {
         rotational: bool,
         capacity_mib: u64,
         irq_mode: IRQMode,
-    ) -> Result<GenDisk<Self>> {
+    ) -> Result<BoundGenDisk<Self>> {
         let tagset = Arc::pin_init(
             TagSet::new(
                 1,
@@ -68,12 +68,21 @@ impl NullBlkDevice {
 
         let queue_data = Box::new(QueueData { irq_mode }, GFP_KERNEL)?;
 
-        gen_disk::GenDiskBuilder::new()
-            .capacity_sectors(capacity_mib << (20 - block::SECTOR_SHIFT))
+        let limits = LimitsBuilder::<Self>::new()
             .logical_block_size(block_size)?
             .physical_block_size(block_size)?
             .rotational(rotational)
-            .build(fmt!("{}", name.to_str()?), tagset, queue_data)
+            .build()?;
+
+        GenDisk::new(
+            fmt!("{}", name.to_str()?),
+            tagset,
+            queue_data,
+            limits,
+            (),
+            capacity_mib << (20 - block::SECTOR_SHIFT),
+            256,
+        )
     }
 }
 
@@ -83,10 +92,13 @@ struct QueueData {
 
 #[vtable]
 impl Operations for NullBlkDevice {
+    const MODULE: &'static ThisModule = &THIS_MODULE;
+
     type QueueData = KBox<QueueData>;
     type TagSetData = ();
     type RequestData = ();
     type HwData = ();
+    type GenDiskData = ();
 
     fn new_request_data() -> impl PinInit<Self::RequestData> {
         Ok(())

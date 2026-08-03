@@ -75,6 +75,8 @@
 //!
 //! #[vtable]
 //! impl Operations for MyBlkDevice {
+//!     const MODULE: &'static kernel::ThisModule = &THIS_MODULE;
+//!
 //!     type RequestData = ();
 //!     type QueueData = ();
 //!     type HwData = ();
