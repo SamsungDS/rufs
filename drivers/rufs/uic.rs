@@ -101,14 +101,20 @@ struct UfsUicRsp {
     value: u32,
 }
 
+#[derive(Default)]
+struct UicTransactionState {
+    command: Option<UfsUicCmd>,
+    response: Option<UfsUicRsp>,
+}
+
 #[pin_data]
 pub(crate) struct UfsUic {
     reg: Arc<UfsReg>,
 
     #[pin]
-    cmd: Mutex<Option<UfsUicCmd>>,
+    transaction: Mutex<()>,
     #[pin]
-    rsp: SpinLock<Option<UfsUicRsp>>,
+    state: SpinLock<UicTransactionState>,
     #[pin]
     completion: Completion,
 }
@@ -118,8 +124,8 @@ impl UfsUic {
         Arc::pin_init(
             try_pin_init!(Self {
                 reg,
-                cmd <- new_mutex!(None),
-                rsp <- new_spinlock!(None),
+                transaction <- new_mutex!(()),
+                state <- new_spinlock!(UicTransactionState::default()),
                 completion <- Completion::new(),
             }),
             GFP_KERNEL,
@@ -270,18 +276,22 @@ impl UfsUic {
     }
 
     fn send_uic_cmd(&self, cmd: UfsUicCmd) -> Result<u32> {
-        self.cmd.lock().take();
+        // Serialize command preparation, issue, wait, and response
+        // consumption. The IRQ-facing state remains under its spinlock so the
+        // completion handler never needs the sleepable transaction mutex.
+        let _transaction = self.transaction.lock();
+
         self.completion.reinit();
-        self.rsp.lock().take();
+        *self.state.lock() = UicTransactionState::default();
 
         self.reg.enable_uic_interrupts();
         self.reg
             .wait_for_uic_cmd_ready(500, UicCmdTimeoutMs::DEFAULT as i64)?;
 
-        self.cmd.lock().replace(cmd);
+        self.state.lock().command = Some(cmd);
         self.dispatch_uic_cmd(cmd);
         let result = self.wait_for_uic_cmd();
-        self.cmd.lock().take();
+        self.state.lock().command = None;
         result
     }
 
@@ -297,7 +307,7 @@ impl UfsUic {
         match self.completion.wait_for_completion_timeout(delta) {
             0 => Err(ETIMEDOUT),
             _ => {
-                let rsp = self.rsp.lock().take();
+                let rsp = self.state.lock().response.take();
                 match rsp {
                     Some(UfsUicRsp {
                         result: UicCmdResult::Success,
@@ -325,7 +335,8 @@ impl UfsUic {
     }
 
     pub(crate) fn handle_uic_completion(&self, interrupt_status: u32) -> bool {
-        let expected_completion = self.cmd.lock().as_ref().map(|cmd| cmd.expected_completion);
+        let mut state = self.state.lock();
+        let expected_completion = state.command.map(|cmd| cmd.expected_completion);
 
         if expected_completion == Some(UicCompletion::Command)
             && is_uic_command_completion(interrupt_status)
@@ -334,7 +345,7 @@ impl UfsUic {
                 result: self.reg.get_uic_cmd_result().into(),
                 value: self.reg.get_dme_attr_val(),
             };
-            self.rsp.lock().replace(rsp);
+            state.response = Some(rsp);
             true
         } else if expected_completion == Some(UicCompletion::PowerMode)
             && is_uic_power_mode(interrupt_status)
@@ -343,7 +354,7 @@ impl UfsUic {
                 result: UicCmdResult::PowerModeChange,
                 value: self.reg.get_power_mode_change_status(),
             };
-            self.rsp.lock().replace(rsp);
+            state.response = Some(rsp);
             true
         } else {
             false
