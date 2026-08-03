@@ -92,6 +92,8 @@ struct QueueData {
 
 #[vtable]
 impl Operations for NullBlkDevice {
+    const MODULE: &'static ThisModule = kernel::module::this_module::<NullBlkModule>();
+
     type QueueData = KBox<QueueData>;
     type TagSetData = ();
     type RequestData = ();

@@ -71,8 +71,17 @@
 //!
 //! struct MyBlkDevice;
 //!
+//! impl kernel::ModuleMetadata for MyBlkDevice {
+//!     const NAME: &'static kernel::str::CStr = kernel::c_str!("myblk");
+//!     // SAFETY: This example is not built as a module, so the module pointer is null.
+//!     const THIS_MODULE: kernel::ThisModule =
+//!         unsafe { kernel::ThisModule::from_ptr(core::ptr::null_mut()) };
+//! }
+//!
 //! #[vtable]
 //! impl Operations for MyBlkDevice {
+//!     const MODULE: &'static kernel::ThisModule = kernel::module::this_module::<MyBlkDevice>();
+//!
 //!     type RequestData = ();
 //!     type QueueData = ();
 //!     type HwData = ();
