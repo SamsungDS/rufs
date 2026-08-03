@@ -184,4 +184,14 @@ impl UfsIrq {
         *slot = Some(queue);
         Ok(())
     }
+
+    pub(crate) fn shutdown(&self) {
+        self.queue.lock().take();
+
+        // Drop outside the registration lock. `free_irq()` waits for the
+        // primary and threaded handlers, and those handlers may take the
+        // queue lock while finishing.
+        let registration = self.registration.lock().take();
+        drop(registration);
+    }
 }

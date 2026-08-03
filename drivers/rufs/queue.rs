@@ -249,6 +249,7 @@ enum RecoveryState {
     Quiescing(RecoveryCause),
     Recovering(RecoveryCause),
     Failed(RecoveryCause),
+    Shutdown,
 }
 
 impl RecoveryState {
@@ -259,6 +260,7 @@ impl RecoveryState {
             | Self::Quiescing(cause)
             | Self::Recovering(cause)
             | Self::Failed(cause) => Some(cause),
+            Self::Shutdown => None,
         }
     }
 }
@@ -781,6 +783,23 @@ impl UfsQueue {
         command_pool
             .reserve()
             .map(|task_tag| u32::from(task_tag.value()))
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        *self.recovery.lock() = RecoveryState::Shutdown;
+        self.tags.quiesce();
+    }
+
+    pub(crate) fn active_commands(&self) -> usize {
+        self.command_pool.lock().active()
+    }
+
+    pub(crate) fn flush_recovery_work(self: &Arc<Self>) {
+        // SAFETY: `UfsQueue` was initialized in an `Arc` with `pin_init!`.
+        // The allocation remains stable while this `Arc` is alive, so its
+        // structurally pinned recovery work cannot move.
+        let work = unsafe { Pin::new_unchecked(&self.recovery_work) };
+        work.flush();
     }
 
     fn bind_command(&self, task_tag: TaskTag, queue_id: u32, blk_tag: u32) -> Result<()> {

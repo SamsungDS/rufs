@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+use kernel::io::poll::read_poll_timeout;
 use kernel::sync::{Arc, Mutex, SpinLock};
 use kernel::time::{delay::*, Delta};
 use kernel::types::ScopeGuard;
@@ -22,6 +23,8 @@ use crate::uic::*;
 use crate::variant::NotifyPhase;
 
 const HBA_ENABLE_DELAY_US: i64 = 1000;
+const SHUTDOWN_DRAIN_INTERVAL_MS: i64 = 1;
+const SHUTDOWN_DRAIN_TIMEOUT_SECS: i64 = 30;
 
 fn stop_hba_controller(reg: &UfsReg) {
     if !reg.ctrl_enabled() {
@@ -42,11 +45,10 @@ fn stop_hba_controller(reg: &UfsReg) {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostState {
-    Reset,
+    Starting,
     Operational,
-    EhNonFatal,
-    EhFatal,
-    Error,
+    Stopping,
+    Stopped,
 }
 
 #[pin_data(PinnedDrop)]
@@ -138,7 +140,7 @@ impl UfsHost {
                 queue: ufs_queue,
                 dev,
                 luns <- new_mutex!(KVec::new()),
-                state <- new_spinlock!(HostState::Reset),
+                state <- new_spinlock!(HostState::Starting),
                 max_hw_queues: 1,
                 max_prdt_entries: 256,
             })
@@ -158,6 +160,7 @@ impl UfsHost {
                 }
                 host.alloc_luns()?;
                 host.dev.alloc_tmf_queue(host.reg.nutmrs())?;
+                host.promote_to_operational()?;
                 Ok(())
             });
 
@@ -219,9 +222,35 @@ impl UfsHost {
         Ok(())
     }
 
-    pub(crate) fn remove(&self) {
+    fn shutdown(&self) {
+        if !self.begin_shutdown() {
+            return;
+        }
+
+        // Removing a disk may submit final filesystem writeback. Keep the
+        // request queues and completion path operational until every disk has
+        // been marked dead and its final I/O has completed.
         self.remove_luns();
-        self.hba_stop();
+
+        self.queue.begin_shutdown();
+        if let Err(e) = read_poll_timeout(
+            || Ok(self.queue.active_commands()),
+            |active| *active == 0,
+            Delta::from_millis(SHUTDOWN_DRAIN_INTERVAL_MS),
+            Delta::from_secs(SHUTDOWN_DRAIN_TIMEOUT_SECS),
+        ) {
+            pr_err!(
+                "[RUFS] ufs_host: timed out draining {} commands errno={}\n",
+                self.queue.active_commands(),
+                e.to_errno(),
+            );
+        }
+
+        self.reg.disable_interrupts();
+        self.irq.shutdown();
+        self.queue.flush_recovery_work();
+        stop_hba_controller(&self.reg);
+        self.finish_shutdown();
     }
 
     fn remove_luns(&self) {
@@ -232,47 +261,37 @@ impl UfsHost {
         luns.clear();
     }
 
-    fn hba_stop(&self) {
-        stop_hba_controller(&self.reg);
-        self.fallback_to_reset();
+    fn promote_to_operational(&self) -> Result<()> {
+        let mut state = self.state.lock();
+        if *state != HostState::Starting {
+            return Err(EINVAL);
+        }
+        *state = HostState::Operational;
+        Ok(())
     }
 
-    // getter
-    #[inline]
-    pub(crate) fn state(&self) -> HostState {
-        *self.state.lock()
+    fn begin_shutdown(&self) -> bool {
+        let mut state = self.state.lock();
+        match *state {
+            HostState::Starting | HostState::Operational => {
+                *state = HostState::Stopping;
+                true
+            }
+            HostState::Stopping | HostState::Stopped => false,
+        }
     }
 
-    // state
-    #[inline]
-    fn set_state(&self, state: HostState) {
-        *self.state.lock() = state;
-    }
-    #[inline]
-    fn enter_eh_nonfatal(&self) {
-        *self.state.lock() = HostState::EhNonFatal;
-    }
-    #[inline]
-    fn enter_eh_fatal(&self) {
-        *self.state.lock() = HostState::EhFatal;
-    }
-    #[inline]
-    fn enter_error(&self) {
-        *self.state.lock() = HostState::Error;
-    }
-    #[inline]
-    fn promote_to_operational(&self) {
-        *self.state.lock() = HostState::Operational;
-    }
-    #[inline]
-    fn fallback_to_reset(&self) {
-        *self.state.lock() = HostState::Reset;
+    fn finish_shutdown(&self) {
+        let mut state = self.state.lock();
+        if *state == HostState::Stopping {
+            *state = HostState::Stopped;
+        }
     }
 }
 
 #[pinned_drop]
 impl PinnedDrop for UfsHost {
     fn drop(self: Pin<&mut Self>) {
-        self.remove();
+        self.shutdown();
     }
 }
