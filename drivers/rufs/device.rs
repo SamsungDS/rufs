@@ -30,6 +30,8 @@ struct TaskManagementOps {}
 
 #[vtable]
 impl mq::Operations for TaskManagementOps {
+    const MODULE: &'static kernel::ThisModule = &crate::THIS_MODULE;
+
     type RequestData = ();
     type QueueData = ();
     type HwData = ();

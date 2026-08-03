@@ -363,6 +363,8 @@ impl QueueData {
 
 #[vtable]
 impl Operations for UfsLuBlockOps {
+    const MODULE: &'static kernel::ThisModule = &crate::THIS_MODULE;
+
     type RequestData = UfsRequestData;
     type QueueData = KBox<QueueData>;
     type HwData = KBox<UfsHwQueue>;
