@@ -382,6 +382,12 @@ impl UfsQcomPlatform {
 }
 
 impl UfsVariantOps for UfsQcomPlatform {
+    fn mcq_enabled(&self) -> bool {
+        // Qualcomm MCQ registers use a separate resource and topology. Keep
+        // SDB selected until that resource is mapped and described.
+        false
+    }
+
     fn device_reset(&self) -> Result<()> {
         if !self.device_reset.is_present() {
             return Ok(());

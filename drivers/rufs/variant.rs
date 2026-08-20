@@ -25,6 +25,11 @@ pub(crate) trait UfsVariantOps: Send + Sync {
         reg.standard_mcq_register_layout()
     }
 
+    /// Return whether this variant has provided an accessible MCQ topology.
+    fn mcq_enabled(&self) -> bool {
+        true
+    }
+
     /// Reset the attached UFS device before enabling the controller.
     fn device_reset(&self) -> Result<()> {
         Ok(())
