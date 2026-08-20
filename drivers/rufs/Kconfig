@@ -22,6 +22,7 @@ config RUFS_QCOM
 	depends on GENERIC_PHY
 	depends on GPIOLIB
 	depends on INTERCONNECT
+	depends on PM_OPP
 	depends on RESET_CONTROLLER
 	depends on ARCH_QCOM || COMPILE_TEST
 	help

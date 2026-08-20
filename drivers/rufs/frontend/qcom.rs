@@ -11,12 +11,16 @@ use kernel::{
     gpio::OptionalOutput,
     interconnect::Path,
     io::{poll::read_poll_timeout, register, Io},
+    macros::vtable,
     of,
+    opp,
     phy::{Phy, UfsMode},
     platform,
     prelude::*,
     regulator,
     reset::OptionalExclusive,
+    str::CString,
+    sync::aref::ARef,
     time::{delay::fsleep, Delta},
 };
 
@@ -112,6 +116,61 @@ const CORE_CLK_CYCLES_MASK: u32 = 0xff;
 const CORE_CLK_CYCLES_MASK_V4: u32 = 0x0fff << 16;
 const CORE_CLK_40NS_CYCLES_MASK: u32 = 0x7f;
 
+#[derive(Default)]
+struct UfsQcomOppOps;
+
+#[vtable]
+impl opp::ConfigOps for UfsQcomOppOps {
+    fn config_clks(
+        dev: &device::Device,
+        _table: &opp::Table,
+        selected: &opp::OPP,
+        _scaling_down: bool,
+    ) -> Result {
+        for (index, name) in CLOCK_NAMES.into_iter().enumerate() {
+            let rate = selected.freq(Some(u32::try_from(index).map_err(|_| EOVERFLOW)?));
+            if rate.as_hz() == 0 {
+                continue;
+            }
+
+            Clk::get(dev, Some(name))?.set_rate(rate)?;
+        }
+        Ok(())
+    }
+}
+
+struct UfsQcomOpp {
+    _table: opp::Table,
+    _config: opp::ConfigToken,
+}
+
+impl UfsQcomOpp {
+    fn new(dev: &device::Device<device::Bound>, max_rate: Hertz) -> Result<Self> {
+        let mut names = KVec::new();
+        for name in CLOCK_NAMES {
+            names.push(CString::try_from(name)?, GFP_KERNEL)?;
+        }
+
+        let config = opp::Config::<UfsQcomOppOps>::new()
+            .set_clk_names(names)?
+            .set(dev)?;
+        let dev_ref: ARef<device::Device> = dev.into();
+        let table = opp::Table::from_of(&dev_ref, 0)?;
+        let selected = table.opp_from_freq(
+            max_rate,
+            Some(true),
+            Some(0),
+            opp::SearchType::Exact,
+        )?;
+        table.set_opp(&selected)?;
+
+        Ok(Self {
+            _table: table,
+            _config: config,
+        })
+    }
+}
+
 register! {
     QCOM_SYS1CLK_1US(u32) @ 0xc0 { 31:0 value; }
     QCOM_PARAM0(u32) @ 0xd0 { 6:4 max_hs_gear; }
@@ -135,19 +194,15 @@ struct UfsQcomClocks {
 }
 
 impl UfsQcomClocks {
-    fn new(dev: &device::Device<device::Bound>, variant: UfsQcomVariant) -> Result<Self> {
-        let max_rate = variant.max_clock_rate()?;
+    fn new(dev: &device::Device<device::Bound>) -> Result<Self> {
         let mut this = Self {
             clocks: KVec::new(),
             control_enabled: 0,
             lanes_enabled: AtomicBool::new(false),
         };
 
-        for (index, name) in CLOCK_NAMES.into_iter().enumerate() {
+        for name in CLOCK_NAMES {
             let clock = Clk::get(dev, Some(name))?;
-            if matches!(index, CORE_CLOCK_INDEX | UNIPRO_CORE_CLOCK_INDEX) {
-                clock.set_rate(max_rate)?;
-            }
             this.clocks.push(clock, GFP_KERNEL)?;
         }
 
@@ -235,6 +290,7 @@ impl UfsQcomInterconnect {
 struct UfsQcomPlatform {
     has_mcq_resource: bool,
     clocks: UfsQcomClocks,
+    _opp: UfsQcomOpp,
     _interconnect: UfsQcomInterconnect,
     reset: OptionalExclusive,
     device_reset: OptionalOutput,
@@ -263,10 +319,12 @@ impl UfsQcomPlatform {
 
     fn new(dev: &device::Device<device::Bound>, variant: UfsQcomVariant) -> Result<Self> {
         Self::enable_supplies(dev)?;
+        let opp = UfsQcomOpp::new(dev, variant.max_clock_rate()?)?;
 
         Ok(Self {
             has_mcq_resource: variant.has_mcq_resource(),
-            clocks: UfsQcomClocks::new(dev, variant)?,
+            clocks: UfsQcomClocks::new(dev)?,
+            _opp: opp,
             _interconnect: UfsQcomInterconnect::new(dev)?,
             reset: OptionalExclusive::get(dev, c"rst")?,
             // Hold the attached device in reset until `device_reset()` runs.
