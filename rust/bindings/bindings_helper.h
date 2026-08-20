@@ -63,6 +63,7 @@
 #include <linux/firmware.h>
 #include <linux/fwctl.h>
 #include <linux/fs.h>
+#include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/interconnect.h>
 #include <linux/interrupt.h>
