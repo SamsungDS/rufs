@@ -87,6 +87,7 @@ pub mod init;
 pub mod interop;
 pub mod interrupt;
 pub mod io;
+pub mod interconnect;
 pub mod ioctl;
 pub mod iommu;
 pub mod iov;
