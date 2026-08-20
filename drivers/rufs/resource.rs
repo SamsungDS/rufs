@@ -25,10 +25,8 @@ pub(crate) enum HciMmio {
 ///
 /// Some platform controllers expose MCQ queue configuration and operation
 /// registers through a named resource rather than the standard HCI region.
-#[allow(dead_code)]
 pub(crate) struct McqMmio(Devres<IoMem<'static>>);
 
-#[allow(dead_code)]
 impl McqMmio {
     pub(crate) fn from_platform(mmio: Devres<IoMem<'static>>) -> Self {
         Self(mmio)

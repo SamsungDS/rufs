@@ -21,8 +21,11 @@ use kernel::{
 };
 
 use crate::host::UfsHost;
-use crate::reg::UfsReg;
-use crate::resource::{HciMmio, HostResources};
+use crate::reg::{
+    McqQueueConfigLayout, McqRegisterLayout, McqRegisterRegion,
+    UfsMcqOprInfo, UfsMcqOprSet, UfsReg,
+};
+use crate::resource::{HciMmio, HostResources, McqMmio};
 use crate::uic::{UfsPaLayerAttr, UfsUic};
 use crate::variant::{NotifyPhase, UfsVariantOps};
 
@@ -65,6 +68,10 @@ impl UfsQcomVariant {
             Self::Generic | Self::Sa8255p => Err(ENOTSUPP),
         }
     }
+
+    const fn has_mcq_resource(self) -> bool {
+        matches!(self, Self::Eliza)
+    }
 }
 
 const CLOCK_NAMES: [&CStr; 8] = [
@@ -84,6 +91,14 @@ const CONTROL_CLOCK_COUNT: usize = 5;
 
 const MAX_MEMORY_BANDWIDTH: u32 = 7_643_136;
 const MAX_CONFIG_BANDWIDTH: u32 = 819_200;
+
+const MCQ_CONFIG_BASE: usize = 0x1c000;
+const MCQ_QUEUE_CONFIG_STRIDE: usize = 0x40;
+const MCQ_SQD_OFFSET: usize = 0x5000;
+const MCQ_SQIS_OFFSET: usize = 0x5040;
+const MCQ_CQD_OFFSET: usize = 0x5080;
+const MCQ_CQIS_OFFSET: usize = 0x50c0;
+const MCQ_OPERATION_STRIDE: usize = 0x100;
 
 const MPHY_TX_FSM_STATE: u32 = 0x41;
 const TX_FSM_HIBERN8: u32 = 0x1;
@@ -218,6 +233,7 @@ impl UfsQcomInterconnect {
 }
 
 struct UfsQcomPlatform {
+    has_mcq_resource: bool,
     clocks: UfsQcomClocks,
     _interconnect: UfsQcomInterconnect,
     reset: OptionalExclusive,
@@ -249,6 +265,7 @@ impl UfsQcomPlatform {
         Self::enable_supplies(dev)?;
 
         Ok(Self {
+            has_mcq_resource: variant.has_mcq_resource(),
             clocks: UfsQcomClocks::new(dev, variant)?,
             _interconnect: UfsQcomInterconnect::new(dev)?,
             reset: OptionalExclusive::get(dev, c"rst")?,
@@ -390,10 +407,37 @@ impl UfsQcomPlatform {
 }
 
 impl UfsVariantOps for UfsQcomPlatform {
+    fn mcq_register_layout(&self, _reg: &UfsReg) -> Result<McqRegisterLayout> {
+        if !self.has_mcq_resource {
+            return Err(ENODEV);
+        }
+
+        let operation = |offset| {
+            UfsMcqOprInfo::new(
+                McqRegisterRegion::Mcq,
+                offset,
+                MCQ_CONFIG_BASE + offset,
+                MCQ_OPERATION_STRIDE,
+            )
+        };
+
+        Ok(McqRegisterLayout::new(
+            McqQueueConfigLayout::new(
+                McqRegisterRegion::Mcq,
+                0,
+                MCQ_QUEUE_CONFIG_STRIDE,
+            ),
+            UfsMcqOprSet::new(
+                operation(MCQ_SQD_OFFSET),
+                operation(MCQ_SQIS_OFFSET),
+                operation(MCQ_CQD_OFFSET),
+                operation(MCQ_CQIS_OFFSET),
+            ),
+        ))
+    }
+
     fn mcq_enabled(&self) -> bool {
-        // Qualcomm MCQ registers use a separate resource and topology. Keep
-        // SDB selected until that resource is mapped and described.
-        false
+        self.has_mcq_resource
     }
 
     fn device_reset(&self) -> Result<()> {
@@ -504,6 +548,14 @@ impl platform::Driver for UfsQcom {
         pin_init::pin_init_scope(move || {
             let variant = *variant.ok_or(ENODEV)?;
             let hci = HciMmio::from_platform(pdev)?;
+            let mcq = if variant.has_mcq_resource() {
+                let request = pdev.io_request_by_name(c"mcq").ok_or(ENODEV)?;
+                Some(McqMmio::from_platform(
+                    request.iomap()?.into_devres()?,
+                ))
+            } else {
+                None
+            };
             let platform = UfsQcomPlatform::new(pdev.as_ref(), variant)?;
 
             dev_info!(
@@ -515,7 +567,7 @@ impl platform::Driver for UfsQcom {
             let resources = HostResources::new(
                 pdev.as_ref().into(),
                 hci,
-                None,
+                mcq,
                 KBox::new(platform, GFP_KERNEL)? as KBox<dyn UfsVariantOps>,
             )?;
             let controller_irq = pdev.irq_by_index(0)?;
