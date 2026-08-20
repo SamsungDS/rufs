@@ -25,6 +25,11 @@ pub(crate) trait UfsVariantOps: Send + Sync {
         reg.standard_mcq_register_layout()
     }
 
+    /// Reset the attached UFS device before enabling the controller.
+    fn device_reset(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn hce_enable_notify(&self, _reg: &UfsReg, _phase: NotifyPhase) -> Result<()> {
         Ok(())
     }

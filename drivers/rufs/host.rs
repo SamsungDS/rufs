@@ -109,6 +109,7 @@ impl UfsHost {
                 stop_hba_controller(&reg);
             }
 
+            resources.variant().device_reset()?;
             resources
                 .variant()
                 .hce_enable_notify(&reg, NotifyPhase::Pre)?;
