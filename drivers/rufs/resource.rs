@@ -8,7 +8,7 @@ use kernel::devres::Devres;
 use kernel::io::mem::IoMem;
 use kernel::io::{IoBase, Mmio, MmioBackend, Region};
 use kernel::sync::{aref::ARef, Arc};
-use kernel::{c_str, pci, prelude::*};
+use kernel::{c_str, pci, platform, prelude::*};
 
 use crate::variant::UfsVariantOps;
 
@@ -18,7 +18,6 @@ type PciHciMmio = pci::Bar<'static, HCI_MMIO_SIZE>;
 
 pub(crate) enum HciMmio {
     Pci(Devres<PciHciMmio>),
-    #[allow(dead_code)]
     Platform(Devres<IoMem<'static, HCI_MMIO_SIZE>>),
 }
 
@@ -48,6 +47,14 @@ impl HciMmio {
         Ok(Self::Pci(
             pdev.iomap_region_sized::<HCI_MMIO_SIZE>(0, c_str!("rufs_pci"))?
                 .into_devres()?,
+        ))
+    }
+
+    pub(crate) fn from_platform(pdev: &platform::Device<Bound>) -> Result<Self> {
+        let request = pdev.io_request_by_index(0).ok_or(ENODEV)?;
+
+        Ok(Self::Platform(
+            request.iomap_sized::<HCI_MMIO_SIZE>()?.into_devres()?,
         ))
     }
 
