@@ -64,6 +64,7 @@
 #include "err.c"
 #include "irq.c"
 #include "fs.c"
+#include "gpio.c"
 #include "gpu.c"
 #include "interconnect.c"
 #include "interrupt.c"
