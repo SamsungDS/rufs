@@ -12,6 +12,7 @@ use kernel::{
     interconnect::Path,
     io::{poll::read_poll_timeout, register, Io},
     macros::vtable,
+    new_mutex,
     of,
     opp,
     phy::{Phy, UfsMode},
@@ -20,7 +21,7 @@ use kernel::{
     regulator,
     reset::OptionalExclusive,
     str::CString,
-    sync::aref::ARef,
+    sync::{aref::ARef, Arc, Mutex},
     time::{delay::fsleep, Delta},
 };
 
@@ -37,27 +38,23 @@ pub(crate) struct UfsQcom;
 
 #[derive(Clone, Copy)]
 pub(crate) enum UfsQcomVariant {
-    Generic,
     Eliza,
     Kaanapali,
     Sm8550,
     Sm8650,
     Sm8750,
     X1e80100,
-    Sa8255p,
 }
 
 impl UfsQcomVariant {
     const fn name(self) -> &'static str {
         match self {
-            Self::Generic => "generic",
             Self::Eliza => "eliza",
             Self::Kaanapali => "kaanapali",
             Self::Sm8550 => "sm8550",
             Self::Sm8650 => "sm8650",
             Self::Sm8750 => "sm8750",
             Self::X1e80100 => "x1e80100",
-            Self::Sa8255p => "sa8255p",
         }
     }
 
@@ -67,9 +64,6 @@ impl UfsQcomVariant {
             Self::Eliza | Self::Kaanapali | Self::Sm8650 | Self::Sm8750 => {
                 Ok(Hertz::from_mhz(403))
             }
-            // Generic compatibles span several incompatible clock layouts.
-            // SA8255P uses a firmware-managed lifecycle.
-            Self::Generic | Self::Sa8255p => Err(ENOTSUPP),
         }
     }
 
@@ -298,6 +292,7 @@ impl UfsQcomInterconnect {
 
 struct UfsQcomPlatform {
     has_mcq_resource: bool,
+    lifecycle: Arc<Mutex<()>>,
     clocks: UfsQcomClocks,
     _opp: UfsQcomOpp,
     _interconnect: UfsQcomInterconnect,
@@ -332,6 +327,7 @@ impl UfsQcomPlatform {
 
         Ok(Self {
             has_mcq_resource: variant.has_mcq_resource(),
+            lifecycle: Arc::pin_init(new_mutex!(()), GFP_KERNEL)?,
             clocks: UfsQcomClocks::new(dev)?,
             _opp: opp,
             _interconnect: UfsQcomInterconnect::new(dev)?,
@@ -386,6 +382,8 @@ impl UfsQcomPlatform {
     }
 
     fn power_up(&self, reg: &UfsReg) -> Result {
+        let _lifecycle = self.lifecycle.lock();
+
         self.clocks.disable_lanes();
         self.phy.shutdown();
 
@@ -605,6 +603,8 @@ impl UfsVariantOps for UfsQcomPlatform {
     }
 
     fn shutdown(&self, _reg: &UfsReg) {
+        let _lifecycle = self.lifecycle.lock();
+
         self.clocks.disable_lanes();
         self.phy.shutdown();
     }
@@ -639,11 +639,6 @@ kernel::of_device_table!(
             of::DeviceId::new(c"qcom,sm8750-ufshc"),
             UfsQcomVariant::Sm8750,
         ),
-        (
-            of::DeviceId::new(c"qcom,sa8255p-ufshc"),
-            UfsQcomVariant::Sa8255p,
-        ),
-        (of::DeviceId::new(c"qcom,ufshc"), UfsQcomVariant::Generic,),
     ]
 );
 
