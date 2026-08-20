@@ -16,10 +16,14 @@ pub struct OptionalOutput {
 }
 
 impl OptionalOutput {
-    /// Obtain an optional output GPIO by connection name.
-    pub fn get(dev: &Device<Bound>, name: &CStr) -> Result<Self> {
+    /// Obtain an optional output GPIO with an initial logical value.
+    pub fn get(dev: &Device<Bound>, name: &CStr, initial: bool) -> Result<Self> {
         let ptr = from_err_ptr(unsafe {
-            bindings::devm_gpiod_get_optional_output_low(dev.as_raw(), name.as_char_ptr())
+            bindings::devm_gpiod_get_optional_output(
+                dev.as_raw(),
+                name.as_char_ptr(),
+                initial,
+            )
         })?;
 
         Ok(Self { ptr })
