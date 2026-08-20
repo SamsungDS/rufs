@@ -86,6 +86,7 @@ pub mod id_pool;
 #[doc(hidden)]
 pub mod impl_flags;
 pub mod init;
+pub mod interconnect;
 pub mod interop;
 pub mod interrupt;
 pub mod io;
