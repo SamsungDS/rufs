@@ -3,7 +3,7 @@
 //! Host-controller variant operations.
 
 use crate::reg::{McqRegisterLayout, UfsReg};
-use crate::uic::UfsPaLayerAttr;
+use crate::uic::{UfsPaLayerAttr, UfsUic};
 use kernel::prelude::*;
 
 #[derive(Clone, Copy)]
@@ -29,7 +29,7 @@ pub(crate) trait UfsVariantOps: Send + Sync {
         Ok(())
     }
 
-    fn link_startup_notify(&self, _reg: &UfsReg, _phase: NotifyPhase) -> Result<()> {
+    fn link_startup_notify(&self, _reg: &UfsReg, _uic: &UfsUic, _phase: NotifyPhase) -> Result<()> {
         Ok(())
     }
 

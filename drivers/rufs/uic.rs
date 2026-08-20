@@ -239,10 +239,14 @@ impl UfsUic {
         self.dme_set(PA_PWRMODE, pwr_mode.pwrmode_value())
     }
 
-    fn dme_get(&self, attr: u32) -> Result<u32> {
+    pub(crate) fn dme_get(&self, attr: u32) -> Result<u32> {
+        self.dme_get_sel(attr, 0)
+    }
+
+    pub(crate) fn dme_get_sel(&self, attr: u32, selector: u32) -> Result<u32> {
         self.send_uic_cmd(UfsUicCmd {
             command: UicCmdDme::Get,
-            argument1: uic_arg_mib(attr),
+            argument1: uic_arg_mib_sel(attr, selector),
             argument2: 0,
             argument3: 0,
             expected_completion: UicCompletion::Command,
@@ -259,7 +263,7 @@ impl UfsUic {
         })
     }
 
-    fn dme_set(&self, attr: u32, value: u32) -> Result<()> {
+    pub(crate) fn dme_set(&self, attr: u32, value: u32) -> Result<()> {
         self.send_uic_cmd(UfsUicCmd {
             command: UicCmdDme::Set,
             argument1: uic_arg_mib(attr),
@@ -412,7 +416,11 @@ const DME_LOCAL_TC0_REPLAY_TIMEOUT_VAL: u32 = 0xD042;
 const DME_LOCAL_AFC0_REQ_TIMEOUT_VAL: u32 = 0xD043;
 
 const fn uic_arg_mib(attr: u32) -> u32 {
-    (attr & 0xFFFF) << 16
+    uic_arg_mib_sel(attr, 0)
+}
+
+const fn uic_arg_mib_sel(attr: u32, selector: u32) -> u32 {
+    ((attr & 0xFFFF) << 16) | (selector & 0xFFFF)
 }
 
 const fn uic_arg_attr_type(attr_type: u32) -> u32 {

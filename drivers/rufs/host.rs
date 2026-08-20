@@ -128,11 +128,11 @@ impl UfsHost {
             )?;
             resources
                 .variant()
-                .link_startup_notify(&reg, NotifyPhase::Pre)?;
+                .link_startup_notify(&reg, &uic, NotifyPhase::Pre)?;
             uic.link_startup()?;
             resources
                 .variant()
-                .link_startup_notify(&reg, NotifyPhase::Post)?;
+                .link_startup_notify(&reg, &uic, NotifyPhase::Post)?;
             dma.make_hba_operational()?;
 
             let ufs_queue = UfsQueue::new(transfer_config, reg.clone(), dma.clone())?;
