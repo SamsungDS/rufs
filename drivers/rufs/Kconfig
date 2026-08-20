@@ -18,11 +18,15 @@ config RUFS_PCI
 config RUFS_QCOM
 	bool "Qualcomm platform frontend"
 	depends on OF
+	depends on COMMON_CLK
+	depends on GENERIC_PHY
+	depends on GPIOLIB
+	depends on INTERCONNECT
+	depends on RESET_CONTROLLER
 	depends on ARCH_QCOM || COMPILE_TEST
 	help
-	  Build the Qualcomm platform frontend skeleton.
-
-	  The Qualcomm hardware initialization sequence is not implemented yet,
-	  so this frontend does not currently bind to hardware.
+	  Build the Qualcomm platform frontend. The frontend maps the UFSHCI
+	  resource and configures the clocks, PHY, reset and interconnect paths
+	  needed by supported Qualcomm UFS controllers.
 
 endif

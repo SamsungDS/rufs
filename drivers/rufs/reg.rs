@@ -387,6 +387,10 @@ impl UfsReg {
         Ok(Arc::new(Self { resources }, GFP_KERNEL)?)
     }
 
+    pub(crate) fn hci_access(&self) -> Result<crate::resource::HciMmioAccess<'_>> {
+        self.resources.hci_access()
+    }
+
     #[inline(always)]
     fn dma_addr_lo(dma_addr: u64) -> u32 {
         dma_addr as u32
