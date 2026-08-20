@@ -31,8 +31,11 @@ pub(crate) struct UfsQcom;
 #[derive(Clone, Copy)]
 pub(crate) enum UfsQcomVariant {
     Generic,
+    Eliza,
+    Kaanapali,
     Sm8550,
     Sm8650,
+    Sm8750,
     X1e80100,
     Sa8255p,
 }
@@ -41,8 +44,11 @@ impl UfsQcomVariant {
     const fn name(self) -> &'static str {
         match self {
             Self::Generic => "generic",
+            Self::Eliza => "eliza",
+            Self::Kaanapali => "kaanapali",
             Self::Sm8550 => "sm8550",
             Self::Sm8650 => "sm8650",
+            Self::Sm8750 => "sm8750",
             Self::X1e80100 => "x1e80100",
             Self::Sa8255p => "sa8255p",
         }
@@ -51,7 +57,9 @@ impl UfsQcomVariant {
     fn max_clock_rate(self) -> Result<Hertz> {
         match self {
             Self::Sm8550 | Self::X1e80100 => Ok(Hertz::from_mhz(300)),
-            Self::Sm8650 => Ok(Hertz::from_mhz(403)),
+            Self::Eliza | Self::Kaanapali | Self::Sm8650 | Self::Sm8750 => {
+                Ok(Hertz::from_mhz(403))
+            }
             // Generic compatibles span several incompatible clock layouts.
             // SA8255P uses a firmware-managed lifecycle.
             Self::Generic | Self::Sa8255p => Err(ENOTSUPP),
@@ -445,6 +453,14 @@ kernel::of_device_table!(
     <UfsQcom as platform::Driver>::IdInfo,
     [
         (
+            of::DeviceId::new(c"qcom,eliza-ufshc"),
+            UfsQcomVariant::Eliza,
+        ),
+        (
+            of::DeviceId::new(c"qcom,kaanapali-ufshc"),
+            UfsQcomVariant::Kaanapali,
+        ),
+        (
             of::DeviceId::new(c"qcom,x1e80100-ufshc"),
             UfsQcomVariant::X1e80100,
         ),
@@ -455,6 +471,10 @@ kernel::of_device_table!(
         (
             of::DeviceId::new(c"qcom,sm8650-ufshc"),
             UfsQcomVariant::Sm8650,
+        ),
+        (
+            of::DeviceId::new(c"qcom,sm8750-ufshc"),
+            UfsQcomVariant::Sm8750,
         ),
         (
             of::DeviceId::new(c"qcom,sa8255p-ufshc"),
