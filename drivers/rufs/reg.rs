@@ -1244,10 +1244,14 @@ impl UfsReg {
     }
 
     #[inline]
-    pub(crate) fn mcq_supported(&self) -> bool {
+    pub(crate) fn mcq_hardware_supported(&self) -> bool {
         let access = self.resources.hci_access().unwrap();
         access.read(CONTROLLER_CAPABILITIES).mcq_supported()
-            && self.resources.variant().mcq_enabled()
+    }
+
+    #[inline]
+    pub(crate) fn mcq_variant_enabled(&self) -> bool {
+        self.resources.variant().mcq_enabled()
     }
 
     #[inline]

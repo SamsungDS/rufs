@@ -53,7 +53,15 @@ pub(crate) enum UfsTransferConfig {
 
 impl UfsTransferConfig {
     pub(crate) fn new(reg: &UfsReg) -> Result<Self> {
-        if !reg.mcq_supported() {
+        let hardware_mcq = reg.mcq_hardware_supported();
+        let variant_mcq = reg.mcq_variant_enabled();
+
+        if !hardware_mcq || !variant_mcq {
+            pr_info!(
+                "[RUFS] ufs_queue: SDB selected CAP.MCQ={} variant.MCQ={}\n",
+                hardware_mcq,
+                variant_mcq,
+            );
             let tag_count = reg.nutrs();
             if tag_count == 0 || tag_count > u32::BITS as usize {
                 return Err(EINVAL);
