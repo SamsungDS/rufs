@@ -112,6 +112,7 @@ pub mod owned;
 pub mod page;
 #[cfg(CONFIG_PCI)]
 pub mod pci;
+pub mod phy;
 pub mod pid_namespace;
 pub mod platform;
 pub mod prelude;
@@ -122,6 +123,7 @@ pub mod ptr;
 pub mod pwm;
 pub mod rbtree;
 pub mod regulator;
+pub mod reset;
 pub mod revocable;
 pub mod safety;
 pub mod scatterlist;
