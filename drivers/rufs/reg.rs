@@ -1255,6 +1255,13 @@ impl UfsReg {
     }
 
     #[inline]
+    pub(crate) fn constrain_mcq_active_commands(&self, reported: usize) -> usize {
+        self.resources
+            .variant()
+            .constrain_mcq_active_commands(reported)
+    }
+
+    #[inline]
     pub(crate) fn nutrs_mcq(&self) -> usize {
         let access = self.resources.hci_access().unwrap();
         access

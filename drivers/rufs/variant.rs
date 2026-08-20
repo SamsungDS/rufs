@@ -30,6 +30,11 @@ pub(crate) trait UfsVariantOps: Send + Sync {
         true
     }
 
+    /// Restrict the number of active MCQ commands for this variant.
+    fn constrain_mcq_active_commands(&self, reported: usize) -> usize {
+        reported
+    }
+
     /// Reset the attached UFS device before enabling the controller.
     fn device_reset(&self) -> Result<()> {
         Ok(())

@@ -80,7 +80,10 @@ impl UfsTransferConfig {
         let default_queues = core::cmp::min(max_queues - reserved_queues, possible_cpus());
         let interrupt_queues = default_queues.checked_add(read_queues).ok_or(EOVERFLOW)?;
         let total_queues = interrupt_queues.checked_add(poll_queues).ok_or(EOVERFLOW)?;
-        let max_active_commands = core::cmp::min(reg.nutrs_mcq(), TASK_TAG_COUNT);
+        let max_active_commands = reg.constrain_mcq_active_commands(core::cmp::min(
+            reg.nutrs_mcq(),
+            TASK_TAG_COUNT,
+        ));
         let task_tag_count = TASK_TAG_COUNT;
         let software_queue_depth = UFS_SOFTWARE_QUEUE_DEPTH;
         let ring_entries = max_active_commands.checked_add(1).ok_or(EOVERFLOW)?;

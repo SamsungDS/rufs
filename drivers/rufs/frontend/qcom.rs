@@ -97,6 +97,7 @@ const MCQ_SQIS_OFFSET: usize = 0x5040;
 const MCQ_CQD_OFFSET: usize = 0x5080;
 const MCQ_CQIS_OFFSET: usize = 0x50c0;
 const MCQ_OPERATION_STRIDE: usize = 0x100;
+const QCOM_MAX_MCQ_ACTIVE_COMMANDS: usize = 64;
 
 const MPHY_TX_FSM_STATE: u32 = 0x41;
 const TX_FSM_HIBERN8: u32 = 0x1;
@@ -540,6 +541,10 @@ impl UfsVariantOps for UfsQcomPlatform {
 
     fn mcq_enabled(&self) -> bool {
         self.has_mcq_resource
+    }
+
+    fn constrain_mcq_active_commands(&self, reported: usize) -> usize {
+        core::cmp::min(reported, QCOM_MAX_MCQ_ACTIVE_COMMANDS)
     }
 
     fn device_reset(&self) -> Result<()> {
