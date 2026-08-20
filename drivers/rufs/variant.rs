@@ -50,6 +50,7 @@ pub(crate) trait UfsVariantOps: Send + Sync {
     fn power_mode_notify(
         &self,
         _reg: &UfsReg,
+        _uic: &UfsUic,
         _mode: UfsPaLayerAttr,
         _phase: NotifyPhase,
     ) -> Result<()> {

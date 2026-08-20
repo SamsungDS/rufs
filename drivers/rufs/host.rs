@@ -179,9 +179,9 @@ impl UfsHost {
         let variant = self.resources.variant();
         let mode = variant.constrain_power_mode(self.uic.max_power_mode()?)?;
 
-        variant.power_mode_notify(&self.reg, mode, NotifyPhase::Pre)?;
+        variant.power_mode_notify(&self.reg, &self.uic, mode, NotifyPhase::Pre)?;
         self.uic.change_power_mode(mode)?;
-        variant.power_mode_notify(&self.reg, mode, NotifyPhase::Post)
+        variant.power_mode_notify(&self.reg, &self.uic, mode, NotifyPhase::Post)
     }
 
     fn alloc_luns(&self) -> Result<()> {

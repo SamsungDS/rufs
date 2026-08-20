@@ -107,11 +107,20 @@ const MCQ_OPERATION_STRIDE: usize = 0x100;
 const MPHY_TX_FSM_STATE: u32 = 0x41;
 const TX_FSM_HIBERN8: u32 = 0x1;
 const PA_LOCAL_TX_LCC_ENABLE: u32 = 0x155e;
+const PA_TXHSADAPTTYPE: u32 = 0x15d4;
+const PA_INITIAL_ADAPT: u32 = 0x1;
+const PA_NO_ADAPT: u32 = 0x3;
+const UFS_HS_G4: u32 = 4;
+const PA_VS_CLK_CFG: u32 = 0x9004;
+const PA_VS_CLK_CFG_MASK: u32 = 0x1ff;
+const DL_VS_CLK_CFG: u32 = 0xa00b;
+const DL_VS_CLK_CFG_MASK: u32 = 0x3ff;
 const PA_VS_CORE_CLK_40NS_CYCLES: u32 = 0x9007;
 const DME_VS_CORE_CLK_CTRL: u32 = 0xd002;
 
 const PA_HS_MODE_A: u32 = 1;
 const CORE_CLK_DIV_EN: u32 = 1 << 8;
+const DME_HW_CGC_EN: u32 = 1 << 9;
 const CORE_CLK_CYCLES_MASK: u32 = 0xff;
 const CORE_CLK_CYCLES_MASK_V4: u32 = 0x0fff << 16;
 const CORE_CLK_40NS_CYCLES_MASK: u32 = 0x7f;
@@ -453,6 +462,7 @@ impl UfsQcomPlatform {
 
     fn configure_link_startup(&self, reg: &UfsReg, uic: &UfsUic) -> Result {
         self.check_hibern8(uic)?;
+        self.enable_unipro_clock_gating(uic);
 
         let core_cycles = self.clocks.cycles_per_microsecond(CORE_CLOCK_INDEX);
         reg.hci_access()?
@@ -461,6 +471,42 @@ impl UfsQcomPlatform {
 
         self.set_unipro_clock_cycles(uic, self.hardware_major(reg)?)?;
         uic.dme_set(PA_LOCAL_TX_LCC_ENABLE, 0)
+    }
+
+    fn dme_set_bits(&self, uic: &UfsUic, attr: u32, mask: u32) -> Result {
+        let value = uic.dme_get(attr)?;
+        uic.dme_set(attr, value | mask)
+    }
+
+    fn enable_unipro_clock_gating(&self, uic: &UfsUic) {
+        for (attr, mask) in [
+            (DL_VS_CLK_CFG, DL_VS_CLK_CFG_MASK),
+            (PA_VS_CLK_CFG, PA_VS_CLK_CFG_MASK),
+            (DME_VS_CORE_CLK_CTRL, DME_HW_CGC_EN),
+        ] {
+            if let Err(e) = self.dme_set_bits(uic, attr, mask) {
+                pr_warn!(
+                    "[RUFS] Qualcomm: failed to enable clock gating attr={:#x} errno={}\n",
+                    attr,
+                    e.to_errno(),
+                );
+                break;
+            }
+        }
+    }
+
+    fn configure_adaptation(&self, uic: &UfsUic, gear: u32) {
+        let adapt = if gear >= UFS_HS_G4 {
+            PA_INITIAL_ADAPT
+        } else {
+            PA_NO_ADAPT
+        };
+        if let Err(e) = uic.dme_set(PA_TXHSADAPTTYPE, adapt) {
+            pr_warn!(
+                "[RUFS] Qualcomm: failed to configure PA adaptation errno={}\n",
+                e.to_errno(),
+            );
+        }
     }
 }
 
@@ -541,6 +587,21 @@ impl UfsVariantOps for UfsQcomPlatform {
             desired.hs_rate = PA_HS_MODE_A;
         }
         Ok(desired)
+    }
+
+    fn power_mode_notify(
+        &self,
+        _reg: &UfsReg,
+        uic: &UfsUic,
+        mode: UfsPaLayerAttr,
+        phase: NotifyPhase,
+    ) -> Result<()> {
+        if matches!(phase, NotifyPhase::Pre)
+            && self.hardware_major.load(Ordering::Acquire) >= 4
+        {
+            self.configure_adaptation(uic, mode.gear_tx);
+        }
+        Ok(())
     }
 
     fn shutdown(&self, _reg: &UfsReg) {
