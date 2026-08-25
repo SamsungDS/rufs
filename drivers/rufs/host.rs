@@ -23,6 +23,7 @@ use crate::uic::*;
 use crate::variant::NotifyPhase;
 
 const HBA_ENABLE_DELAY_US: i64 = 1000;
+const LINK_STARTUP_RETRIES: usize = 3;
 const SHUTDOWN_DRAIN_INTERVAL_MS: i64 = 1;
 const SHUTDOWN_DRAIN_TIMEOUT_SECS: i64 = 30;
 
@@ -41,6 +42,30 @@ fn stop_hba_controller(reg: &UfsReg) {
             e.to_errno()
         );
     }
+}
+
+fn enable_hba_controller(resources: &HostResources, reg: &UfsReg) -> Result {
+    resources.variant().device_reset()?;
+    resources
+        .variant()
+        .hce_enable_notify(reg, NotifyPhase::Pre)?;
+    reg.ctrl_enable();
+    fsleep(Delta::from_micros(HBA_ENABLE_DELAY_US));
+    reg.wait_for_ctrl_enable(1000, 50)?;
+    resources
+        .variant()
+        .hce_enable_notify(reg, NotifyPhase::Post)
+}
+
+fn start_link(resources: &HostResources, reg: &UfsReg, uic: &Arc<UfsUic>) -> Result<bool> {
+    resources
+        .variant()
+        .link_startup_notify(reg, uic, NotifyPhase::Pre)?;
+    uic.link_startup()?;
+    resources
+        .variant()
+        .link_startup_notify(reg, uic, NotifyPhase::Post)?;
+    resources.variant().link_startup_valid(uic)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,16 +134,7 @@ impl UfsHost {
                 stop_hba_controller(&reg);
             }
 
-            resources.variant().device_reset()?;
-            resources
-                .variant()
-                .hce_enable_notify(&reg, NotifyPhase::Pre)?;
-            reg.ctrl_enable();
-            fsleep(Delta::from_micros(HBA_ENABLE_DELAY_US));
-            reg.wait_for_ctrl_enable(1000, 50)?;
-            resources
-                .variant()
-                .hce_enable_notify(&reg, NotifyPhase::Post)?;
+            enable_hba_controller(&resources, &reg)?;
 
             /* ufshcd_link_startup() */
             irq.request_controller_irq(
@@ -127,13 +143,22 @@ impl UfsHost {
                 uic.clone(),
                 interrupt_policy,
             )?;
-            resources
-                .variant()
-                .link_startup_notify(&reg, &uic, NotifyPhase::Pre)?;
-            uic.link_startup()?;
-            resources
-                .variant()
-                .link_startup_notify(&reg, &uic, NotifyPhase::Post)?;
+            let mut retries = LINK_STARTUP_RETRIES;
+            loop {
+                match start_link(&resources, &reg, &uic)? {
+                    true => break,
+                    false if retries > 0 => {
+                        pr_warn!(
+                            "[RUFS] ufs_host: retry degraded link, retries_left={}\n",
+                            retries,
+                        );
+                        retries -= 1;
+                        stop_hba_controller(&reg);
+                        enable_hba_controller(&resources, &reg)?;
+                    }
+                    false => return Err(EIO),
+                }
+            }
             dma.make_hba_operational()?;
 
             let ufs_queue = UfsQueue::new(

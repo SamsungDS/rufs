@@ -48,6 +48,11 @@ pub(crate) trait UfsVariantOps: Send + Sync {
         Ok(())
     }
 
+    /// Return whether link startup negotiated a usable link.
+    fn link_startup_valid(&self, _uic: &UfsUic) -> Result<bool> {
+        Ok(true)
+    }
+
     fn constrain_power_mode(&self, desired: UfsPaLayerAttr) -> Result<UfsPaLayerAttr> {
         Ok(desired)
     }

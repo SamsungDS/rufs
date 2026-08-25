@@ -293,6 +293,7 @@ impl UfsQcomInterconnect {
 
 struct UfsQcomPlatform {
     has_mcq_resource: bool,
+    expected_lanes: u32,
     // Serialize PHY transitions and retain OPP resources until shutdown.
     lifecycle: Arc<Mutex<Option<UfsQcomOpp>>>,
     clocks: UfsQcomClocks,
@@ -325,9 +326,17 @@ impl UfsQcomPlatform {
     fn new(dev: &device::Device<device::Bound>, variant: UfsQcomVariant) -> Result<Self> {
         Self::enable_supplies(dev)?;
         let opp = UfsQcomOpp::new(dev, variant.max_clock_rate()?)?;
+        let expected_lanes = dev
+            .fwnode()
+            .map(|fwnode| fwnode.property_read::<u32>(c"lanes-per-direction").or(2))
+            .unwrap_or(2);
+        if expected_lanes == 0 || expected_lanes > 2 {
+            return Err(EINVAL);
+        }
 
         Ok(Self {
             has_mcq_resource: variant.has_mcq_resource(),
+            expected_lanes,
             lifecycle: Arc::pin_init(new_mutex!(Some(opp)), GFP_KERNEL)?,
             clocks: UfsQcomClocks::new(dev)?,
             _interconnect: UfsQcomInterconnect::new(dev)?,
@@ -506,6 +515,21 @@ impl UfsQcomPlatform {
             );
         }
     }
+
+    fn connected_lanes_valid(&self, uic: &UfsUic) -> Result<bool> {
+        let (rx_lanes, tx_lanes) = uic.connected_lanes()?;
+        if rx_lanes == self.expected_lanes && tx_lanes == self.expected_lanes {
+            return Ok(true);
+        }
+
+        pr_err!(
+            "[RUFS] Qualcomm: connected lane mismatch expected={} rx={} tx={}\n",
+            self.expected_lanes,
+            rx_lanes,
+            tx_lanes,
+        );
+        Ok(false)
+    }
 }
 
 impl UfsVariantOps for UfsQcomPlatform {
@@ -575,6 +599,10 @@ impl UfsVariantOps for UfsQcomPlatform {
             NotifyPhase::Pre => self.configure_link_startup(reg, uic),
             NotifyPhase::Post => Ok(()),
         }
+    }
+
+    fn link_startup_valid(&self, uic: &UfsUic) -> Result<bool> {
+        self.connected_lanes_valid(uic)
     }
 
     fn constrain_power_mode(&self, mut desired: UfsPaLayerAttr) -> Result<UfsPaLayerAttr> {

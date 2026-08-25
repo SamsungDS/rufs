@@ -148,8 +148,7 @@ impl UfsUic {
     }
 
     pub(crate) fn max_power_mode(&self) -> Result<UfsPaLayerAttr> {
-        let lane_rx = self.dme_get(PA_CONNECTEDRXDATALANES)?;
-        let lane_tx = self.dme_get(PA_CONNECTEDTXDATALANES)?;
+        let (lane_rx, lane_tx) = self.connected_lanes()?;
         if lane_rx == 0 || lane_tx == 0 || lane_rx != lane_tx {
             pr_err!(
                 "[RUFS] ufs_uic: invalid connected lanes rx={} tx={}\n",
@@ -190,6 +189,13 @@ impl UfsUic {
             pwr_tx,
             hs_rate: PA_HS_MODE_B,
         })
+    }
+
+    pub(crate) fn connected_lanes(&self) -> Result<(u32, u32)> {
+        Ok((
+            self.dme_get(PA_CONNECTEDRXDATALANES)?,
+            self.dme_get(PA_CONNECTEDTXDATALANES)?,
+        ))
     }
 
     pub(crate) fn change_power_mode(&self, pwr_mode: UfsPaLayerAttr) -> Result<()> {
