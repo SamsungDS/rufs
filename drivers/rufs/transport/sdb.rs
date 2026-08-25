@@ -139,6 +139,11 @@ impl UfsTransferOps for SdbTransferBackend {
         )
     }
 
+    fn reset(&self) -> Result<()> {
+        *self.state.completion.lock() = SdbCompletionState::default();
+        Ok(())
+    }
+
     fn dump_state(&self, tag: usize, reason: &str) {
         let state = self.state.completion.lock();
 

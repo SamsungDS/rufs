@@ -136,7 +136,13 @@ impl UfsHost {
                 .link_startup_notify(&reg, &uic, NotifyPhase::Post)?;
             dma.make_hba_operational()?;
 
-            let ufs_queue = UfsQueue::new(transfer_config, reg.clone(), dma.clone())?;
+            let ufs_queue = UfsQueue::new(
+                transfer_config,
+                resources.clone(),
+                reg.clone(),
+                dma.clone(),
+                uic.clone(),
+            )?;
             let dev = UfsDev::new(ufs_queue.clone())?;
             let host = try_pin_init!(Self {
                 resources,

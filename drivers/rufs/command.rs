@@ -99,6 +99,14 @@ impl CommandPool {
         }
     }
 
+    pub(crate) fn recovery_owner(&self, task_tag: TaskTag) -> Result<Option<CommandOwner>> {
+        match self.slots.get(task_tag.index()).ok_or(EINVAL)? {
+            CommandSlotState::Free => Ok(None),
+            CommandSlotState::Reserved => Err(EBUSY),
+            CommandSlotState::Bound(owner) => Ok(Some(*owner)),
+        }
+    }
+
     pub(crate) fn release(&mut self, task_tag: TaskTag) -> Result<()> {
         let slot = self
             .slots

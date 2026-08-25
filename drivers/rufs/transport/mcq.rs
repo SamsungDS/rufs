@@ -614,4 +614,8 @@ impl UfsTransferOps for McqTransferBackend {
     fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()> {
         McqTransferBackend::collect_completions(self, completed)
     }
+
+    fn reset(&self) -> Result<()> {
+        self.activate()
+    }
 }

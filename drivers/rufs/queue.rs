@@ -1,20 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0
 
-use crate::command::{CommandOwner, CommandPool, TaskTag};
+use crate::command::{CommandOwner, CommandPool, TaskTag, TASK_TAG_COUNT};
 use crate::dma::*;
 use crate::lu::{QueueData, TagSetData, UfsLuBlockOps, UfsRequestData};
 use crate::protocol::scsi::*;
 use crate::protocol::{query::UfsDevCmd, UfsCmd};
 use crate::reg::*;
+use crate::resource::HostResources;
 use crate::transport::*;
+use crate::uic::UfsUic;
+use crate::variant::{NotifyPhase, UfsVariantOps};
 use kernel::alloc::mempool::MemPool;
 use kernel::block::mq;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;
 use kernel::block::mq::TagSet;
 use kernel::sync::{aref::ARef, Arc, SpinLock};
+use kernel::time::{delay::fsleep, Delta};
 use kernel::types::OwnableRefCounted;
 use kernel::workqueue::{self, impl_has_work, new_work, Work, WorkItem};
 use kernel::{bindings, new_spinlock, prelude::*};
+
+const HBA_ENABLE_DELAY_US: i64 = 1000;
 
 fn retryable_check_condition(sense: Option<&ScsiSense>) -> bool {
     matches!(sense, Some(sense) if sense.is_unit_attention())
@@ -433,6 +439,32 @@ impl UfsRequestInner {
     pub(crate) fn reset(&mut self) {
         self.state = UfsRequestState::Idle;
     }
+
+    fn prepare_recovery_disposition(&mut self, requeue: bool) -> Result<()> {
+        let state = core::mem::replace(&mut self.state, UfsRequestState::Idle);
+        match state {
+            UfsRequestState::InFlight {
+                cmd,
+                prdt,
+                queue_id: _,
+            }
+            | UfsRequestState::Recovering {
+                cmd,
+                prdt,
+                queue_id: _,
+            } => {
+                drop(prdt);
+                if requeue && matches!(cmd, UfsCmd::Device(_)) {
+                    self.state = UfsRequestState::Prepared { cmd, prdt: None };
+                }
+                Ok(())
+            }
+            state => {
+                self.state = state;
+                Err(EIO)
+            }
+        }
+    }
 }
 
 struct ResolvedCompletion {
@@ -699,7 +731,10 @@ impl UfsRequestData {
 #[pin_data]
 pub(crate) struct UfsQueue {
     pub(crate) tags: Arc<TagSet<UfsLuBlockOps>>,
+    resources: Arc<HostResources>,
+    reg: Arc<UfsReg>,
     dma: Arc<UfsDma>,
+    uic: Arc<UfsUic>,
     backend: UfsTransferBackend,
     #[pin]
     recovery: SpinLock<RecoveryState>,
@@ -716,10 +751,12 @@ impl_has_work! {
 impl UfsQueue {
     pub(crate) fn new(
         config: UfsTransferConfig,
+        resources: Arc<HostResources>,
         reg: Arc<UfsReg>,
         dma: Arc<UfsDma>,
+        uic: Arc<UfsUic>,
     ) -> Result<Arc<Self>> {
-        let backend = UfsTransferBackend::new(config, reg, dma.clone())?;
+        let backend = UfsTransferBackend::new(config, reg.clone(), dma.clone())?;
         let hw_queues = backend.hw_queues()?;
         let queue_map = config.queue_map()?;
         let nr_hw_queues = queue_map.nr_hw_queues();
@@ -763,7 +800,10 @@ impl UfsQueue {
         let queue = Arc::pin_init(
             try_pin_init!(Self {
                 tags <- tagset,
+                resources,
+                reg,
                 dma,
+                uic,
                 backend,
                 recovery <- new_spinlock!(RecoveryState::Operational),
                 recovery_work <- new_work!("UfsQueue::recovery"),
@@ -834,6 +874,116 @@ impl UfsQueue {
 
     fn recovery_required(&self) -> bool {
         self.recovery.lock().cause().is_some()
+    }
+
+    fn stop_controller(&self) -> Result<()> {
+        self.reg.disable_interrupts();
+        self.reg.clear_all_interrupts();
+        self.reg.disable_run_stop();
+        if self.reg.ctrl_enabled() {
+            self.reg.ctrl_disable();
+            self.reg.wait_for_ctrl_disable(10, 10)?;
+        }
+        Ok(())
+    }
+
+    fn reset_controller(&self) -> Result<()> {
+        self.stop_controller()?;
+
+        let variant = self.resources.variant();
+        variant.device_reset()?;
+        variant.hce_enable_notify(&self.reg, NotifyPhase::Pre)?;
+        self.reg.ctrl_enable();
+        fsleep(Delta::from_micros(HBA_ENABLE_DELAY_US));
+        self.reg.wait_for_ctrl_enable(1000, 50)?;
+        variant.hce_enable_notify(&self.reg, NotifyPhase::Post)?;
+
+        variant.link_startup_notify(&self.reg, &self.uic, NotifyPhase::Pre)?;
+        self.uic.link_startup()?;
+        variant.link_startup_notify(&self.reg, &self.uic, NotifyPhase::Post)?;
+
+        // Restore the common UTRL/UTMRL state before backend-specific state.
+        // In particular, MCQ activation programs queue registers and enables
+        // MCQ interrupts on top of an operational controller, matching the
+        // order used during initial host bring-up.
+        self.dma.make_hba_operational()?;
+        self.backend.reset()?;
+
+        if let Err(e) = self.restore_power_mode(variant) {
+            pr_warn!(
+                "[RUFS] ufs_queue: recovery power mode restore failed errno={}, continue\n",
+                e.to_errno(),
+            );
+        }
+        Ok(())
+    }
+
+    fn restore_power_mode(&self, variant: &dyn UfsVariantOps) -> Result<()> {
+        let mode = variant.constrain_power_mode(self.uic.max_power_mode()?)?;
+        variant.power_mode_notify(&self.reg, &self.uic, mode, NotifyPhase::Pre)?;
+        self.uic.change_power_mode(mode)?;
+        variant.power_mode_notify(&self.reg, &self.uic, mode, NotifyPhase::Post)
+    }
+
+    fn dispose_recovery_request(
+        &self,
+        owner: CommandOwner,
+        requeue: bool,
+    ) -> Result<()> {
+        let rq = self
+            .tags
+            .try_tag_to_rq(owner.queue_id, owner.blk_tag)?
+            .ok_or(EIO)?;
+        rq.data_ref()
+            .inner
+            .lock()
+            .prepare_recovery_disposition(requeue)?;
+        let rq = OwnableRefCounted::try_from_shared(rq).map_err(|_| EBUSY)?;
+
+        if requeue {
+            rq.requeue(true);
+        } else {
+            rq.end(bindings::BLK_STS_IOERR as u8);
+        }
+        Ok(())
+    }
+
+    fn dispose_recovery_requests(&self, requeue: bool) -> Result<usize> {
+        let mut disposed = 0;
+        let mut failed = false;
+
+        for tag in 0..TASK_TAG_COUNT {
+            let task_tag = TaskTag::from_index(tag)?;
+            let owner = match self.command_pool.lock().recovery_owner(task_tag) {
+                Ok(Some(owner)) => owner,
+                Ok(None) => continue,
+                Err(e) => {
+                    pr_err!(
+                        "[RUFS] ufs_queue: recovery found unbound command tag={} errno={}\n",
+                        tag,
+                        e.to_errno(),
+                    );
+                    failed = true;
+                    continue;
+                }
+            };
+            if let Err(e) = self.dispose_recovery_request(owner, requeue) {
+                pr_err!(
+                    "[RUFS] ufs_queue: recovery request disposition failed tag={} errno={}\n",
+                    tag,
+                    e.to_errno(),
+                );
+                failed = true;
+            } else {
+                disposed += 1;
+            }
+        }
+
+        if failed || self.active_commands() != 0 {
+            Err(EIO)
+        } else {
+            Ok(disposed)
+        }
     }
 
     pub(crate) fn require_recovery(self: &Arc<Self>, reason: &'static str, tag: usize) {
@@ -977,6 +1127,9 @@ impl UfsQueue {
     }
 
     pub(crate) fn complete(self: &Arc<Self>) -> bool {
+        if self.recovery_required() {
+            return false;
+        }
         // Completion is tag-driven: the backend collects completed tags, then
         // the queue finalizes exactly those requests. Finalization still runs
         // from the threaded IRQ path because it takes request, backend, and DMA
@@ -1025,6 +1178,9 @@ impl UfsQueue {
         hw_queue: &UfsHwQueue,
         batch: &mut mq::IoCompletionBatch<UfsLuBlockOps>,
     ) -> bool {
+        if self.recovery_required() {
+            return false;
+        }
         let mut any_completed = false;
         for _ in 0..self.completion_pass_limit() {
             let mut requests = CompletedRequests::new();
@@ -1255,14 +1411,15 @@ impl WorkItem for UfsQueue {
 
         {
             let mut state = this.recovery.lock();
-            *state = RecoveryState::Recovering(cause);
+            if matches!(*state, RecoveryState::Quiescing(_)) {
+                *state = RecoveryState::Recovering(cause);
+            } else {
+                return;
+            }
         }
 
-        // Controller reset and request disposition are added after the
-        // recovery foundation is validated. Until then, keep the tag set
-        // quiesced so a late completion cannot refer to a reused tag.
-        pr_err!(
-            "[RUFS] ufs_queue: recovery unavailable, queue stopped reason={} queue={:?} tag={}\n",
+        pr_info!(
+            "[RUFS] ufs_queue: controller recovery started reason={} queue={:?} tag={}\n",
             cause.reason.name(),
             cause.scope.queue_id(),
             cause.tag,
@@ -1277,6 +1434,54 @@ impl WorkItem for UfsQueue {
                 errors.dme,
             );
         }
-        *this.recovery.lock() = RecoveryState::Failed(cause);
+        // A controller reset makes every command that was visible to the old
+        // controller instance unreachable. Only after that boundary may RUFS
+        // return their blk-mq tags: requeue them when the new link is usable,
+        // or finish them with I/O error when reset failed.
+        let reset = this.reset_controller();
+        let requeue = reset.is_ok();
+        if reset.is_err() {
+            let _ = this.stop_controller();
+        }
+        let disposition = this.dispose_recovery_requests(requeue);
+
+        match (reset, disposition) {
+            (Ok(()), Ok(disposed)) => {
+                let resume = {
+                    let mut state = this.recovery.lock();
+                    if matches!(*state, RecoveryState::Recovering(_)) {
+                        *state = RecoveryState::Operational;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if resume {
+                    this.tags.unquiesce();
+                    pr_info!(
+                        "[RUFS] ufs_queue: controller recovery completed requeued={}\n",
+                        disposed,
+                    );
+                }
+            }
+            (reset, disposition) => {
+                if let Err(e) = reset {
+                    pr_err!(
+                        "[RUFS] ufs_queue: controller recovery reset failed errno={}\n",
+                        e.to_errno(),
+                    );
+                }
+                if let Err(e) = disposition {
+                    pr_err!(
+                        "[RUFS] ufs_queue: recovery request cleanup failed errno={}\n",
+                        e.to_errno(),
+                    );
+                }
+                let mut state = this.recovery.lock();
+                if matches!(*state, RecoveryState::Recovering(_)) {
+                    *state = RecoveryState::Failed(cause);
+                }
+            }
+        }
     }
 }
