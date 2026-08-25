@@ -696,7 +696,8 @@ impl platform::Driver for UfsQcom {
         })
     }
 
-    fn unbind(pdev: &platform::Device<Core<'_>>, _this: Pin<&Self::Data<'_>>) {
+    fn unbind(pdev: &platform::Device<Core<'_>>, this: Pin<&Self::Data<'_>>) {
         dev_dbg!(pdev.as_ref(), "Remove Rust Qualcomm UFS driver.\n");
+        this.host.shutdown();
     }
 }

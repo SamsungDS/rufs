@@ -229,7 +229,7 @@ impl UfsHost {
         Ok(())
     }
 
-    fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         if !self.begin_shutdown() {
             return;
         }
