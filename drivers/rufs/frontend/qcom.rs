@@ -293,9 +293,9 @@ impl UfsQcomInterconnect {
 
 struct UfsQcomPlatform {
     has_mcq_resource: bool,
-    lifecycle: Arc<Mutex<()>>,
+    // Serialize PHY transitions and retain OPP resources until shutdown.
+    lifecycle: Arc<Mutex<Option<UfsQcomOpp>>>,
     clocks: UfsQcomClocks,
-    _opp: UfsQcomOpp,
     _interconnect: UfsQcomInterconnect,
     reset: OptionalExclusive,
     device_reset: OptionalOutput,
@@ -328,9 +328,8 @@ impl UfsQcomPlatform {
 
         Ok(Self {
             has_mcq_resource: variant.has_mcq_resource(),
-            lifecycle: Arc::pin_init(new_mutex!(()), GFP_KERNEL)?,
+            lifecycle: Arc::pin_init(new_mutex!(Some(opp)), GFP_KERNEL)?,
             clocks: UfsQcomClocks::new(dev)?,
-            _opp: opp,
             _interconnect: UfsQcomInterconnect::new(dev)?,
             reset: OptionalExclusive::get(dev, c"rst")?,
             // Hold the attached device in reset until `device_reset()` runs.
@@ -608,10 +607,16 @@ impl UfsVariantOps for UfsQcomPlatform {
     }
 
     fn shutdown(&self, _reg: &UfsReg) {
-        let _lifecycle = self.lifecycle.lock();
+        let mut lifecycle = self.lifecycle.lock();
 
         self.clocks.disable_lanes();
         self.phy.shutdown();
+
+        // Remove static OPPs before generic PM-domain detach so a later bind
+        // can configure the device's OPP table again.
+        let opp = lifecycle.take();
+        drop(lifecycle);
+        drop(opp);
     }
 }
 
