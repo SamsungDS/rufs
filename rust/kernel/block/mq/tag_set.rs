@@ -230,6 +230,44 @@ impl<T: Operations> TagSet<T> {
         unsafe { bindings::blk_mq_unquiesce_tagset(self.inner.get()) }
     }
 
+    /// Return the number of started requests associated with this tag set.
+    pub fn busy_request_count(&self) -> usize {
+        /// # Safety
+        ///
+        /// `data` must point to a live `usize` for the duration of the call.
+        unsafe extern "C" fn count_request(
+            _rq: *mut bindings::request,
+            data: *mut crate::ffi::c_void,
+        ) -> bool {
+            // SAFETY: `data` points to the stack-local count passed to
+            // `blk_mq_tagset_busy_iter`, which invokes callbacks synchronously.
+            let count = unsafe { &mut *data.cast::<usize>() };
+            *count += 1;
+            true
+        }
+
+        let mut count = 0usize;
+        // SAFETY: `self.inner` is a live tag set. The callback does not retain
+        // the request or the pointer to `count` beyond this synchronous call.
+        unsafe {
+            bindings::blk_mq_tagset_busy_iter(
+                self.inner.get(),
+                Some(count_request),
+                core::ptr::from_mut(&mut count).cast(),
+            )
+        };
+        count
+    }
+
+    /// Wait until all scheduled request completion callbacks have finished.
+    ///
+    /// I/O queues must be shut down before calling this method.
+    pub fn wait_completed_requests(&self) {
+        // SAFETY: `self.inner` is a live tag set. The caller is responsible for
+        // stopping the queues as required by the C API.
+        unsafe { bindings::blk_mq_tagset_wait_completed_request(self.inner.get()) }
+    }
+
     /// Borrow the [`T::TagSetData`](Operations::TagSetData) associated with
     /// this tag set.
     pub fn data(&self) -> <T::TagSetData as ForeignOwnable>::Borrowed<'_> {
