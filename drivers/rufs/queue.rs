@@ -1058,11 +1058,12 @@ impl UfsQueue {
         self: &Arc<Self>,
         request: CompletedRequest,
     ) -> Option<ResolvedCompletion> {
-        let task_tag = request.task_tag;
+        let task_tag = request.task_tag();
+        let queue_id = request.queue_id();
         match self.request_at_task_tag(task_tag) {
             Ok(Some(rq)) => {
                 if rq.tag() != u32::from(task_tag.value())
-                    || rq.queue_index() != request.queue_id
+                    || rq.queue_index() != queue_id
                 {
                     self.require_recovery("completion queue mismatch", task_tag.index());
                     return None;
@@ -1070,8 +1071,8 @@ impl UfsQueue {
                 Some(ResolvedCompletion {
                     rq,
                     task_tag,
-                    queue_id: request.queue_id,
-                    completion: request.completion,
+                    queue_id,
+                    completion: request.completion(),
                 })
             }
             Ok(None) => {

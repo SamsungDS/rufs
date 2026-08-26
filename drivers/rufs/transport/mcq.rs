@@ -7,7 +7,7 @@ use crate::dma::UfsDma;
 use crate::hci::descriptor::{CqEntry, SqEntry};
 use crate::reg::{McqRegisterLayout, UfsMcqOprRegion, UfsMcqOprSet, UfsReg};
 use crate::transport::{
-    CompletedRequests, McqConfig, SubmissionOutcome, TransferCompletion, UfsHwQueue, UfsTransferOps,
+    CompletedRequests, McqConfig, SubmissionOutcome, UfsHwQueue, UfsTransferOps,
 };
 use kernel::io::{io_project, Io};
 use kernel::sync::{barrier, Arc, SpinLock};
@@ -313,10 +313,10 @@ impl McqHardwareQueue {
                 consumed = true;
                 match dma.tag_from_cq_entry(&cqe, self.descriptor.id()) {
                     Ok(tag) => match TaskTag::from_index(tag) {
-                        Ok(task_tag) => completed_requests.insert(
+                        Ok(task_tag) => completed_requests.insert_mcq(
                             task_tag,
                             self.descriptor.id(),
-                            TransferCompletion::Mcq(cqe),
+                            cqe,
                         )?,
                         Err(_) => completed_requests.record_fault(
                             "invalid MCQ completion task tag",

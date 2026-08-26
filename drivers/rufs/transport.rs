@@ -113,10 +113,35 @@ pub(crate) enum TransferCompletion {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct CompletedRequest {
-    pub(crate) task_tag: TaskTag,
-    pub(crate) queue_id: u32,
-    pub(crate) completion: TransferCompletion,
+pub(crate) enum CompletedRequest {
+    Sdb(TaskTag),
+    Mcq {
+        task_tag: TaskTag,
+        queue_id: u32,
+        cqe: CqEntry,
+    },
+}
+
+impl CompletedRequest {
+    pub(crate) fn task_tag(self) -> TaskTag {
+        match self {
+            Self::Sdb(task_tag) | Self::Mcq { task_tag, .. } => task_tag,
+        }
+    }
+
+    pub(crate) fn queue_id(self) -> u32 {
+        match self {
+            Self::Sdb(_) => 0,
+            Self::Mcq { queue_id, .. } => queue_id,
+        }
+    }
+
+    pub(crate) fn completion(self) -> TransferCompletion {
+        match self {
+            Self::Sdb(_) => TransferCompletion::Sdb,
+            Self::Mcq { cqe, .. } => TransferCompletion::Mcq(cqe),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -147,23 +172,27 @@ impl CompletedRequests {
         }
     }
 
-    pub(crate) fn insert(
-        &mut self,
-        task_tag: TaskTag,
-        queue_id: u32,
-        completion: TransferCompletion,
-    ) -> Result<()> {
+    fn insert(&mut self, request: CompletedRequest) -> Result<()> {
         if self.len == self.requests.len() {
             return Err(ENOMEM);
         }
 
-        self.requests[self.len] = Some(CompletedRequest {
-            task_tag,
-            queue_id,
-            completion,
-        });
+        self.requests[self.len] = Some(request);
         self.len += 1;
         Ok(())
+    }
+
+    pub(crate) fn insert_mcq(
+        &mut self,
+        task_tag: TaskTag,
+        queue_id: u32,
+        cqe: CqEntry,
+    ) -> Result<()> {
+        self.insert(CompletedRequest::Mcq {
+            task_tag,
+            queue_id,
+            cqe,
+        })
     }
 
     pub(crate) fn insert_sdb_mask(&mut self, mut mask: u32) -> Result<u32> {
@@ -173,7 +202,7 @@ impl CompletedRequests {
             let tag = mask.trailing_zeros();
             let tag_mask = 1u32 << tag;
             mask &= !tag_mask;
-            self.insert(TaskTag::new(tag)?, 0, TransferCompletion::Sdb)?;
+            self.insert(CompletedRequest::Sdb(TaskTag::new(tag)?))?;
             inserted |= tag_mask;
         }
 
