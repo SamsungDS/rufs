@@ -9,6 +9,9 @@ use kernel::{prelude::*, time::Delta};
 use zerocopy_derive::Immutable;
 
 pub(crate) const QUERY_DESC_MAX_SIZE: usize = 255;
+pub(crate) const UFS_DEV_WRITE_BOOSTER_SUP: u32 = 1 << 8;
+pub(crate) const WB_BUF_MODE_LU_DEDICATED: u8 = 0;
+pub(crate) const WB_BUF_MODE_SHARED: u8 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, FromBytes, IntoBytes, Immutable)]
@@ -128,6 +131,26 @@ impl DeviceDesc {
     pub(crate) fn queue_depth(&self) -> usize {
         self.queue_depth as usize
     }
+
+    pub(crate) fn extended_wb_support(&self) -> u16 {
+        u16::from_be(self.extended_wb_support)
+    }
+
+    pub(crate) fn extended_ufs_features_support(&self) -> u32 {
+        u32::from_be(self.extended_ufs_features_support)
+    }
+
+    pub(crate) fn write_booster_buffer_preserve_user_space_en(&self) -> u8 {
+        self.write_booster_buffer_preserve_user_space_en
+    }
+
+    pub(crate) fn write_booster_buffer_type(&self) -> u8 {
+        self.write_booster_buffer_type
+    }
+
+    pub(crate) fn num_shared_write_booster_buffer_alloc_units(&self) -> u32 {
+        u32::from_be(self.num_shared_write_booster_buffer_alloc_units)
+    }
 }
 
 #[repr(C, packed)]
@@ -186,6 +209,22 @@ impl GeometryDesc {
     pub(crate) fn max_number_lu(&self) -> u8 {
         self.max_number_lu
     }
+
+    pub(crate) fn write_booster_buffer_max_n_alloc_units(&self) -> u32 {
+        u32::from_be(self.write_booster_buffer_max_n_alloc_units)
+    }
+
+    pub(crate) fn device_max_write_booster_l_us(&self) -> u8 {
+        self.device_max_write_booster_l_us
+    }
+
+    pub(crate) fn write_booster_buffer_cap_adj_fac(&self) -> u8 {
+        self.write_booster_buffer_cap_adj_fac
+    }
+
+    pub(crate) fn supported_write_booster_buffer_types(&self) -> u8 {
+        self.supported_write_booster_buffer_types
+    }
 }
 
 #[repr(C, packed)]
@@ -232,6 +271,10 @@ impl UnitDesc {
 
     pub(crate) fn lu_queue_depth(&self) -> usize {
         self.lu_queue_depth as usize
+    }
+
+    pub(crate) fn lu_num_write_booster_buffer_alloc_units(&self) -> u32 {
+        u32::from_be(self.lu_num_write_booster_buffer_alloc_units)
     }
 }
 

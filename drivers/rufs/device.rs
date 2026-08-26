@@ -257,11 +257,13 @@ impl UfsDev {
     }
 
     pub(crate) fn device_params_init(&self) -> Result<()> {
-        self.get_geometry_info()?;
-        self.get_device_info()
+        let geometry = self.get_geometry_info()?;
+        let device = self.get_device_info()?;
+        self.report_write_booster(device, geometry);
+        Ok(())
     }
 
-    fn get_geometry_info(&self) -> Result<()> {
+    fn get_geometry_info(&self) -> Result<GeometryDesc> {
         let desc = self.read_desc(DescIdn::Geometry, 0, 0)?.get_geometry()?;
         match desc.max_number_lu() {
             1 => {
@@ -272,10 +274,10 @@ impl UfsDev {
             }
         }
 
-        Ok(())
+        Ok(desc)
     }
 
-    fn get_device_info(&self) -> Result<()> {
+    fn get_device_info(&self) -> Result<DeviceDesc> {
         let desc = self.read_desc(DescIdn::Device, 0, 0)?.get_device()?;
         self.info.lock().manufacturer_id = desc.manufacturer_id();
         self.info.lock().spec_version = desc.spec_version();
@@ -285,6 +287,129 @@ impl UfsDev {
         self.info.lock().num_wlu = desc.number_wlu() as usize;
         self.info.lock().luns_avail = (desc.number_lu() + desc.number_wlu()) as usize;
 
-        Ok(())
+        Ok(desc)
+    }
+
+    fn report_wb_flag(&self, name: &str, idn: FlagIdn, index: u8) {
+        match self.read_flag(idn, index, 0) {
+            Ok(value) => pr_info!(
+                "[RUFS] ufs_dev: WB flag {}={} index={}\n",
+                name,
+                value,
+                index,
+            ),
+            Err(e) => pr_warn!(
+                "[RUFS] ufs_dev: WB flag {} read failed index={} errno={}\n",
+                name,
+                index,
+                e.to_errno(),
+            ),
+        }
+    }
+
+    fn report_wb_attr(&self, name: &str, idn: AttrIdn, index: u8) {
+        match self.read_attr(idn, index, 0) {
+            Ok(value) => pr_info!(
+                "[RUFS] ufs_dev: WB attr {}={} index={}\n",
+                name,
+                value,
+                index,
+            ),
+            Err(e) => pr_warn!(
+                "[RUFS] ufs_dev: WB attr {} read failed index={} errno={}\n",
+                name,
+                index,
+                e.to_errno(),
+            ),
+        }
+    }
+
+    fn report_write_booster(&self, device: DeviceDesc, geometry: GeometryDesc) {
+        let features = device.extended_ufs_features_support();
+        let supported = features & UFS_DEV_WRITE_BOOSTER_SUP != 0;
+        let buffer_type = device.write_booster_buffer_type();
+
+        pr_info!(
+            "[RUFS] ufs_dev: WB device spec={:#06x} supported={} ext_features={:#010x} ext_wb={:#06x} preserve_user_space={} buffer_type={} shared_alloc_units={}\n",
+            device.spec_version(),
+            supported,
+            features,
+            device.extended_wb_support(),
+            device.write_booster_buffer_preserve_user_space_en(),
+            buffer_type,
+            device.num_shared_write_booster_buffer_alloc_units(),
+        );
+        pr_info!(
+            "[RUFS] ufs_dev: WB geometry max_alloc_units={} max_lus={} cap_adj_fac={} supported_types={:#04x}\n",
+            geometry.write_booster_buffer_max_n_alloc_units(),
+            geometry.device_max_write_booster_l_us(),
+            geometry.write_booster_buffer_cap_adj_fac(),
+            geometry.supported_write_booster_buffer_types(),
+        );
+
+        if !supported {
+            return;
+        }
+
+        let index = match buffer_type {
+            WB_BUF_MODE_SHARED => {
+                if device.num_shared_write_booster_buffer_alloc_units() == 0 {
+                    pr_warn!("[RUFS] ufs_dev: WB has no shared buffer allocation\n");
+                    return;
+                }
+                0
+            }
+            WB_BUF_MODE_LU_DEDICATED => {
+                let mut dedicated_lun = None;
+                for lun in 0..device.number_lu() {
+                    match self.read_unit_desc(lun) {
+                        Ok(unit) => {
+                            let units = unit.lu_num_write_booster_buffer_alloc_units();
+                            if units == 0 {
+                                continue;
+                            }
+                            pr_info!(
+                                "[RUFS] ufs_dev: WB dedicated LU={} alloc_units={}\n",
+                                lun,
+                                units,
+                            );
+                            if dedicated_lun.is_none() {
+                                dedicated_lun = Some(lun);
+                            }
+                        }
+                        Err(e) => pr_warn!(
+                            "[RUFS] ufs_dev: WB unit descriptor read failed LU={} errno={}\n",
+                            lun,
+                            e.to_errno(),
+                        ),
+                    }
+                }
+
+                let Some(lun) = dedicated_lun else {
+                    pr_warn!("[RUFS] ufs_dev: WB has no dedicated buffer allocation\n");
+                    return;
+                };
+                lun
+            }
+            _ => {
+                pr_warn!(
+                    "[RUFS] ufs_dev: WB has unknown buffer type={}\n",
+                    buffer_type,
+                );
+                return;
+            }
+        };
+
+        self.report_wb_flag("enabled", FlagIdn::WBEn, index);
+        self.report_wb_flag("flush_enabled", FlagIdn::WBBuffFlushEn, index);
+        self.report_wb_flag(
+            "flush_during_hibern8",
+            FlagIdn::WBBuffFlushDuringHibern8,
+            index,
+        );
+        self.report_wb_attr("flush_status", AttrIdn::WBFlushStatus, index);
+        self.report_wb_attr("available_buffer", AttrIdn::AvailWBBuffSize, index);
+        self.report_wb_attr("lifetime_estimate", AttrIdn::WBBuffLifeTimeEst, index);
+        self.report_wb_attr("current_buffer", AttrIdn::CurrWBBuffSize, index);
     }
 }
