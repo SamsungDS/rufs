@@ -272,17 +272,18 @@ impl UfsHost {
 
         self.queue.begin_shutdown();
         if let Err(e) = read_poll_timeout(
-            || Ok(self.queue.active_commands()),
+            || Ok(self.queue.busy_requests()),
             |active| *active == 0,
             Delta::from_millis(SHUTDOWN_DRAIN_INTERVAL_MS),
             Delta::from_secs(SHUTDOWN_DRAIN_TIMEOUT_SECS),
         ) {
             pr_err!(
                 "[RUFS] ufs_host: timed out draining {} commands errno={}\n",
-                self.queue.active_commands(),
+                self.queue.busy_requests(),
                 e.to_errno(),
             );
         }
+        self.queue.wait_completed_requests();
 
         self.reg.disable_interrupts();
         self.irq.shutdown();

@@ -12,7 +12,6 @@ use kernel::bindings;
 use kernel::block::error::code::BLK_STS_IOERR;
 use kernel::block::mq::gen_disk::BoundGenDisk;
 use kernel::block::mq::LimitsBuilder;
-use kernel::sync::atomic::{Atomic, Relaxed};
 use kernel::sync::{Arc, Mutex, SpinLock};
 use kernel::types::{OwnableRefCounted, Owned};
 use kernel::{
@@ -307,23 +306,18 @@ enum QueueOwner {
 
 pub(crate) struct QueueData {
     owner: QueueOwner,
-    // Best-effort completion-side restart hint. The delayed retry installed
-    // by the block API guarantees progress if this hint races with dispatch.
-    budget_waiting: Atomic<bool>,
 }
 
 impl QueueData {
     pub(crate) fn dev(queue: Arc<UfsQueue>) -> Self {
         Self {
             owner: QueueOwner::Dev(queue),
-            budget_waiting: Atomic::new(false),
         }
     }
 
     pub(crate) fn lu(lu: Arc<UfsLu>) -> Self {
         Self {
             owner: QueueOwner::Lu(lu),
-            budget_waiting: Atomic::new(false),
         }
     }
 
@@ -351,14 +345,6 @@ impl QueueData {
             QueueOwner::Lu(lu) => Some(lu),
         }
     }
-
-    fn mark_budget_waiting(&self) {
-        self.budget_waiting.store(true, Relaxed);
-    }
-
-    fn take_budget_waiting(&self) -> bool {
-        self.budget_waiting.xchg(false, Relaxed)
-    }
 }
 
 #[vtable]
@@ -375,18 +361,6 @@ impl Operations for UfsLuBlockOps {
         pin_init!(UfsRequestData {
             inner <- new_spinlock!(UfsRequestInner::default()),
         })
-    }
-
-    fn get_budget(queue_data: &QueueData) -> Option<u32> {
-        let token = queue_data.queue().try_get_budget();
-        if token.is_none() {
-            queue_data.mark_budget_waiting();
-        }
-        token
-    }
-
-    fn put_budget(queue_data: &QueueData, token: u32) -> bool {
-        queue_data.queue().put_budget(token) && queue_data.take_budget_waiting()
     }
 
     fn queue_rq(
@@ -510,7 +484,7 @@ impl Operations for UfsLuBlockOps {
             }
             mq::Command::DriverIn | mq::Command::DriverOut => {
                 let rq = OwnableRefCounted::into_shared(rq.start());
-                if let Err(e) = UfsRequestData::compose_dev_request(&rq, hw_queue) {
+                if let Err(e) = UfsRequestData::compose_dev_request(&rq) {
                     complete_unsubmitted(rq, e);
                     return Ok(());
                 }
@@ -532,7 +506,7 @@ impl Operations for UfsLuBlockOps {
         // the same tag after releasing the DMA mapping.
         let rq = OwnableRefCounted::into_shared(rq.start());
 
-        if let Err(e) = UfsRequestData::compose_scsi_cmd(&rq, cmd, hw_queue) {
+        if let Err(e) = UfsRequestData::compose_scsi_cmd(&rq, cmd) {
             complete_unsubmitted(rq, e);
             return Ok(());
         }
@@ -584,10 +558,10 @@ impl Operations for UfsLuBlockOps {
 
     fn request_timeout(
         tag_set: &TagSet<Self>,
-        queue_id: u32,
+        _queue_id: u32,
         tag: u32,
     ) -> mq::RequestTimeoutStatus {
-        let request = match tag_set.try_tag_to_rq(queue_id, tag) {
+        let request = match tag_set.try_shared_tag_to_rq(tag) {
             Ok(Some(request)) => request,
             Ok(None) | Err(_) => return mq::RequestTimeoutStatus::RetryLater,
         };

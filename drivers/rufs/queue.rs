@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
-use crate::command::{CommandOwner, CommandPool, TaskTag, TASK_TAG_COUNT};
+use crate::command::TaskTag;
 use crate::dma::*;
 use crate::lu::{TagSetData, UfsLuBlockOps, UfsRequestData};
 use crate::protocol::scsi::*;
@@ -495,12 +495,11 @@ impl ResolvedCompletion {
 
 impl UfsRequestData {
     fn task_tag(rq: &mq::Request<UfsLuBlockOps>) -> Result<TaskTag> {
-        TaskTag::new(rq.dispatch_budget().ok_or(EIO)?)
+        TaskTag::new(rq.tag())
     }
 
     pub(crate) fn compose_dev_request(
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
-        hw_queue: &UfsHwQueue,
     ) -> Result<()> {
         if let Some(queue) = rq.queue_data().dev_queue() {
             let cmd = rq
@@ -511,7 +510,6 @@ impl UfsRequestData {
                 .get_device()?;
             let task_tag = Self::task_tag(rq)?;
             queue.compose_dev(cmd, task_tag)?;
-            queue.bind_command(task_tag, hw_queue.id(), rq.tag())?;
             Ok(())
         } else {
             Err(EIO)
@@ -521,15 +519,12 @@ impl UfsRequestData {
     pub(crate) fn compose_scsi_cmd(
         rq: &ARef<mq::Request<UfsLuBlockOps>>,
         cmd: UfsSCSICmd,
-        hw_queue: &UfsHwQueue,
     ) -> Result<()> {
         let mempool = rq.queue().tag_set().data().dma_vec_mempool.clone();
-        let queue = rq.queue_data().queue();
         let task_tag = Self::task_tag(rq)?;
         let prdt = UfsQueue::compose_scsi(rq, cmd, task_tag, &mempool)?;
 
         rq.data_ref().inner.lock().prepare_scsi(cmd, prdt)?;
-        queue.bind_command(task_tag, hw_queue.id(), rq.tag())?;
         Ok(())
     }
 
@@ -714,7 +709,6 @@ impl UfsRequestData {
         status: u32,
     ) -> CompletionOutcome {
         let tag = rq.tag();
-        rq.release_budget_and_run_queue();
         let rq = match OwnableRefCounted::try_from_shared(rq) {
             Ok(rq) => rq,
             Err(_rq) => {
@@ -740,8 +734,6 @@ pub(crate) struct UfsQueue {
     recovery: SpinLock<RecoveryState>,
     #[pin]
     recovery_work: Work<UfsQueue>,
-    #[pin]
-    command_pool: SpinLock<CommandPool>,
 }
 
 impl_has_work! {
@@ -805,10 +797,6 @@ impl UfsQueue {
                 backend,
                 recovery <- new_spinlock!(RecoveryState::Operational),
                 recovery_work <- new_work!("UfsQueue::recovery"),
-                command_pool <- new_spinlock!(CommandPool::new(
-                    queue_depth,
-                    queue_depth,
-                )?),
             }),
             GFP_KERNEL,
         )?;
@@ -816,20 +804,17 @@ impl UfsQueue {
         Ok(queue)
     }
 
-    pub(crate) fn try_get_budget(&self) -> Option<u32> {
-        let mut command_pool = self.command_pool.lock();
-        command_pool
-            .reserve()
-            .map(|task_tag| u32::from(task_tag.value()))
-    }
-
     pub(crate) fn begin_shutdown(&self) {
         *self.recovery.lock() = RecoveryState::Shutdown;
         self.tags.quiesce();
     }
 
-    pub(crate) fn active_commands(&self) -> usize {
-        self.command_pool.lock().active()
+    pub(crate) fn busy_requests(&self) -> usize {
+        self.tags.busy_request_count()
+    }
+
+    pub(crate) fn wait_completed_requests(&self) {
+        self.tags.wait_completed_requests();
     }
 
     pub(crate) fn flush_recovery_work(self: &Arc<Self>) {
@@ -840,33 +825,8 @@ impl UfsQueue {
         work.flush();
     }
 
-    fn bind_command(&self, task_tag: TaskTag, queue_id: u32, blk_tag: u32) -> Result<()> {
-        self.command_pool
-            .lock()
-            .bind(task_tag, CommandOwner { queue_id, blk_tag })
-    }
-
-    fn command_owner(&self, task_tag: TaskTag) -> Result<CommandOwner> {
-        self.command_pool.lock().owner(task_tag).ok_or(EIO)
-    }
-
-    pub(crate) fn put_budget(&self, token: u32) -> bool {
-        let Ok(task_tag) = TaskTag::new(token) else {
-            pr_warn!("[RUFS] ufs_queue: invalid budget token={}\n", token);
-            return false;
-        };
-        if self.command_pool.lock().release(task_tag).is_err() {
-            pr_warn!(
-                "[RUFS] ufs_queue: invalid command slot release task_tag={}\n",
-                task_tag.value(),
-            );
-            return false;
-        }
-        true
-    }
-
     fn completion_pass_limit(&self) -> usize {
-        let active = self.command_pool.lock().active();
+        let active = self.busy_requests();
         core::cmp::max(1, active.div_ceil(CompletedRequests::capacity()))
     }
 
@@ -925,13 +885,17 @@ impl UfsQueue {
 
     fn dispose_recovery_request(
         &self,
-        owner: CommandOwner,
+        task_tag: TaskTag,
         requeue: bool,
-    ) -> Result<()> {
-        let rq = self
+    ) -> Result<bool> {
+        let rq = match self
             .tags
-            .try_tag_to_rq(owner.queue_id, owner.blk_tag)?
-            .ok_or(EIO)?;
+            .try_shared_tag_to_rq(u32::from(task_tag.value()))
+        {
+            Ok(Some(rq)) => rq,
+            Ok(None) | Err(EBUSY) => return Ok(false),
+            Err(e) => return Err(e),
+        };
         rq.data_ref()
             .inner
             .lock()
@@ -943,41 +907,39 @@ impl UfsQueue {
         } else {
             rq.end(bindings::BLK_STS_IOERR as u8);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn dispose_recovery_requests(&self, requeue: bool) -> Result<usize> {
+        self.tags.wait_completed_requests();
+        let expected = self.busy_requests();
         let mut disposed = 0;
         let mut failed = false;
 
-        for tag in 0..TASK_TAG_COUNT {
-            let task_tag = TaskTag::from_index(tag)?;
-            let owner = match self.command_pool.lock().recovery_owner(task_tag) {
-                Ok(Some(owner)) => owner,
-                Ok(None) => continue,
+        for tag in 0..self.tags.queue_depth() {
+            let task_tag = TaskTag::new(tag)?;
+            match self.dispose_recovery_request(task_tag, requeue) {
+                Ok(true) => disposed += 1,
+                Ok(false) => continue,
                 Err(e) => {
                     pr_err!(
-                        "[RUFS] ufs_queue: recovery found unbound command tag={} errno={}\n",
+                        "[RUFS] ufs_queue: recovery request disposition failed tag={} errno={}\n",
                         tag,
                         e.to_errno(),
                     );
                     failed = true;
-                    continue;
                 }
-            };
-            if let Err(e) = self.dispose_recovery_request(owner, requeue) {
-                pr_err!(
-                    "[RUFS] ufs_queue: recovery request disposition failed tag={} errno={}\n",
-                    tag,
-                    e.to_errno(),
-                );
-                failed = true;
-            } else {
-                disposed += 1;
             }
         }
 
-        if failed || self.active_commands() != 0 {
+        let remaining = self.busy_requests();
+        if failed || disposed != expected || remaining != 0 {
+            pr_err!(
+                "[RUFS] ufs_queue: recovery request mismatch expected={} disposed={} remaining={}\n",
+                expected,
+                disposed,
+                remaining,
+            );
             Err(EIO)
         } else {
             Ok(disposed)
@@ -1087,12 +1049,9 @@ impl UfsQueue {
     fn request_at_task_tag(
         &self,
         task_tag: TaskTag,
-    ) -> Result<(CommandOwner, Option<ARef<mq::Request<UfsLuBlockOps>>>)> {
-        let owner = self.command_owner(task_tag)?;
-        Ok((
-            owner,
-            self.tags.try_tag_to_rq(owner.queue_id, owner.blk_tag)?,
-        ))
+    ) -> Result<Option<ARef<mq::Request<UfsLuBlockOps>>>> {
+        self.tags
+            .try_shared_tag_to_rq(u32::from(task_tag.value()))
     }
 
     fn resolve_completion(
@@ -1101,8 +1060,10 @@ impl UfsQueue {
     ) -> Option<ResolvedCompletion> {
         let task_tag = request.task_tag;
         match self.request_at_task_tag(task_tag) {
-            Ok((owner, Some(rq))) => {
-                if owner.queue_id != request.queue_id {
+            Ok(Some(rq)) => {
+                if rq.tag() != u32::from(task_tag.value())
+                    || rq.queue_index() != request.queue_id
+                {
                     self.require_recovery("completion queue mismatch", task_tag.index());
                     return None;
                 }
@@ -1113,7 +1074,7 @@ impl UfsQueue {
                     completion: request.completion,
                 })
             }
-            Ok((_, None)) => {
+            Ok(None) => {
                 self.require_recovery("completion tag has no request", task_tag.index());
                 None
             }
@@ -1350,7 +1311,6 @@ impl UfsQueue {
                     self.require_recovery("invalid SCSI completion state", tag as usize);
                     return CompletionOutcome::RetainedForRecovery;
                 }
-                rq.release_budget_and_run_queue();
                 mq::Request::complete(rq);
                 CompletionOutcome::Returned
             }
@@ -1372,8 +1332,6 @@ impl UfsQueue {
                     self.require_recovery("invalid polled completion state", tag as usize);
                     return CompletionOutcome::RetainedForRecovery;
                 }
-                rq.release_budget_and_run_queue();
-
                 if requeue {
                     rq.requeue(true);
                     return CompletionOutcome::Returned;
