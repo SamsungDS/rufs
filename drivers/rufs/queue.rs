@@ -781,6 +781,8 @@ impl UfsQueue {
             GFP_KERNEL,
         )?;
 
+        let mut tagset_flags = kernel::block::mq::tag_set::Flags::default();
+        tagset_flags |= kernel::block::mq::tag_set::Flag::TagHctxShared;
         let tagset = Arc::pin_init(
             TagSet::<UfsLuBlockOps>::new(
                 nr_hw_queues as u32,
@@ -788,7 +790,7 @@ impl UfsQueue {
                 u32::try_from(queue_depth).map_err(|_| EOVERFLOW)?,
                 queue_map.num_maps(),
                 kernel::alloc::NumaNode::NO_NODE,
-                kernel::block::mq::tag_set::Flags::default(),
+                tagset_flags,
             ),
             GFP_KERNEL,
         )?;
