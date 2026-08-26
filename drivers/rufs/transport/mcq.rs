@@ -538,7 +538,7 @@ impl McqTransferBackend {
     }
 
     pub(crate) fn queue_depth(&self) -> usize {
-        self.config.max_active_commands
+        self.config.queue_depth
     }
 
     pub(crate) fn allocated_queues(&self) -> usize {

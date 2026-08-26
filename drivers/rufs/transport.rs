@@ -18,7 +18,6 @@ use sdb::{SdbHwQueue, SdbTransferBackend};
 
 const UFS_MCQ_DEFAULT_READ_QUEUES: usize = 0;
 const UFS_MCQ_DEFAULT_POLL_QUEUES: usize = 1;
-const UFS_SOFTWARE_QUEUE_DEPTH: usize = 256;
 const COMPLETION_BATCH_SIZE: usize = 16;
 
 fn possible_cpus() -> usize {
@@ -33,9 +32,7 @@ pub(crate) struct McqConfig {
     pub(crate) read_queues: usize,
     pub(crate) interrupt_queues: usize,
     pub(crate) poll_queues: usize,
-    pub(crate) max_active_commands: usize,
-    task_tag_count: usize,
-    software_queue_depth: usize,
+    pub(crate) queue_depth: usize,
     pub(crate) ring_entries: usize,
 }
 
@@ -80,14 +77,12 @@ impl UfsTransferConfig {
         let default_queues = core::cmp::min(max_queues - reserved_queues, possible_cpus());
         let interrupt_queues = default_queues.checked_add(read_queues).ok_or(EOVERFLOW)?;
         let total_queues = interrupt_queues.checked_add(poll_queues).ok_or(EOVERFLOW)?;
-        let max_active_commands = reg.constrain_mcq_active_commands(core::cmp::min(
+        let queue_depth = reg.constrain_mcq_active_commands(core::cmp::min(
             reg.nutrs_mcq(),
             TASK_TAG_COUNT,
         ));
-        let task_tag_count = TASK_TAG_COUNT;
-        let software_queue_depth = UFS_SOFTWARE_QUEUE_DEPTH;
-        let ring_entries = max_active_commands.checked_add(1).ok_or(EOVERFLOW)?;
-        if interrupt_queues == 0 || max_active_commands == 0 {
+        let ring_entries = queue_depth.checked_add(1).ok_or(EOVERFLOW)?;
+        if interrupt_queues == 0 || queue_depth == 0 {
             return Err(EINVAL);
         }
 
@@ -98,33 +93,15 @@ impl UfsTransferConfig {
             read_queues,
             interrupt_queues,
             poll_queues,
-            max_active_commands,
-            task_tag_count,
-            software_queue_depth,
+            queue_depth,
             ring_entries,
         }))
     }
 
-    pub(crate) fn tag_count(&self) -> usize {
+    pub(crate) fn queue_depth(&self) -> usize {
         match self {
             Self::Sdb { tag_count } => *tag_count,
-            Self::Mcq(config) => config.task_tag_count,
-        }
-    }
-
-    pub(crate) fn software_queue_depth(&self) -> usize {
-        match self {
-            // Keep submitters from blocking on blk-mq tags before they can
-            // reap polled commands. The command pool still limits SDB to NUTRS.
-            Self::Sdb { .. } => UFS_SOFTWARE_QUEUE_DEPTH,
-            Self::Mcq(config) => config.software_queue_depth,
-        }
-    }
-
-    pub(crate) fn max_active_commands(&self) -> usize {
-        match self {
-            Self::Sdb { tag_count } => *tag_count,
-            Self::Mcq(config) => config.max_active_commands,
+            Self::Mcq(config) => config.queue_depth,
         }
     }
 }

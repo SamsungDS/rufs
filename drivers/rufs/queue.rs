@@ -760,12 +760,8 @@ impl UfsQueue {
         let hw_queues = backend.hw_queues()?;
         let queue_map = config.queue_map()?;
         let nr_hw_queues = queue_map.nr_hw_queues();
-        let task_tag_count = config.tag_count();
-        let software_queue_depth = config.software_queue_depth();
-        let max_active_commands = config.max_active_commands();
-        if task_tag_count == 0
-            || software_queue_depth == 0
-            || max_active_commands == 0
+        let queue_depth = config.queue_depth();
+        if queue_depth == 0
             || nr_hw_queues == 0
             || hw_queues.len() != nr_hw_queues
         {
@@ -780,7 +776,7 @@ impl UfsQueue {
                 // until completion. Reserve enough vector storage to make
                 // that mapping lifetime independent of atomic allocation
                 // success under memory pressure.
-                dma_vec_mempool: MemPool::new(max_active_commands)?,
+                dma_vec_mempool: MemPool::new(queue_depth)?,
             },
             GFP_KERNEL,
         )?;
@@ -789,7 +785,7 @@ impl UfsQueue {
             TagSet::<UfsLuBlockOps>::new(
                 nr_hw_queues as u32,
                 tagset_data,
-                u32::try_from(software_queue_depth).map_err(|_| EOVERFLOW)?,
+                u32::try_from(queue_depth).map_err(|_| EOVERFLOW)?,
                 queue_map.num_maps(),
                 kernel::alloc::NumaNode::NO_NODE,
                 kernel::block::mq::tag_set::Flags::default(),
@@ -808,8 +804,8 @@ impl UfsQueue {
                 recovery <- new_spinlock!(RecoveryState::Operational),
                 recovery_work <- new_work!("UfsQueue::recovery"),
                 command_pool <- new_spinlock!(CommandPool::new(
-                    task_tag_count,
-                    max_active_commands,
+                    queue_depth,
+                    queue_depth,
                 )?),
             }),
             GFP_KERNEL,

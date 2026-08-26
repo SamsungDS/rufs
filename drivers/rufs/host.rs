@@ -116,7 +116,7 @@ impl UfsHost {
             let dma = UfsDma::new(
                 resources.device(),
                 reg.clone(),
-                transfer_config.tag_count(),
+                transfer_config.queue_depth(),
             )?;
 
             reg.clear_all_interrupts();
