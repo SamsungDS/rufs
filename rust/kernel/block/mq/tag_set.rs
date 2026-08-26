@@ -57,6 +57,46 @@ pub struct TagSet<T: Operations> {
 }
 
 impl<T: Operations> TagSet<T> {
+    fn try_rq_from_tags(
+        tags: *mut bindings::blk_mq_tags,
+        tag: u32,
+    ) -> Result<Option<ARef<Request<T>>>> {
+        if tags.is_null() {
+            return Err(EINVAL);
+        }
+
+        // SAFETY: The caller obtained `tags` from this live tag set.
+        let rq_ptr = unsafe { bindings::blk_mq_tag_to_rq(tags, tag) };
+        if rq_ptr.is_null() {
+            return Ok(None);
+        }
+
+        // SAFETY: A non-null request returned by blk-mq has initialized driver
+        // private data.
+        let refcount_ptr = unsafe {
+            RequestDataWrapper::refcount_ptr(
+                Request::wrapper_ptr(rq_ptr.cast::<Request<T>>()).as_ptr(),
+            )
+        };
+        // SAFETY: The refcount remains valid while the request tag is active.
+        let atomic_ref = unsafe { &*refcount_ptr }.as_atomic();
+
+        loop {
+            let prev = atomic_ref.load(ordering::Acquire);
+            if prev < 1 {
+                return Err(EBUSY);
+            }
+            match atomic_ref.cmpxchg(prev, prev + 1, ordering::Relaxed) {
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+
+        // SAFETY: The successful increment above transfers one request
+        // reference to the returned `ARef`.
+        Ok(Some(unsafe { Request::aref_from_raw(rq_ptr) }))
+    }
+
     /// Try to create a new tag set
     pub fn new(
         nr_hw_queues: u32,
@@ -323,36 +363,7 @@ impl<T: Operations> TagSet<T> {
 
         // SAFETY: We checked that `qid` is within bounds.
         let tags = unsafe { *(*self.inner.get()).tags.add(qid as usize) };
-        // SAFETY: We checked `qid` above, so `tags` is valid.
-        let rq_ptr = unsafe { bindings::blk_mq_tag_to_rq(tags, tag) };
-        if rq_ptr.is_null() {
-            return Ok(None);
-        }
-
-        // SAFETY: A non-null request returned by blk-mq has initialized driver
-        // private data.
-        let refcount_ptr = unsafe {
-            RequestDataWrapper::refcount_ptr(
-                Request::wrapper_ptr(rq_ptr.cast::<Request<T>>()).as_ptr(),
-            )
-        };
-        // SAFETY: The refcount remains valid while the request tag is active.
-        let atomic_ref = unsafe { &*refcount_ptr }.as_atomic();
-
-        loop {
-            let prev = atomic_ref.load(ordering::Acquire);
-            if prev < 1 {
-                return Err(EBUSY);
-            }
-            match atomic_ref.cmpxchg(prev, prev + 1, ordering::Relaxed) {
-                Ok(_) => break,
-                Err(_) => continue,
-            }
-        }
-
-        // SAFETY: The successful increment above transfers one request
-        // reference to the returned `ARef`.
-        Ok(Some(unsafe { Request::aref_from_raw(rq_ptr) }))
+        Self::try_rq_from_tags(tags, tag)
     }
 
     /// Try to obtain a request from a tag shared by all hardware queues.
@@ -366,10 +377,10 @@ impl<T: Operations> TagSet<T> {
             return Err(EINVAL);
         }
 
-        // A shared tag set uses the same tag map for every hardware queue.
-        // Keep the representative queue selection inside the block API so
-        // drivers only depend on the shared-tag identity.
-        self.try_tag_to_rq(0, tag)
+        // SAFETY: `self.inner` is a live tag set, and the shared-tag flag
+        // requires blk-mq to allocate `shared_tags` during initialization.
+        let tags = unsafe { (*self.inner.get()).shared_tags };
+        Self::try_rq_from_tags(tags, tag)
     }
 
     /// TODO
