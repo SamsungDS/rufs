@@ -578,15 +578,11 @@ impl Operations for UfsLuBlockOps {
         hw_queue: &UfsHwQueue,
         queue_data: &QueueData,
         batch: &mut mq::IoCompletionBatch<Self>,
-    ) -> Result<mq::PollStatus> {
+    ) -> Result<bool> {
         let Some(lu) = queue_data.logical_unit() else {
             return Err(EIO);
         };
-        Ok(if lu.queue.poll(hw_queue, batch) {
-            mq::PollStatus::Completed
-        } else {
-            mq::PollStatus::Yield
-        })
+        Ok(lu.queue.poll(hw_queue, batch))
     }
 
     fn map_queues(tag_set: Pin<&mut TagSet<Self>>) {
