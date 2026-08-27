@@ -146,7 +146,7 @@ impl UfsDma {
         Ok(io_project!(self.utrdl, [try: tag]).copy_read())
     }
 
-    pub(crate) fn tag_from_cq_entry(&self, cqe: &CqEntry, queue_id: u32) -> Result<usize> {
+    pub(crate) fn validate_cq_entry(&self, cqe: &CqEntry, queue_id: u32) -> Result<()> {
         let tag = usize::from(cqe.task_tag());
         if tag >= self.transfer_slots {
             return Err(EINVAL);
@@ -160,7 +160,7 @@ impl UfsDma {
             return Err(EIO);
         }
 
-        Ok(tag)
+        Ok(())
     }
 
     pub(crate) fn fetch_devman_upiu(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {

@@ -2,7 +2,6 @@
 
 //! UFSHCI multi-circular queue transport.
 
-use crate::command::TaskTag;
 use crate::dma::UfsDma;
 use crate::hci::descriptor::{CqEntry, SqEntry};
 use crate::reg::{McqRegisterLayout, UfsMcqOprRegion, UfsMcqOprSet, UfsReg};
@@ -311,19 +310,8 @@ impl McqHardwareQueue {
                 };
 
                 consumed = true;
-                match dma.tag_from_cq_entry(&cqe, self.descriptor.id()) {
-                    Ok(tag) => match TaskTag::from_index(tag) {
-                        Ok(task_tag) => completed_requests.insert_mcq(
-                            task_tag,
-                            self.descriptor.id(),
-                            cqe,
-                        )?,
-                        Err(_) => completed_requests.record_fault(
-                            "invalid MCQ completion task tag",
-                            tag,
-                            Some(self.descriptor.id()),
-                        ),
-                    },
+                match dma.validate_cq_entry(&cqe, self.descriptor.id()) {
+                    Ok(()) => completed_requests.insert_mcq(self.descriptor.id(), cqe)?,
                     Err(_) => completed_requests.record_fault(
                         "invalid MCQ completion descriptor",
                         usize::from(cqe.task_tag()),

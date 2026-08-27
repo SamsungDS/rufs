@@ -10,11 +10,11 @@ pub(crate) const TASK_TAG_COUNT: usize = 1usize << u8::BITS;
 pub(crate) struct TaskTag(u8);
 
 impl TaskTag {
-    pub(crate) fn new(tag: u32) -> Result<Self> {
-        Ok(Self(u8::try_from(tag).map_err(|_| EINVAL)?))
+    pub(crate) const fn from_value(tag: u8) -> Self {
+        Self(tag)
     }
 
-    pub(crate) fn from_index(tag: usize) -> Result<Self> {
+    pub(crate) fn new(tag: u32) -> Result<Self> {
         Ok(Self(u8::try_from(tag).map_err(|_| EINVAL)?))
     }
 

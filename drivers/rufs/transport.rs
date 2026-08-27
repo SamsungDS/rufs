@@ -115,17 +115,14 @@ pub(crate) enum TransferCompletion {
 #[derive(Clone, Copy)]
 pub(crate) enum CompletedRequest {
     Sdb(TaskTag),
-    Mcq {
-        task_tag: TaskTag,
-        queue_id: u32,
-        cqe: CqEntry,
-    },
+    Mcq { queue_id: u32, cqe: CqEntry },
 }
 
 impl CompletedRequest {
     pub(crate) fn task_tag(self) -> TaskTag {
         match self {
-            Self::Sdb(task_tag) | Self::Mcq { task_tag, .. } => task_tag,
+            Self::Sdb(task_tag) => task_tag,
+            Self::Mcq { cqe, .. } => TaskTag::from_value(cqe.task_tag()),
         }
     }
 
@@ -182,17 +179,8 @@ impl CompletedRequests {
         Ok(())
     }
 
-    pub(crate) fn insert_mcq(
-        &mut self,
-        task_tag: TaskTag,
-        queue_id: u32,
-        cqe: CqEntry,
-    ) -> Result<()> {
-        self.insert(CompletedRequest::Mcq {
-            task_tag,
-            queue_id,
-            cqe,
-        })
+    pub(crate) fn insert_mcq(&mut self, queue_id: u32, cqe: CqEntry) -> Result<()> {
+        self.insert(CompletedRequest::Mcq { queue_id, cqe })
     }
 
     pub(crate) fn insert_sdb_mask(&mut self, mut mask: u32) -> Result<u32> {
