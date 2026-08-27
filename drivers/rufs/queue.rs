@@ -826,8 +826,11 @@ impl UfsQueue {
     }
 
     fn completion_pass_limit(&self) -> usize {
-        let active = self.busy_requests();
-        core::cmp::max(1, active.div_ceil(CompletedRequests::capacity()))
+        let queue_depth = self.tags.queue_depth() as usize;
+        core::cmp::max(
+            1,
+            queue_depth.div_ceil(CompletedRequests::capacity()),
+        )
     }
 
     fn recovery_required(&self) -> bool {
