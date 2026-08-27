@@ -583,13 +583,15 @@ impl Operations for UfsLuBlockOps {
     }
 
     fn request_timeout(
-        _tag_set: &TagSet<Self>,
-        request_data: &UfsRequestData,
-        queue_data: &QueueData,
-        _queue_id: u32,
+        tag_set: &TagSet<Self>,
+        queue_id: u32,
         tag: u32,
     ) -> mq::RequestTimeoutStatus {
-        let status = UfsRequestData::timeout(request_data, queue_data, tag);
+        let request = match tag_set.try_tag_to_rq(queue_id, tag) {
+            Ok(Some(request)) => request,
+            Ok(None) | Err(_) => return mq::RequestTimeoutStatus::RetryLater,
+        };
+        let status = UfsRequestData::timeout(&request, tag);
 
         if status {
             mq::RequestTimeoutStatus::Completed

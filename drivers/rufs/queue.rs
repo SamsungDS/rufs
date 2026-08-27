@@ -2,7 +2,7 @@
 
 use crate::command::{CommandOwner, CommandPool, TaskTag, TASK_TAG_COUNT};
 use crate::dma::*;
-use crate::lu::{QueueData, TagSetData, UfsLuBlockOps, UfsRequestData};
+use crate::lu::{TagSetData, UfsLuBlockOps, UfsRequestData};
 use crate::protocol::scsi::*;
 use crate::protocol::{query::UfsDevCmd, UfsCmd};
 use crate::reg::*;
@@ -587,9 +587,9 @@ impl UfsRequestData {
         }
     }
 
-    pub(crate) fn timeout(request_data: &UfsRequestData, queue_data: &QueueData, tag: u32) -> bool {
-        let queue = queue_data.queue_arc().clone();
-        let disposition = request_data.inner.lock().timeout();
+    pub(crate) fn timeout(rq: &mq::Request<UfsLuBlockOps>, tag: u32) -> bool {
+        let queue = rq.queue_data().queue_arc().clone();
+        let disposition = rq.data_ref().inner.lock().timeout();
         let cmd = match disposition {
             TimeoutDisposition::StartRecovery(cmd) => {
                 queue.require_recovery("request timeout", tag as usize);
