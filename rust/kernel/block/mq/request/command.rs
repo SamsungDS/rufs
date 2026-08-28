@@ -52,11 +52,6 @@ pub enum Command {
 }
 
 impl Command {
-    /// Returns this command as a block operation with no additional flags.
-    pub const fn as_opf(self) -> bindings::blk_opf_t {
-        self as bindings::blk_opf_t
-    }
-
     /// Creates a [`Command`] from a raw `u32` value.
     ///
     /// # Safety
