@@ -14,7 +14,7 @@ use kernel::alloc::mempool::MemPool;
 use kernel::block::mq;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;
 use kernel::block::mq::TagSet;
-use kernel::sync::{aref::ARef, Arc, SpinLock};
+use kernel::sync::{Arc, SpinLock};
 use kernel::time::{delay::fsleep, Delta};
 use kernel::types::{OwnableRefCounted, Owned};
 use kernel::workqueue::{self, impl_has_work, new_work, Work, WorkItem};
@@ -468,7 +468,7 @@ impl UfsRequestInner {
 }
 
 struct ResolvedCompletion {
-    rq: ARef<mq::Request<UfsLuBlockOps>>,
+    rq: Owned<mq::Request<UfsLuBlockOps>>,
     task_tag: TaskTag,
     queue_id: u32,
     completion: TransferCompletion,
@@ -613,7 +613,7 @@ impl UfsRequestData {
     }
 
     fn complete(
-        rq: ARef<mq::Request<UfsLuBlockOps>>,
+        rq: Owned<mq::Request<UfsLuBlockOps>>,
         task_tag: TaskTag,
         queue_id: u32,
         completion: TransferCompletion,
@@ -622,7 +622,7 @@ impl UfsRequestData {
     }
 
     fn complete_polled(
-        rq: ARef<mq::Request<UfsLuBlockOps>>,
+        rq: Owned<mq::Request<UfsLuBlockOps>>,
         task_tag: TaskTag,
         queue_id: u32,
         completion: TransferCompletion,
@@ -638,14 +638,18 @@ impl UfsRequestData {
     }
 
     fn complete_with(
-        rq: ARef<mq::Request<UfsLuBlockOps>>,
+        rq: Owned<mq::Request<UfsLuBlockOps>>,
         task_tag: TaskTag,
         queue_id: u32,
         completion: TransferCompletion,
         target: CompletionTarget<'_>,
     ) -> CompletionOutcome {
         let request_queue = rq.queue_data().queue_arc().clone();
-        let (cmd, prdt) = match rq.data_ref().inner.lock().begin_completion(queue_id) {
+        let completion_state = {
+            let mut request = rq.data_ref().inner.lock();
+            request.begin_completion(queue_id)
+        };
+        let (cmd, prdt) = match completion_state {
             Ok(state) => state,
             Err(_) => {
                 pr_err!(
@@ -654,6 +658,9 @@ impl UfsRequestData {
                 );
                 request_queue
                     .require_recovery("completion for inactive request", rq.tag() as usize);
+                // Keep the request owned by the Rust blk-mq abstraction until
+                // recovery decides its final disposition.
+                drop(rq);
                 return CompletionOutcome::RetainedForRecovery;
             }
         };
@@ -665,7 +672,7 @@ impl UfsRequestData {
                     drop(prdt);
                     let status = u32::from(bindings::BLK_STS_IOERR);
                     rq.data_ref().inner.lock().reset();
-                    return Self::end_device_request(rq, request_queue, status);
+                    return Self::end_request(rq, status);
                 };
                 let result = queue.fetch_dev(cmd, task_tag, completion);
                 drop(prdt);
@@ -685,7 +692,7 @@ impl UfsRequestData {
                         u32::from(bindings::BLK_STS_IOERR)
                     }
                 };
-                Self::end_device_request(rq, request_queue, status)
+                Self::end_request(rq, status)
             }
             UfsCmd::SCSI(cmd) => {
                 let Some(lu) = rq.queue_data().logical_unit() else {
@@ -693,7 +700,7 @@ impl UfsRequestData {
                     drop(prdt);
                     let status = u32::from(bindings::BLK_STS_IOERR);
                     rq.data_ref().inner.lock().reset();
-                    return Self::end_device_request(rq, request_queue, status);
+                    return Self::end_request(rq, status);
                 };
                 let queue = &lu.queue;
                 let result = queue.fetch_scsi_completion(task_tag, completion);
@@ -704,20 +711,7 @@ impl UfsRequestData {
         }
     }
 
-    fn end_device_request(
-        rq: ARef<mq::Request<UfsLuBlockOps>>,
-        queue: Arc<UfsQueue>,
-        status: u32,
-    ) -> CompletionOutcome {
-        let tag = rq.tag();
-        let rq = match OwnableRefCounted::try_from_shared(rq) {
-            Ok(rq) => rq,
-            Err(_rq) => {
-                queue.require_recovery("device completion ownership conflict", tag as usize);
-                return CompletionOutcome::RetainedForRecovery;
-            }
-        };
-
+    fn end_request(rq: Owned<mq::Request<UfsLuBlockOps>>, status: u32) -> CompletionOutcome {
         rq.end(u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8));
         CompletionOutcome::Returned
     }
@@ -892,10 +886,7 @@ impl UfsQueue {
         task_tag: TaskTag,
         requeue: bool,
     ) -> Result<bool> {
-        let rq = match self
-            .tags
-            .try_shared_tag_to_rq(u32::from(task_tag.value()))
-        {
+        let rq = match self.take_request_at_task_tag(task_tag) {
             Ok(Some(rq)) => rq,
             Ok(None) | Err(EBUSY) => return Ok(false),
             Err(e) => return Err(e),
@@ -904,7 +895,6 @@ impl UfsQueue {
             .inner
             .lock()
             .prepare_recovery_disposition(requeue)?;
-        let rq = OwnableRefCounted::try_from_shared(rq).map_err(|_| EBUSY)?;
 
         if requeue {
             rq.requeue(true);
@@ -1050,12 +1040,20 @@ impl UfsQueue {
         self.backend.dump_state(tag, reason);
     }
 
-    fn request_at_task_tag(
+    fn take_request_at_task_tag(
         &self,
         task_tag: TaskTag,
-    ) -> Result<Option<ARef<mq::Request<UfsLuBlockOps>>>> {
-        self.tags
-            .try_shared_tag_to_rq(u32::from(task_tag.value()))
+    ) -> Result<Option<Owned<mq::Request<UfsLuBlockOps>>>> {
+        let Some(rq) = self
+            .tags
+            .try_shared_tag_to_rq(u32::from(task_tag.value()))?
+        else {
+            return Ok(None);
+        };
+
+        OwnableRefCounted::try_from_shared(rq)
+            .map(Some)
+            .map_err(|_| EBUSY)
     }
 
     fn resolve_completion(
@@ -1064,7 +1062,7 @@ impl UfsQueue {
     ) -> Option<ResolvedCompletion> {
         let task_tag = request.task_tag();
         let queue_id = request.queue_id();
-        match self.request_at_task_tag(task_tag) {
+        match self.take_request_at_task_tag(task_tag) {
             Ok(Some(rq)) => {
                 if rq.tag() != u32::from(task_tag.value())
                     || rq.queue_index() != queue_id
@@ -1083,8 +1081,12 @@ impl UfsQueue {
                 self.require_recovery("completion tag has no request", task_tag.index());
                 None
             }
+            Err(EBUSY) => {
+                self.require_recovery("completion ownership conflict", task_tag.index());
+                None
+            }
             Err(_) => {
-                self.require_recovery("completion request is not shareable", task_tag.index());
+                self.require_recovery("completion request lookup failed", task_tag.index());
                 None
             }
         }
@@ -1186,7 +1188,7 @@ impl UfsQueue {
         self: &Arc<Self>,
         cmd: UfsSCSICmd,
         result: UfsScsiResult,
-        rq: ARef<mq::Request<UfsLuBlockOps>>,
+        rq: Owned<mq::Request<UfsLuBlockOps>>,
         target: CompletionTarget<'_>,
     ) -> CompletionOutcome {
         let tag = rq.tag();
@@ -1314,19 +1316,14 @@ impl UfsQueue {
                     .is_err()
                 {
                     self.require_recovery("invalid SCSI completion state", tag as usize);
-                    return CompletionOutcome::RetainedForRecovery;
+                    rq.data_ref().inner.lock().reset();
+                    rq.end(bindings::BLK_STS_IOERR as u8);
+                    return CompletionOutcome::Returned;
                 }
-                mq::Request::complete(rq);
+                mq::Request::complete(OwnableRefCounted::into_shared(rq));
                 CompletionOutcome::Returned
             }
             CompletionTarget::Poll(batch) => {
-                let rq = match OwnableRefCounted::try_from_shared(rq) {
-                    Ok(rq) => rq,
-                    Err(_rq) => {
-                        self.require_recovery("polled completion ownership conflict", tag as usize);
-                        return CompletionOutcome::RetainedForRecovery;
-                    }
-                };
                 if rq
                     .data_ref()
                     .inner
@@ -1335,7 +1332,9 @@ impl UfsQueue {
                     .is_err()
                 {
                     self.require_recovery("invalid polled completion state", tag as usize);
-                    return CompletionOutcome::RetainedForRecovery;
+                    rq.data_ref().inner.lock().reset();
+                    rq.end(bindings::BLK_STS_IOERR as u8);
+                    return CompletionOutcome::Returned;
                 }
                 if requeue {
                     rq.requeue(true);

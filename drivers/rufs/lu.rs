@@ -515,6 +515,14 @@ impl Operations for UfsLuBlockOps {
     fn complete(rq: ARef<mq::Request<Self>>) {
         let queue = rq.queue_data().queue_arc().clone();
         let tag = rq.tag() as usize;
+        let rq = match OwnableRefCounted::try_from_shared(rq) {
+            Ok(rq) => rq,
+            Err(_rq) => {
+                pr_err!("[RUFS] ufs_lu: scheduled completion ownership conflict\n");
+                queue.require_recovery("scheduled completion ownership conflict", tag);
+                return;
+            }
+        };
         let disposition = match rq.data_ref().inner.lock().take_scheduled_completion() {
             Ok(disposition) => disposition,
             Err(_) => {
@@ -525,17 +533,11 @@ impl Operations for UfsLuBlockOps {
             }
         };
 
-        match OwnableRefCounted::try_from_shared(rq) {
-            Ok(rq) => match disposition {
-                CompletionDisposition::End(status) => {
-                    rq.end(u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8))
-                }
-                CompletionDisposition::Requeue => rq.requeue(true),
-            },
-            Err(_) => {
-                pr_err!("[RUFS] ufs_lu: scheduled completion ownership conflict\n");
-                queue.require_recovery("scheduled completion ownership conflict", tag);
+        match disposition {
+            CompletionDisposition::End(status) => {
+                rq.end(u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR as u8))
             }
+            CompletionDisposition::Requeue => rq.requeue(true),
         }
     }
 
