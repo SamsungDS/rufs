@@ -371,15 +371,6 @@ impl<T: Operations> Request<T> {
         unsafe { (*self.0 .0.get()).__sector = sector }
     }
 
-    /// Create a DMA mapping iterator for this request.
-    pub fn dma_map_iter<const N: usize>(
-        self: ARef<Self>,
-        device: &Device,
-        mempool: DmaMapMempool<N>,
-    ) -> BlkResult<DmaMapIter<'static, N, T>> {
-        DmaMapIter::new(self, device, mempool)
-    }
-
     /// Return the DMA data direction for this request.
     pub fn dma_direction(&self) -> kernel::dma::DataDirection {
         if self.is_write() {
@@ -572,7 +563,7 @@ impl<T: Operations> Owned<Request<T>> {
         device: &Device,
         mempool: DmaMapMempool<N>,
     ) -> BlkResult<DmaMapIter<'_, N, T>> {
-        DmaMapIter::new_owned(self, device, mempool)
+        DmaMapIter::new(self, device, mempool)
     }
 
     /// Notify the block layer that a request is going to be processed now.

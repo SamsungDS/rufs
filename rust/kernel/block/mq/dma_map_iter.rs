@@ -29,24 +29,8 @@ pub struct DmaMapIter<'a, const N: usize, T: Operations> {
     inner: DmaMapIterInner<'a, N, T>,
 }
 
-impl<const N: usize, T: Operations> DmaMapIter<'static, N, T> {
-    pub(crate) fn new(
-        rq: ARef<Request<T>>,
-        device: &Device,
-        mempool: DmaMapMempool<N>,
-    ) -> BlkResult<Self> {
-        let mut this = Self {
-            iter: Opaque::zeroed(),
-            inner: DmaMapIterInner::new_shared(rq, device, mempool)?,
-        };
-
-        this.start()?;
-        Ok(this)
-    }
-}
-
 impl<'a, const N: usize, T: Operations> DmaMapIter<'a, N, T> {
-    pub(crate) fn new_owned(
+    pub(crate) fn new(
         rq: &'a Request<T>,
         device: &Device,
         mempool: DmaMapMempool<N>,
@@ -126,11 +110,7 @@ impl<'a, const N: usize, T: Operations> DmaMapIter<'a, N, T> {
     /// is dropped. In particular, the caller must drop the mapping before
     /// completing or requeuing the request.
     pub unsafe fn finish_detached(self) -> DmaMapIterMapped<'static, N, T> {
-        let Self {
-            iter: _,
-            mut inner,
-        } = self;
-        inner.request_ref = None;
+        let Self { iter: _, inner } = self;
         // SAFETY: The caller guarantees that request ownership outlives the
         // detached mapping, so the borrow lifetime no longer limits the
         // mapping. `DmaMapIterInner` is otherwise identical for all lifetimes.
@@ -145,30 +125,10 @@ impl<'a, const N: usize, T: Operations> DmaMapIter<'a, N, T> {
 struct DmaMapIterInner<'a, const N: usize, T: Operations> {
     state: Opaque<bindings::dma_iova_state>,
     request: NonNull<Request<T>>,
-    request_ref: Option<ARef<Request<T>>>,
     device: ARef<Device>,
     dma_vectors: MemPoolBox<[DmaVector; N]>,
     dma_vector_count: usize,
     _request: PhantomData<&'a Request<T>>,
-}
-
-impl<const N: usize, T: Operations> DmaMapIterInner<'static, N, T> {
-    fn new_shared(
-        rq: ARef<Request<T>>,
-        device: &Device,
-        mempool: DmaMapMempool<N>,
-    ) -> Result<Self> {
-        let request = NonNull::from(&*rq);
-        Ok(Self {
-            state: Opaque::zeroed(),
-            request,
-            request_ref: Some(rq),
-            device: device.into(),
-            dma_vectors: mempool.alloc_zeroed(GFP_ATOMIC)?,
-            dma_vector_count: 0,
-            _request: PhantomData,
-        })
-    }
 }
 
 impl<'a, const N: usize, T: Operations> DmaMapIterInner<'a, N, T> {
@@ -180,7 +140,6 @@ impl<'a, const N: usize, T: Operations> DmaMapIterInner<'a, N, T> {
         Ok(Self {
             state: Opaque::zeroed(),
             request: NonNull::from(rq),
-            request_ref: None,
             device: device.into(),
             dma_vectors: mempool.alloc_zeroed(GFP_ATOMIC)?,
             dma_vector_count: 0,
@@ -209,9 +168,9 @@ impl<'a, const N: usize, T: Operations> DmaMapIterInner<'a, N, T> {
     }
 
     fn request(&self) -> &Request<T> {
-        // SAFETY: The request is protected by `request_ref` or `_request`'s
-        // borrow. A detached mapping requires its caller to keep the request
-        // driver-owned until the mapping is dropped.
+        // SAFETY: The request is protected by `_request`'s borrow. A detached
+        // mapping requires its caller to keep the request driver-owned until
+        // the mapping is dropped.
         unsafe { self.request.as_ref() }
     }
 }
