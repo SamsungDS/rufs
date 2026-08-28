@@ -351,21 +351,6 @@ impl<T: Operations> TagSet<T> {
         }
     }
 
-    /// Try to obtain a shared reference to a driver-owned request.
-    ///
-    /// Unlike [`TagSet::tag_to_rq`], this method does not wait for a request
-    /// that is currently owned by the block layer or through an exclusive Rust
-    /// reference. It returns [`EBUSY`] instead.
-    pub fn try_tag_to_rq(&self, qid: u32, tag: u32) -> Result<Option<ARef<Request<T>>>> {
-        if qid >= self.hw_queue_count() {
-            return Err(EINVAL);
-        }
-
-        // SAFETY: We checked that `qid` is within bounds.
-        let tags = unsafe { *(*self.inner.get()).tags.add(qid as usize) };
-        Self::try_rq_from_tags(tags, tag)
-    }
-
     /// Try to obtain a request from a tag shared by all hardware queues.
     ///
     /// This method is only valid for tag sets configured with
