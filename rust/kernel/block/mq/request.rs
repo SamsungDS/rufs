@@ -376,7 +376,7 @@ impl<T: Operations> Request<T> {
         self: ARef<Self>,
         device: &Device,
         mempool: DmaMapMempool<N>,
-    ) -> BlkResult<DmaMapIter<N, T>> {
+    ) -> BlkResult<DmaMapIter<'static, N, T>> {
         DmaMapIter::new(self, device, mempool)
     }
 
@@ -566,6 +566,15 @@ unsafe impl<T: Operations> RefCounted for Request<T> {
 }
 
 impl<T: Operations> Owned<Request<T>> {
+    /// Create a DMA mapping iterator while retaining unique request ownership.
+    pub fn dma_map_iter<const N: usize>(
+        &self,
+        device: &Device,
+        mempool: DmaMapMempool<N>,
+    ) -> BlkResult<DmaMapIter<'_, N, T>> {
+        DmaMapIter::new_owned(self, device, mempool)
+    }
+
     /// Notify the block layer that a request is going to be processed now.
     ///
     /// The block layer uses this hook to do proper initializations such as
