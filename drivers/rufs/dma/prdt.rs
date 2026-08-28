@@ -16,7 +16,7 @@ const PRDT_DATA_BYTE_COUNT_PAD: usize = 4;
 const UNMAP_PARAM_LIST_SIZE: usize = 24;
 
 pub(crate) enum UfsPrdtMapping {
-    Sg(DmaMapIterMapped<MAX_PRD_ENTRIES, UfsLuBlockOps>),
+    Sg(DmaMapIterMapped<'static, MAX_PRD_ENTRIES, UfsLuBlockOps>),
     Unmap(UfsUnmapMapping),
 }
 
