@@ -8,6 +8,7 @@ use crate::protocol::scsi::UfsSCSICmd;
 use kernel::block::mq::dma_map_iter::{DmaMapIterMapped, DmaMapMempool};
 use kernel::dma::Coherent;
 use kernel::sync::aref::ARef;
+use kernel::types::Owned;
 use kernel::{block::mq, device, prelude::*};
 
 pub(crate) const PRDT_DATA_BYTE_COUNT_MAX: u32 = 0x00040000;
@@ -34,7 +35,7 @@ impl UfsPrdt {
     pub(crate) fn map(
         dev: &ARef<device::Device>,
         cmd: UfsSCSICmd,
-        rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        rq: &Owned<mq::Request<UfsLuBlockOps>>,
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
     ) -> Result<Self> {
         if cmd.data_len() == 0 {
@@ -49,7 +50,6 @@ impl UfsPrdt {
         }
 
         let mut iter = rq
-            .clone()
             .dma_map_iter(dev, mempool.clone())
             .map_err(|_| ENOMEM)?;
         let mut remaining = cmd.data_len();

@@ -16,6 +16,7 @@ use kernel::dma;
 use kernel::io::io_project;
 use kernel::io::Io;
 use kernel::sync::{aref::ARef, Arc};
+use kernel::types::Owned;
 use kernel::{
     block::mq,
     device::{self, Bound},
@@ -117,7 +118,7 @@ impl UfsDma {
 
     pub(crate) fn compose_scsi_upiu(
         &self,
-        rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        rq: &Owned<mq::Request<UfsLuBlockOps>>,
         cmd: UfsSCSICmd,
         task_tag: u8,
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,

@@ -16,7 +16,7 @@ use kernel::block::mq::dma_map_iter::DmaMapMempool;
 use kernel::block::mq::TagSet;
 use kernel::sync::{aref::ARef, Arc, SpinLock};
 use kernel::time::{delay::fsleep, Delta};
-use kernel::types::OwnableRefCounted;
+use kernel::types::{OwnableRefCounted, Owned};
 use kernel::workqueue::{self, impl_has_work, new_work, Work, WorkItem};
 use kernel::{bindings, new_spinlock, prelude::*};
 
@@ -499,7 +499,7 @@ impl UfsRequestData {
     }
 
     pub(crate) fn compose_dev_request(
-        rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        rq: &Owned<mq::Request<UfsLuBlockOps>>,
     ) -> Result<()> {
         if let Some(queue) = rq.queue_data().dev_queue() {
             let cmd = rq
@@ -517,7 +517,7 @@ impl UfsRequestData {
     }
 
     pub(crate) fn compose_scsi_cmd(
-        rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        rq: &Owned<mq::Request<UfsLuBlockOps>>,
         cmd: UfsSCSICmd,
     ) -> Result<()> {
         let mempool = rq.queue().tag_set().data().dma_vec_mempool.clone();
@@ -529,9 +529,9 @@ impl UfsRequestData {
     }
 
     pub(crate) fn submit(
-        rq: ARef<mq::Request<UfsLuBlockOps>>,
+        rq: Owned<mq::Request<UfsLuBlockOps>>,
         hw_queue: &UfsHwQueue,
-    ) -> core::result::Result<(), (ARef<mq::Request<UfsLuBlockOps>>, Error)> {
+    ) -> core::result::Result<(), (Owned<mq::Request<UfsLuBlockOps>>, Error)> {
         let queue = rq.queue_data().queue_arc().clone();
         let queue_id = hw_queue.id();
         let task_tag = match Self::task_tag(&rq) {
@@ -550,13 +550,14 @@ impl UfsRequestData {
 
         let mut rq = Some(rq);
         let outcome = hw_queue.submit(u32::from(task_tag.value()), polled, || {
-            let request = rq.as_ref().ok_or(EIO)?;
+            let request = rq.as_mut().ok_or(EIO)?;
             request.data_ref().inner.lock().mark_in_flight(queue_id)?;
 
-            // Drop the submit-side reference at the publish boundary. From
-            // this point hardware may complete the command immediately and
-            // completion must be able to recover unique request ownership.
-            drop(rq.take());
+            // Park unique ownership in the blk-mq tag map at the publication
+            // boundary. No submit-side request reference remains live when
+            // hardware can observe the task tag.
+            let request = rq.take().ok_or(EIO)?;
+            drop(request);
             Ok(())
         });
 
@@ -1002,7 +1003,7 @@ impl UfsQueue {
     }
 
     fn compose_scsi(
-        rq: &ARef<mq::Request<UfsLuBlockOps>>,
+        rq: &Owned<mq::Request<UfsLuBlockOps>>,
         cmd: UfsSCSICmd,
         task_tag: TaskTag,
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,

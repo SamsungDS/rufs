@@ -264,21 +264,8 @@ pub(crate) struct UfsLuBlockOps;
 //
 // Because the command was not submitted, no hardware completion can race with
 // returning the request to blk-mq.
-fn complete_unsubmitted(rq: ARef<mq::Request<UfsLuBlockOps>>, e: Error) {
-    let queue = rq.queue_data().queue_arc().clone();
-    let tag = rq.tag() as usize;
-
+fn complete_unsubmitted(rq: Owned<mq::Request<UfsLuBlockOps>>, e: Error) {
     rq.data_ref().inner.lock().reset();
-    let Ok(rq) = OwnableRefCounted::try_from_shared(rq) else {
-        pr_err!(
-            "[RUFS] ufs_lu: unsubmitted request ownership conflict tag={}\n",
-            tag,
-        );
-        // TODO: Error handling must decide the final request disposition after
-        // quiescing the queue and excluding every competing request owner.
-        queue.require_recovery("unsubmitted request ownership conflict", tag);
-        return;
-    };
 
     if e == EBUSY {
         rq.requeue(true);
@@ -483,7 +470,7 @@ impl Operations for UfsLuBlockOps {
                 cmd
             }
             mq::Command::DriverIn | mq::Command::DriverOut => {
-                let rq = OwnableRefCounted::into_shared(rq.start());
+                let rq = rq.start();
                 if let Err(e) = UfsRequestData::compose_dev_request(&rq) {
                     complete_unsubmitted(rq, e);
                     return Ok(());
@@ -500,11 +487,7 @@ impl Operations for UfsLuBlockOps {
             }
         };
 
-        // Make the request discoverable through its blk-mq tag while composing
-        // it. Submission drops this temporary reference before exposing the
-        // command to hardware. Completion later recovers unique ownership from
-        // the same tag after releasing the DMA mapping.
-        let rq = OwnableRefCounted::into_shared(rq.start());
+        let rq = rq.start();
 
         if let Err(e) = UfsRequestData::compose_scsi_cmd(&rq, cmd) {
             complete_unsubmitted(rq, e);
