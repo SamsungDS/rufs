@@ -99,7 +99,8 @@ pub(crate) struct UfsHost {
 impl UfsHost {
     pub(crate) fn new<'a>(
         resources: Arc<HostResources>,
-        controller_irq: irq::IrqRequest<'a>,
+        uic_irq: irq::IrqRequest<'a>,
+        queue_irq: irq::IrqRequest<'a>,
     ) -> impl PinInit<Self, Error> + 'a {
         pin_init_scope(move || {
             let reg = UfsReg::new(resources.clone())?;
@@ -137,12 +138,7 @@ impl UfsHost {
             enable_hba_controller(&resources, &reg)?;
 
             /* ufshcd_link_startup() */
-            irq.request_controller_irq(
-                controller_irq,
-                reg.clone(),
-                uic.clone(),
-                interrupt_policy,
-            )?;
+            irq.request_uic_irq(uic_irq, reg.clone(), uic.clone(), interrupt_policy)?;
             let mut retries = LINK_STARTUP_RETRIES;
             loop {
                 match start_link(&resources, &reg, &uic)? {
@@ -186,7 +182,15 @@ impl UfsHost {
                 init_guard.dismiss();
 
                 /* ufshcd_verify_dev_init */
-                host.irq.attach_queue(host.queue.clone())?;
+                host.irq.request_queue_irq(
+                    queue_irq,
+                    host.reg.clone(),
+                    host.queue.clone(),
+                    interrupt_policy,
+                )?;
+                // Transfer and backend completion interrupts must not become
+                // visible before their handler owns a live queue.
+                host.queue.enable_interrupts();
                 host.dev.verify_dev_init()?;
                 host.dev.complete_dev_init()?;
                 host.dev.device_params_init()?;

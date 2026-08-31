@@ -722,8 +722,11 @@ impl platform::Driver for UfsQcom {
                 mcq,
                 KBox::new(platform, GFP_KERNEL)? as KBox<dyn UfsVariantOps>,
             )?;
-            let controller_irq = pdev.irq_by_index(0)?;
-            let host = UfsHost::new(resources, controller_irq);
+            // The UIC and transfer handlers are independent shared actions on
+            // the controller's global interrupt.
+            let uic_irq = pdev.irq_by_index(0)?;
+            let queue_irq = pdev.irq_by_index(0)?;
+            let host = UfsHost::new(resources, uic_irq, queue_irq);
 
             Ok(try_pin_init!(UfsQcomData { pdev, host <- host }))
         })

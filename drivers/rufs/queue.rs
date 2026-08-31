@@ -820,6 +820,10 @@ impl UfsQueue {
         work.flush();
     }
 
+    pub(crate) fn enable_interrupts(&self) {
+        self.backend.enable_interrupts();
+    }
+
     fn completion_pass_limit(&self) -> usize {
         let queue_depth = self.tags.queue_depth() as usize;
         core::cmp::max(
@@ -858,12 +862,13 @@ impl UfsQueue {
         self.uic.link_startup()?;
         variant.link_startup_notify(&self.reg, &self.uic, NotifyPhase::Post)?;
 
-        // Restore the common UTRL/UTMRL state before backend-specific state.
-        // In particular, MCQ activation programs queue registers and enables
-        // MCQ interrupts on top of an operational controller, matching the
-        // order used during initial host bring-up.
+        // Restore the common UTRL/UTMRL state and backend-specific state
+        // before re-enabling their interrupts. The queue handler remains
+        // registered throughout recovery, matching the ordering used during
+        // initial host bring-up.
         self.dma.make_hba_operational()?;
         self.backend.reset()?;
+        self.enable_interrupts();
 
         if let Err(e) = self.restore_power_mode(variant) {
             pr_warn!(

@@ -569,7 +569,6 @@ impl McqTransferBackend {
             u32::try_from(self.queue_depth()).map_err(|_| EOVERFLOW)?,
         )?;
         self.enable();
-        self.reg.enable_mcq_interrupts();
         Ok(())
     }
 
@@ -601,6 +600,11 @@ impl UfsTransferOps for McqTransferBackend {
 
     fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()> {
         McqTransferBackend::collect_completions(self, completed)
+    }
+
+    fn enable_interrupts(&self) {
+        self.reg.enable_transfer_interrupts();
+        self.reg.enable_mcq_interrupts()
     }
 
     fn reset(&self) -> Result<()> {

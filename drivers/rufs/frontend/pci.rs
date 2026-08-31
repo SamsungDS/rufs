@@ -140,11 +140,13 @@ impl pci::Driver for UfsPci {
                 None,
                 variant,
             )?;
-            // Until MCQ ESI routing is implemented, all UIC and transfer
-            // completions use the controller's single global interrupt.
+            // Until MCQ ESI routing is implemented, the independently
+            // registered UIC and transfer handlers share the controller IRQ.
             let irq_vectors = pdev.alloc_irq_vectors(1, 1, pci::IrqTypes::all())?;
-            let controller_irq = (*irq_vectors.start()).try_into()?;
-            let host = UfsHost::new(resources, controller_irq);
+            let controller_vector = *irq_vectors.start();
+            let uic_irq = controller_vector.try_into()?;
+            let queue_irq = controller_vector.try_into()?;
+            let host = UfsHost::new(resources, uic_irq, queue_irq);
 
             pr_info!("rufs: probe done");
 

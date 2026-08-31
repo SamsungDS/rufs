@@ -1429,7 +1429,7 @@ impl UfsReg {
         self.write_is(value & (UTP_TRANSFER_REQ_COMPL | MCQ_CQ_EVENT_STATUS | ERROR_MASK));
     }
 
-    pub(crate) fn enable_interrupts(&self) {
+    pub(crate) fn enable_transfer_interrupts(&self) {
         self.write_ie(self.read_ie() | UTP_REQ_COMPL_MASK | ERROR_MASK);
     }
 

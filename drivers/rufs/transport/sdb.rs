@@ -139,6 +139,10 @@ impl UfsTransferOps for SdbTransferBackend {
         )
     }
 
+    fn enable_interrupts(&self) {
+        self.reg.enable_transfer_interrupts()
+    }
+
     fn reset(&self) -> Result<()> {
         *self.state.completion.lock() = SdbCompletionState::default();
         Ok(())

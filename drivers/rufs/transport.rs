@@ -285,6 +285,7 @@ pub(crate) trait UfsTransferOps: Send + Sync {
     fn hw_queues(&self) -> Result<KVec<UfsHwQueue>>;
     fn dump_state(&self, tag: usize, reason: &str);
     fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()>;
+    fn enable_interrupts(&self);
     fn reset(&self) -> Result<()>;
 }
 
@@ -329,6 +330,10 @@ impl UfsTransferBackend {
 
     pub(crate) fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()> {
         self.ops.collect_completions(completed)
+    }
+
+    pub(crate) fn enable_interrupts(&self) {
+        self.ops.enable_interrupts()
     }
 
     pub(crate) fn dump_state(&self, tag: usize, reason: &str) {
