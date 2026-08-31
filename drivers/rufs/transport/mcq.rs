@@ -94,6 +94,15 @@ impl UfsMcqQueueDescriptor {
         &self.oprs
     }
 
+    fn acknowledge_completion_events(&self, reg: &UfsReg) -> Result<bool> {
+        let status = reg.read_mcq_cqis(self.oprs(), self.id() as usize)?;
+        if status != 0 {
+            reg.write_mcq_cqis(self.oprs(), self.id() as usize, status)?;
+        }
+
+        Ok(status != 0)
+    }
+
     fn offset_to_slot(&self, offset: u32, entry_size: u32) -> Result<u32> {
         if offset % entry_size != 0 {
             return Err(EINVAL);
@@ -188,15 +197,6 @@ impl UfsMcqCompletionQueue {
 
     fn is_empty(&self) -> bool {
         self.cq_head_slot == self.cq_tail_slot
-    }
-
-    fn acknowledge_events(&self, reg: &UfsReg, descriptor: &UfsMcqQueueDescriptor) -> Result<()> {
-        let status = reg.read_mcq_cqis(descriptor.oprs(), descriptor.id() as usize)?;
-        if status != 0 {
-            reg.write_mcq_cqis(descriptor.oprs(), descriptor.id() as usize, status)?;
-        }
-
-        Ok(())
     }
 
     fn reset(&mut self) {
@@ -295,6 +295,7 @@ impl McqHardwareQueue {
         completed_requests: &mut CompletedRequests,
     ) -> Result<()> {
         let mut completion = self.completion.lock();
+        self.descriptor.acknowledge_completion_events(reg)?;
         completion.update_tail(reg, &self.descriptor)?;
         barrier::dma_rmb();
         let mut consumed = false;
@@ -324,7 +325,6 @@ impl McqHardwareQueue {
         if consumed {
             completion.commit_head(reg, &self.descriptor)?;
         }
-        completion.acknowledge_events(reg, &self.descriptor)?;
 
         result
     }
@@ -354,6 +354,30 @@ impl McqHwQueue {
         if !self.poll {
             return Err(EINVAL);
         }
+        self.queue
+            .collect_completions(&self.reg, &self.dma, completed)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct McqInterruptQueue {
+    reg: Arc<UfsReg>,
+    dma: Arc<UfsDma>,
+    queue: Arc<McqHardwareQueue>,
+}
+
+impl McqInterruptQueue {
+    pub(crate) fn id(&self) -> u32 {
+        self.queue.descriptor.id()
+    }
+
+    pub(crate) fn acknowledge_completion(&self) -> Result<bool> {
+        self.queue
+            .descriptor
+            .acknowledge_completion_events(&self.reg)
+    }
+
+    pub(crate) fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()> {
         self.queue
             .collect_completions(&self.reg, &self.dma, completed)
     }
@@ -533,6 +557,25 @@ impl McqTransferBackend {
         self.queues.len()
     }
 
+    pub(crate) fn interrupt_queues(&self) -> Result<KVec<McqInterruptQueue>> {
+        let mut interrupt_queues = KVec::new();
+        for queue in self.queues.queues.iter().take(self.config.interrupt_queues) {
+            interrupt_queues.push(
+                McqInterruptQueue {
+                    reg: self.reg.clone(),
+                    dma: self.dma.clone(),
+                    queue: queue.clone(),
+                },
+                GFP_KERNEL,
+            )?;
+        }
+        if interrupt_queues.len() != self.config.interrupt_queues {
+            return Err(EINVAL);
+        }
+
+        Ok(interrupt_queues)
+    }
+
     fn hw_queues(&self) -> Result<KVec<UfsHwQueue>> {
         let mut hw_queues = KVec::new();
         for queue in self.queues.queues.iter() {
@@ -551,12 +594,11 @@ impl McqTransferBackend {
     }
 
     fn prepare(&self) -> Result<()> {
-        self.queues
-            .configure_registers_with_interrupt_queues(
-                &self.reg,
-                &self.register_layout,
-                self.config.interrupt_queues,
-            )
+        self.queues.configure_registers_with_interrupt_queues(
+            &self.reg,
+            &self.register_layout,
+            self.config.interrupt_queues,
+        )
     }
 
     fn enable(&self) {

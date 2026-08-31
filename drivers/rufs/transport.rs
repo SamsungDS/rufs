@@ -13,6 +13,7 @@ use kernel::sync::Arc;
 pub(crate) mod mcq;
 pub(crate) mod sdb;
 
+pub(crate) use mcq::McqInterruptQueue;
 use mcq::{McqHwQueue, McqTransferBackend};
 use sdb::{SdbHwQueue, SdbTransferBackend};
 
@@ -291,6 +292,7 @@ pub(crate) trait UfsTransferOps: Send + Sync {
 
 pub(crate) struct UfsTransferBackend {
     ops: KBox<dyn UfsTransferOps>,
+    interrupt_queues: KVec<McqInterruptQueue>,
 }
 
 impl UfsTransferBackend {
@@ -299,13 +301,18 @@ impl UfsTransferBackend {
         reg: Arc<UfsReg>,
         dma: Arc<UfsDma>,
     ) -> Result<Self> {
-        let ops = match config {
+        let (ops, interrupt_queues) = match config {
             UfsTransferConfig::Sdb { .. } => {
                 pr_info!("[RUFS] ufs_queue: use SDB backend\n");
-                KBox::new(SdbTransferBackend::new(reg)?, GFP_KERNEL)? as KBox<dyn UfsTransferOps>
+                (
+                    KBox::new(SdbTransferBackend::new(reg)?, GFP_KERNEL)?
+                        as KBox<dyn UfsTransferOps>,
+                    KVec::new(),
+                )
             }
             UfsTransferConfig::Mcq(config) => {
-                let backend = McqTransferBackend::new(config, reg, dma)?;
+                let backend = KBox::new(McqTransferBackend::new(config, reg, dma)?, GFP_KERNEL)?;
+                let interrupt_queues = backend.interrupt_queues()?;
                 backend.activate()?;
                 pr_info!(
                     "[RUFS] ufs_queue: MCQ backend enabled queues={}/{} interrupt={} poll={} allocated={} depth={} ring_entries={}\n",
@@ -317,11 +324,14 @@ impl UfsTransferBackend {
                     backend.queue_depth(),
                     config.ring_entries,
                 );
-                KBox::new(backend, GFP_KERNEL)? as KBox<dyn UfsTransferOps>
+                (backend as KBox<dyn UfsTransferOps>, interrupt_queues)
             }
         };
 
-        Ok(Self { ops })
+        Ok(Self {
+            ops,
+            interrupt_queues,
+        })
     }
 
     pub(crate) fn hw_queues(&self) -> Result<KVec<UfsHwQueue>> {
@@ -330,6 +340,10 @@ impl UfsTransferBackend {
 
     pub(crate) fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()> {
         self.ops.collect_completions(completed)
+    }
+
+    pub(crate) fn interrupt_queues(&self) -> &[McqInterruptQueue] {
+        &self.interrupt_queues
     }
 
     pub(crate) fn enable_interrupts(&self) {

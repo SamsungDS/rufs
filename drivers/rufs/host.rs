@@ -264,6 +264,14 @@ impl UfsHost {
         Ok(())
     }
 
+    pub(crate) fn request_mcq_queue_irqs<'a, F>(&self, request: F) -> Result<()>
+    where
+        F: FnMut() -> Result<irq::IrqRequest<'a>>,
+    {
+        self.irq
+            .request_mcq_queue_irqs(self.queue.clone(), self.queue.interrupt_queues(), request)
+    }
+
     pub(crate) fn shutdown(&self) {
         if !self.begin_shutdown() {
             return;

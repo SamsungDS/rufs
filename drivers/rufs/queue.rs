@@ -1041,6 +1041,10 @@ impl UfsQueue {
         self.backend.collect_completions(completed)
     }
 
+    pub(crate) fn interrupt_queues(&self) -> &[McqInterruptQueue] {
+        self.backend.interrupt_queues()
+    }
+
     fn dump_backend_state(&self, tag: usize, reason: &str) {
         self.backend.dump_state(tag, reason);
     }
@@ -1097,7 +1101,10 @@ impl UfsQueue {
         }
     }
 
-    pub(crate) fn complete(self: &Arc<Self>) -> bool {
+    fn complete_from<F>(self: &Arc<Self>, mut collect: F, queue_id: Option<u32>) -> bool
+    where
+        F: FnMut(&mut CompletedRequests) -> Result<()>,
+    {
         if self.recovery_required() {
             return false;
         }
@@ -1110,7 +1117,7 @@ impl UfsQueue {
         let mut any_completed = false;
         for _ in 0..self.completion_pass_limit() {
             let mut requests = CompletedRequests::new();
-            let collect_result = self.collect_backend_completions(&mut requests);
+            let collect_result = collect(&mut requests);
 
             let batch_full = requests.is_full();
             while let Some(request) = requests.take_next() {
@@ -1128,12 +1135,22 @@ impl UfsQueue {
                 return any_completed;
             }
             if let Err(e) = collect_result {
-                pr_err!(
-                    "[RUFS] ufs_queue: collect completions failed errno={}\n",
-                    e.to_errno(),
-                );
-                self.dump_backend_state(0, "collect completions failed");
-                self.require_recovery("completion collection failed", 0);
+                if let Some(queue_id) = queue_id {
+                    pr_err!(
+                        "[RUFS] ufs_queue: collect queue {} completions failed errno={}\n",
+                        queue_id,
+                        e.to_errno(),
+                    );
+                    self.dump_backend_state(0, "collect queue failed");
+                    self.require_mcq_recovery(queue_id, 0);
+                } else {
+                    pr_err!(
+                        "[RUFS] ufs_queue: collect completions failed errno={}\n",
+                        e.to_errno(),
+                    );
+                    self.dump_backend_state(0, "collect completions failed");
+                    self.require_recovery("completion collection failed", 0);
+                }
                 return any_completed;
             }
             if !batch_full {
@@ -1142,6 +1159,18 @@ impl UfsQueue {
         }
 
         any_completed
+    }
+
+    pub(crate) fn complete(self: &Arc<Self>) -> bool {
+        self.complete_from(|requests| self.collect_backend_completions(requests), None)
+    }
+
+    pub(crate) fn complete_queue(self: &Arc<Self>, interrupt_queue: &McqInterruptQueue) -> bool {
+        let queue_id = interrupt_queue.id();
+        self.complete_from(
+            |requests| interrupt_queue.collect_completions(requests),
+            Some(queue_id),
+        )
     }
 
     pub(crate) fn poll(
