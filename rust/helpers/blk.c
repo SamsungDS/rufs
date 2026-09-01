@@ -63,11 +63,25 @@ rust_helper_blk_rq_nr_phys_segments(struct request *rq)
 	return blk_rq_nr_phys_segments(rq);
 }
 
-__rust_helper bool rust_helper_blk_rq_dma_unmap(struct request *req,
-						struct device *dma_dev,
-						struct dma_iova_state *state,
-						size_t mapped_len,
-						enum pci_p2pdma_map_type map)
+__rust_helper bool
+rust_helper_blk_dma_unmap(struct device *dma_dev,
+			  struct dma_iova_state *state,
+			  size_t mapped_len,
+			  enum pci_p2pdma_map_type map,
+			  enum dma_data_direction dir)
 {
-	return blk_rq_dma_unmap(req, dma_dev, state, mapped_len, map);
+	if (map == PCI_P2PDMA_MAP_BUS_ADDR)
+		return true;
+
+	if (dma_use_iova(state)) {
+		unsigned int attrs = 0;
+
+		if (map == PCI_P2PDMA_MAP_THRU_HOST_BRIDGE)
+			attrs |= DMA_ATTR_MMIO;
+
+		dma_iova_destroy(dma_dev, state, mapped_len, dir, attrs);
+		return true;
+	}
+
+	return !dma_need_unmap(dma_dev);
 }
