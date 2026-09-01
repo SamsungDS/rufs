@@ -2,6 +2,8 @@
 
 //! SCSI command and completion protocol definitions.
 
+use kernel::prelude::*;
+
 pub(crate) const UFS_SENSE_SIZE: usize = 18;
 
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +58,43 @@ const SYNCHRONIZE_CACHE: u8 = 0x35;
 const UNMAP: u8 = 0x42;
 const READ_16: u8 = 0x88;
 const WRITE_16: u8 = 0x8a;
+
+#[repr(C)]
+#[derive(Clone, Copy, IntoBytes)]
+pub(crate) struct UfsUnmapParameterList {
+    data_length: [u8; 2],
+    block_descriptor_data_length: [u8; 2],
+    reserved_header: [u8; 4],
+    lba: [u8; 8],
+    blocks: [u8; 4],
+    reserved_descriptor: [u8; 4],
+}
+
+impl UfsUnmapParameterList {
+    pub(crate) const SIZE: usize = size_of::<Self>();
+
+    pub(crate) fn new(lba: u64, blocks: u32) -> Result<Self> {
+        if blocks == 0 {
+            return Err(EINVAL);
+        }
+
+        Ok(Self {
+            data_length: 22u16.to_be_bytes(),
+            block_descriptor_data_length: 16u16.to_be_bytes(),
+            reserved_header: [0; 4],
+            lba: lba.to_be_bytes(),
+            blocks: blocks.to_be_bytes(),
+            reserved_descriptor: [0; 4],
+        })
+    }
+}
+
+// SAFETY: `UfsUnmapParameterList` contains only byte arrays and has no
+// padding, invalid bit patterns, or interior pointers.
+unsafe impl kernel::transmute::AsBytes for UfsUnmapParameterList {}
+unsafe impl kernel::transmute::FromBytes for UfsUnmapParameterList {}
+
+const _: () = assert!(UfsUnmapParameterList::SIZE == 24);
 
 #[derive(PartialEq, Copy, Clone, Debug)]
 pub(crate) enum UfsScsiDataDirection {
@@ -202,7 +241,7 @@ impl UfsSCSICmd {
 
     pub(crate) fn unmap(lun: u8, lba: u64, blocks: u32) -> Self {
         let mut cdb = [0u8; 16];
-        let data_len = 24u32;
+        let data_len = UfsUnmapParameterList::SIZE as u32;
         cdb[0] = UNMAP;
         cdb[7..9].copy_from_slice(&(data_len as u16).to_be_bytes());
 
