@@ -128,6 +128,8 @@
 
 /// DMA mapping iterator for block requests.
 pub mod dma_map_iter;
+/// Single-buffer DMA mappings detached from a block request borrow.
+pub mod dma_map_single;
 mod feature;
 pub mod gen_disk;
 mod operations;
