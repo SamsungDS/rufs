@@ -62,7 +62,7 @@ impl SdbHwQueue {
         } else {
             state.polled &= !mask;
         }
-        barrier::dma_wmb();
+        barrier::dma_mb(barrier::Write);
         self.reg.ring_utrl_doorbell(tag);
         SubmissionOutcome::Submitted
     }
@@ -107,7 +107,7 @@ impl SdbTransferBackend {
             SdbCompletionSource::Poll => completed & state.polled,
         };
         if eligible != 0 {
-            barrier::dma_rmb();
+            barrier::dma_mb(barrier::Read);
         }
         let collected = requests.insert_sdb_mask(eligible)?;
 

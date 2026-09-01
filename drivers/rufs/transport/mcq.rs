@@ -281,7 +281,7 @@ impl McqHardwareQueue {
             return SubmissionOutcome::NotSubmitted(e);
         }
 
-        barrier::dma_wmb();
+        barrier::dma_mb(barrier::Write);
         match reg.write_mcq_sq_tail(self.descriptor.oprs(), self.descriptor.id() as usize, tail) {
             Ok(()) => SubmissionOutcome::Submitted,
             Err(e) => SubmissionOutcome::PublishFailed(e),
@@ -297,7 +297,7 @@ impl McqHardwareQueue {
         let mut completion = self.completion.lock();
         self.descriptor.acknowledge_completion_events(reg)?;
         completion.update_tail(reg, &self.descriptor)?;
-        barrier::dma_rmb();
+        barrier::dma_mb(barrier::Read);
         let mut consumed = false;
         let result = (|| {
             while !completion.is_empty() && !completed_requests.is_full() {
