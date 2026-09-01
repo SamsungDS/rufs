@@ -12,6 +12,7 @@ use crate::protocol::upiu::Upiu;
 use crate::protocol::UfsCmd;
 use crate::reg::*;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;
+use kernel::block::mq::dma_map_single::{DetachedStreaming, DetachedStreamingInFlight};
 use kernel::dma;
 use kernel::io::io_project;
 use kernel::io::Io;
@@ -23,10 +24,10 @@ use kernel::{
     prelude::*,
 };
 
-use crate::hci::descriptor::{Ucd, Utmrd, UtpOcs, Utrd};
-use prdt::UfsPrdt;
 pub(crate) use crate::hci::descriptor::{CqEntry, MAX_PRD_ENTRIES};
-pub(crate) use prdt::{UfsPrdtMapping, PRDT_DATA_BYTE_COUNT_MAX};
+use crate::hci::descriptor::{PrdEntry, Ucd, Utmrd, UtpOcs, Utrd};
+use prdt::UfsPrdt;
+pub(crate) use prdt::{UfsActiveMapping, UfsPreparedMapping, PRDT_DATA_BYTE_COUNT_MAX};
 
 pub(crate) struct UfsDma {
     reg: Arc<UfsReg>,
@@ -123,18 +124,28 @@ impl UfsDma {
         cmd: UfsSCSICmd,
         task_tag: u8,
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
-    ) -> Result<Option<UfsPrdtMapping>> {
-        let prdt = UfsPrdt::map(&self.dev, cmd, rq, mempool)?;
+    ) -> Result<UfsPreparedMapping> {
         let tag = usize::from(task_tag);
+        let mut write_entry = |index, entry| {
+            io_project!(self.ucdl, [try: tag].prdt[try: index]).copy_write(entry);
+            Ok(())
+        };
+        let prdt = if cmd.is_unmap() {
+            let mapping = self.prepare_unmap(cmd)?;
+            let dma_handle = mapping.dma_handle();
+            let dma_size = mapping.size() as u32;
+            let prdt = UfsPrdt::single(mapping);
+            let entry = PrdEntry::new(dma_handle, dma_size)?;
+            write_entry(0, entry)?;
+            prdt
+        } else {
+            UfsPrdt::map(&self.dev, cmd, rq, mempool, &mut write_entry)?
+        };
 
         io_project!(self.ucdl, [try: tag].cmd_upiu).copy_write(Upiu::command(cmd, tag));
         io_project!(self.ucdl, [try: tag].rsp_upiu).copy_write(Upiu::default());
 
-        for (i, entry) in prdt.entries().iter().enumerate() {
-            io_project!(self.ucdl, [try: tag].prdt[try: i]).copy_write(*entry);
-        }
-
-        let prd_entries = prdt.entries().len();
+        let prd_entries = prdt.entry_count();
         let utrd = io_project!(self.utrdl, [try: tag]).copy_read();
         let utrd = utrd
             .build(UfsCmd::SCSI(cmd))
@@ -142,6 +153,23 @@ impl UfsDma {
         io_project!(self.utrdl, [try: tag]).copy_write(utrd);
 
         Ok(prdt.into_mapping())
+    }
+
+    fn prepare_unmap(
+        &self,
+        cmd: UfsSCSICmd,
+    ) -> Result<DetachedStreamingInFlight<KBox<UfsUnmapParameterList>>> {
+        let params = UfsUnmapParameterList::new(cmd.unmap_lba(), cmd.unmap_blocks())?;
+        let buffer = KBox::new(params, GFP_ATOMIC).map_err(|_| EBUSY)?;
+
+        // SAFETY: RUFS drains or safely abandons every request mapping before
+        // its bound frontend instance is dropped. An in-flight mapping whose
+        // controller cannot be stopped leaks its storage and device reference.
+        let mapping =
+            unsafe { DetachedStreaming::new(&self.dev, buffer, dma::DataDirection::ToDevice) }
+                .map_err(map_single_dma_error)?;
+
+        Ok(mapping.submit())
     }
 
     pub(crate) fn transfer_request_desc(&self, tag: usize) -> Result<Utrd> {
@@ -233,5 +261,15 @@ impl UfsDma {
             Ok(rsp_upiu) => rsp_upiu.scsi_result(ocs),
             Err(_) => UfsScsiResult::error(UtpOcs::InvalidCommandStatus as u8),
         }
+    }
+}
+
+fn map_single_dma_error(error: Error) -> Error {
+    if error == EIO {
+        // Match the block DMA iterator: a DMA API mapping failure is a
+        // transient resource shortage and should be retried by blk-mq.
+        EBUSY
+    } else {
+        error
     }
 }

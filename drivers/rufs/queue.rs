@@ -181,16 +181,16 @@ enum UfsRequestState {
     Idle,
     Prepared {
         cmd: UfsCmd,
-        prdt: Option<UfsPrdtMapping>,
+        mapping: UfsPreparedMapping,
     },
     InFlight {
         cmd: UfsCmd,
-        prdt: Option<UfsPrdtMapping>,
+        mapping: UfsActiveMapping,
         queue_id: u32,
     },
     Recovering {
         cmd: UfsCmd,
-        prdt: Option<UfsPrdtMapping>,
+        mapping: UfsActiveMapping,
         queue_id: u32,
     },
     Completing,
@@ -249,6 +249,10 @@ struct RecoveryCause {
     tag: usize,
 }
 
+/// Proof that the controller can no longer access previously published DMA
+/// mappings.
+struct DmaAccessEnded;
+
 enum RecoveryState {
     Operational,
     Requested(RecoveryCause),
@@ -291,17 +295,20 @@ impl UfsRequestInner {
         if !matches!(cmd, UfsCmd::Device(_)) || !matches!(self.state, UfsRequestState::Idle) {
             return Err(EINVAL);
         }
-        self.state = UfsRequestState::Prepared { cmd, prdt: None };
+        self.state = UfsRequestState::Prepared {
+            cmd,
+            mapping: UfsPreparedMapping::None,
+        };
         Ok(())
     }
 
-    fn prepare_scsi(&mut self, cmd: UfsSCSICmd, prdt: Option<UfsPrdtMapping>) -> Result<()> {
+    fn prepare_scsi(&mut self, cmd: UfsSCSICmd, mapping: UfsPreparedMapping) -> Result<()> {
         if !matches!(self.state, UfsRequestState::Idle) {
             return Err(EBUSY);
         }
         self.state = UfsRequestState::Prepared {
             cmd: UfsCmd::SCSI(cmd),
-            prdt,
+            mapping,
         };
         Ok(())
     }
@@ -316,9 +323,9 @@ impl UfsRequestInner {
     fn mark_in_flight(&mut self, queue_id: u32) -> Result<()> {
         let state = core::mem::replace(&mut self.state, UfsRequestState::Idle);
         self.state = match state {
-            UfsRequestState::Prepared { cmd, prdt } => UfsRequestState::InFlight {
+            UfsRequestState::Prepared { cmd, mapping } => UfsRequestState::InFlight {
                 cmd,
-                prdt,
+                mapping: mapping.publish(),
                 queue_id,
             },
             state => {
@@ -329,21 +336,21 @@ impl UfsRequestInner {
         Ok(())
     }
 
-    fn begin_completion(&mut self, queue_id: u32) -> Result<(UfsCmd, Option<UfsPrdtMapping>)> {
+    fn begin_completion(&mut self, queue_id: u32) -> Result<(UfsCmd, UfsActiveMapping)> {
         let state = core::mem::replace(&mut self.state, UfsRequestState::Idle);
         match state {
             UfsRequestState::InFlight {
                 cmd,
-                prdt,
+                mapping,
                 queue_id: submitted_queue,
             }
             | UfsRequestState::Recovering {
                 cmd,
-                prdt,
+                mapping,
                 queue_id: submitted_queue,
             } if submitted_queue == queue_id => {
                 self.state = UfsRequestState::Completing;
-                Ok((cmd, prdt))
+                Ok((cmd, mapping))
             }
             state => {
                 self.state = state;
@@ -355,30 +362,30 @@ impl UfsRequestInner {
     fn timeout(&mut self) -> TimeoutDisposition {
         let state = core::mem::replace(&mut self.state, UfsRequestState::Idle);
         match state {
-            UfsRequestState::Prepared { cmd, prdt } => {
-                self.state = UfsRequestState::Prepared { cmd, prdt };
+            UfsRequestState::Prepared { cmd, mapping } => {
+                self.state = UfsRequestState::Prepared { cmd, mapping };
                 TimeoutDisposition::Pending(cmd)
             }
             UfsRequestState::InFlight {
                 cmd,
-                prdt,
+                mapping,
                 queue_id,
             } => {
                 self.state = UfsRequestState::Recovering {
                     cmd,
-                    prdt,
+                    mapping,
                     queue_id,
                 };
                 TimeoutDisposition::StartRecovery(cmd)
             }
             UfsRequestState::Recovering {
                 cmd,
-                prdt,
+                mapping,
                 queue_id,
             } => {
                 self.state = UfsRequestState::Recovering {
                     cmd,
-                    prdt,
+                    mapping,
                     queue_id,
                 };
                 TimeoutDisposition::Recovering(cmd)
@@ -440,22 +447,38 @@ impl UfsRequestInner {
         self.state = UfsRequestState::Idle;
     }
 
-    fn prepare_recovery_disposition(&mut self, requeue: bool) -> Result<()> {
+    fn prepare_recovery_disposition(
+        &mut self,
+        requeue: bool,
+        dma_ended: Option<&DmaAccessEnded>,
+    ) -> Result<()> {
         let state = core::mem::replace(&mut self.state, UfsRequestState::Idle);
         match state {
             UfsRequestState::InFlight {
                 cmd,
-                prdt,
+                mapping,
                 queue_id: _,
             }
             | UfsRequestState::Recovering {
                 cmd,
-                prdt,
+                mapping,
                 queue_id: _,
             } => {
-                drop(prdt);
+                if dma_ended.is_some() {
+                    // SAFETY: `DmaAccessEnded` is created only after the
+                    // controller has invalidated all previously published
+                    // commands.
+                    unsafe { mapping.complete() };
+                } else {
+                    // The controller did not stop, so dropping the active
+                    // wrapper deliberately leaks its mapping.
+                    drop(mapping);
+                }
                 if requeue && matches!(cmd, UfsCmd::Device(_)) {
-                    self.state = UfsRequestState::Prepared { cmd, prdt: None };
+                    self.state = UfsRequestState::Prepared {
+                        cmd,
+                        mapping: UfsPreparedMapping::None,
+                    };
                 }
                 Ok(())
             }
@@ -465,6 +488,12 @@ impl UfsRequestInner {
             }
         }
     }
+}
+
+fn complete_dma_mapping(mapping: UfsActiveMapping) {
+    // SAFETY: Callers invoke this only after consuming a hardware completion
+    // for the command that owns the mapping.
+    unsafe { mapping.complete() };
 }
 
 struct ResolvedCompletion {
@@ -522,9 +551,9 @@ impl UfsRequestData {
     ) -> Result<()> {
         let mempool = rq.queue().tag_set().data().dma_vec_mempool.clone();
         let task_tag = Self::task_tag(rq)?;
-        let prdt = UfsQueue::compose_scsi(rq, cmd, task_tag, &mempool)?;
+        let mapping = UfsQueue::compose_scsi(rq, cmd, task_tag, &mempool)?;
 
-        rq.data_ref().inner.lock().prepare_scsi(cmd, prdt)?;
+        rq.data_ref().inner.lock().prepare_scsi(cmd, mapping)?;
         Ok(())
     }
 
@@ -649,7 +678,7 @@ impl UfsRequestData {
             let mut request = rq.data_ref().inner.lock();
             request.begin_completion(queue_id)
         };
-        let (cmd, prdt) = match completion_state {
+        let (cmd, mapping) = match completion_state {
             Ok(state) => state,
             Err(_) => {
                 pr_err!(
@@ -669,13 +698,13 @@ impl UfsRequestData {
             UfsCmd::Device(cmd) => {
                 let Some(queue) = rq.queue_data().dev_queue() else {
                     pr_err!("[RUFS] ufs_queue: device request has invalid context\n");
-                    drop(prdt);
+                    complete_dma_mapping(mapping);
                     let status = u32::from(bindings::BLK_STS_IOERR);
                     rq.data_ref().inner.lock().reset();
                     return Self::end_request(rq, status);
                 };
                 let result = queue.fetch_dev(cmd, task_tag, completion);
-                drop(prdt);
+                complete_dma_mapping(mapping);
                 let status = match result {
                     Ok(UfsCmd::Device(cmd)) => {
                         if rq.data_ref().inner.lock().complete_device(cmd).is_err() {
@@ -697,14 +726,14 @@ impl UfsRequestData {
             UfsCmd::SCSI(cmd) => {
                 let Some(lu) = rq.queue_data().logical_unit() else {
                     pr_err!("[RUFS] ufs_queue: SCSI request has invalid context\n");
-                    drop(prdt);
+                    complete_dma_mapping(mapping);
                     let status = u32::from(bindings::BLK_STS_IOERR);
                     rq.data_ref().inner.lock().reset();
                     return Self::end_request(rq, status);
                 };
                 let queue = &lu.queue;
                 let result = queue.fetch_scsi_completion(task_tag, completion);
-                drop(prdt);
+                complete_dma_mapping(mapping);
 
                 queue.clone().complete_scsi(cmd, result, rq, target)
             }
@@ -759,11 +788,10 @@ impl UfsQueue {
             TagSetData {
                 queue_map,
                 hw_queues,
-                // Every active hardware command may retain one detached DMA mapping
-                // until completion. Reserve enough vector storage to make
-                // that mapping lifetime independent of atomic allocation
-                // success under memory pressure.
-                dma_vec_mempool: MemPool::new(queue_depth)?,
+                // One reserved vector array guarantees forward progress under
+                // memory pressure. Additional allocation failures are returned
+                // to blk-mq as resource shortages and retried.
+                dma_vec_mempool: MemPool::new(1)?,
             },
             GFP_KERNEL,
         )?;
@@ -836,7 +864,7 @@ impl UfsQueue {
         self.recovery.lock().cause().is_some()
     }
 
-    fn stop_controller(&self) -> Result<()> {
+    fn stop_controller(&self) -> Result<DmaAccessEnded> {
         self.reg.disable_interrupts();
         self.reg.clear_all_interrupts();
         self.reg.disable_run_stop();
@@ -844,39 +872,46 @@ impl UfsQueue {
             self.reg.ctrl_disable();
             self.reg.wait_for_ctrl_disable(10, 10)?;
         }
-        Ok(())
+        Ok(DmaAccessEnded)
     }
 
-    fn reset_controller(&self) -> Result<()> {
-        self.stop_controller()?;
+    fn reset_controller(&self) -> (Option<DmaAccessEnded>, Result<()>) {
+        let dma_ended = match self.stop_controller() {
+            Ok(dma_ended) => dma_ended,
+            Err(e) => return (None, Err(e)),
+        };
 
-        let variant = self.resources.variant();
-        variant.device_reset()?;
-        variant.hce_enable_notify(&self.reg, NotifyPhase::Pre)?;
-        self.reg.ctrl_enable();
-        fsleep(Delta::from_micros(HBA_ENABLE_DELAY_US));
-        self.reg.wait_for_ctrl_enable(1000, 50)?;
-        variant.hce_enable_notify(&self.reg, NotifyPhase::Post)?;
+        let result = (|| {
+            let variant = self.resources.variant();
+            variant.device_reset()?;
+            variant.hce_enable_notify(&self.reg, NotifyPhase::Pre)?;
+            self.reg.ctrl_enable();
+            fsleep(Delta::from_micros(HBA_ENABLE_DELAY_US));
+            self.reg.wait_for_ctrl_enable(1000, 50)?;
+            variant.hce_enable_notify(&self.reg, NotifyPhase::Post)?;
 
-        variant.link_startup_notify(&self.reg, &self.uic, NotifyPhase::Pre)?;
-        self.uic.link_startup()?;
-        variant.link_startup_notify(&self.reg, &self.uic, NotifyPhase::Post)?;
+            variant.link_startup_notify(&self.reg, &self.uic, NotifyPhase::Pre)?;
+            self.uic.link_startup()?;
+            variant.link_startup_notify(&self.reg, &self.uic, NotifyPhase::Post)?;
 
-        // Restore the common UTRL/UTMRL state and backend-specific state
-        // before re-enabling their interrupts. The queue handler remains
-        // registered throughout recovery, matching the ordering used during
-        // initial host bring-up.
-        self.dma.make_hba_operational()?;
-        self.backend.reset()?;
-        self.enable_interrupts();
+            // Restore the common UTRL/UTMRL state and backend-specific state
+            // before re-enabling their interrupts. The queue handler remains
+            // registered throughout recovery, matching the ordering used
+            // during initial host bring-up.
+            self.dma.make_hba_operational()?;
+            self.backend.reset()?;
+            self.enable_interrupts();
 
-        if let Err(e) = self.restore_power_mode(variant) {
-            pr_warn!(
-                "[RUFS] ufs_queue: recovery power mode restore failed errno={}, continue\n",
-                e.to_errno(),
-            );
-        }
-        Ok(())
+            if let Err(e) = self.restore_power_mode(variant) {
+                pr_warn!(
+                    "[RUFS] ufs_queue: recovery power mode restore failed errno={}, continue\n",
+                    e.to_errno(),
+                );
+            }
+            Ok(())
+        })();
+
+        (Some(dma_ended), result)
     }
 
     fn restore_power_mode(&self, variant: &dyn UfsVariantOps) -> Result<()> {
@@ -890,6 +925,7 @@ impl UfsQueue {
         &self,
         task_tag: TaskTag,
         requeue: bool,
+        dma_ended: Option<&DmaAccessEnded>,
     ) -> Result<bool> {
         let rq = match self.take_request_at_task_tag(task_tag) {
             Ok(Some(rq)) => rq,
@@ -899,7 +935,7 @@ impl UfsQueue {
         rq.data_ref()
             .inner
             .lock()
-            .prepare_recovery_disposition(requeue)?;
+            .prepare_recovery_disposition(requeue, dma_ended)?;
 
         if requeue {
             rq.requeue(true);
@@ -909,7 +945,11 @@ impl UfsQueue {
         Ok(true)
     }
 
-    fn dispose_recovery_requests(&self, requeue: bool) -> Result<usize> {
+    fn dispose_recovery_requests(
+        &self,
+        requeue: bool,
+        dma_ended: Option<&DmaAccessEnded>,
+    ) -> Result<usize> {
         self.tags.wait_completed_requests();
         let expected = self.busy_requests();
         let mut disposed = 0;
@@ -917,7 +957,7 @@ impl UfsQueue {
 
         for tag in 0..self.tags.queue_depth() {
             let task_tag = TaskTag::new(tag)?;
-            match self.dispose_recovery_request(task_tag, requeue) {
+            match self.dispose_recovery_request(task_tag, requeue, dma_ended) {
                 Ok(true) => disposed += 1,
                 Ok(false) => continue,
                 Err(e) => {
@@ -1002,7 +1042,7 @@ impl UfsQueue {
         cmd: UfsSCSICmd,
         task_tag: TaskTag,
         mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
-    ) -> Result<Option<UfsPrdtMapping>> {
+    ) -> Result<UfsPreparedMapping> {
         let queue = rq.queue_data().queue();
 
         queue
@@ -1432,12 +1472,14 @@ impl WorkItem for UfsQueue {
         // controller instance unreachable. Only after that boundary may RUFS
         // return their blk-mq tags: requeue them when the new link is usable,
         // or finish them with I/O error when reset failed.
-        let reset = this.reset_controller();
+        let (mut dma_ended, reset) = this.reset_controller();
         let requeue = reset.is_ok();
         if reset.is_err() {
-            let _ = this.stop_controller();
+            if let Ok(stopped) = this.stop_controller() {
+                dma_ended = Some(stopped);
+            }
         }
-        let disposition = this.dispose_recovery_requests(requeue);
+        let disposition = this.dispose_recovery_requests(requeue, dma_ended.as_ref());
 
         match (reset, disposition) {
             (Ok(()), Ok(disposed)) => {
