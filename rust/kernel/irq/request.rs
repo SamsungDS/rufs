@@ -432,6 +432,23 @@ impl<'a, T: ThreadedHandler> ThreadedRegistration<'a, T> {
         &self.handler
     }
 
+    /// Wakes the IRQ thread associated with this registration.
+    ///
+    /// The generic IRQ layer coalesces the wakeup if the thread is already
+    /// pending or running.
+    pub fn wake_thread(&self) -> Result {
+        // SAFETY: These are the IRQ and cookie used to register this action.
+        // The shared reference guarantees that the registration remains alive
+        // for this call.
+        unsafe {
+            bindings::irq_wake_thread(
+                self.request.irq,
+                core::ptr::from_ref(self).cast_mut().cast(),
+            )
+        };
+        Ok(())
+    }
+
     /// Wait for pending IRQ handlers on other CPUs.
     #[inline]
     pub fn synchronize(&self) {
