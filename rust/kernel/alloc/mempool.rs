@@ -220,6 +220,16 @@ impl<T> DerefMut for MemPoolBox<T> {
     }
 }
 
+// SAFETY: The kernel mempool implementation serializes access to its internal
+// state. Moving a pool between threads is therefore safe when its elements can
+// be moved between threads.
+unsafe impl<T: Send> Send for MemPool<T> {}
+
+// SAFETY: The kernel mempool implementation serializes access to its internal
+// state. Sharing a pool between threads is therefore safe when its elements can
+// be shared between threads.
+unsafe impl<T: Sync> Sync for MemPool<T> {}
+
 #[macros::kunit_tests(rust_mempool)]
 mod tests {
     use super::*;
