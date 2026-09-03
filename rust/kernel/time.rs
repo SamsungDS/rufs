@@ -500,4 +500,11 @@ impl Delta {
             }
         }
     }
+
+    /// Return this duration converted to jiffies.
+    #[inline]
+    pub(crate) fn as_jiffies(self) -> Jiffies {
+        // SAFETY: `nsecs_to_jiffies` accepts every `u64` nanosecond value.
+        unsafe { bindings::nsecs_to_jiffies(self.as_nanos() as u64) }
+    }
 }
