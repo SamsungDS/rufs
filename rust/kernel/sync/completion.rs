@@ -6,7 +6,7 @@
 //!
 //! C header: [`include/linux/completion.h`](srctree/include/linux/completion.h)
 
-use crate::{bindings, prelude::*, types::Opaque};
+use crate::{bindings, prelude::*, time::Delta, types::Opaque};
 
 /// Synchronization primitive to signal when a certain task has been completed.
 ///
@@ -100,6 +100,19 @@ impl Completion {
         unsafe { bindings::complete_all(self.as_raw()) };
     }
 
+    /// Signal one task waiting on this completion.
+    pub fn complete(&self) {
+        // SAFETY: `self.as_raw()` points to a valid `struct completion`.
+        unsafe { bindings::complete(self.as_raw()) };
+    }
+
+    /// Reinitialize this completion for reuse.
+    pub fn reinit(&self) {
+        // SAFETY: `self.as_raw()` points to a valid `struct completion` and
+        // the caller has exclusive control over its reinitialization protocol.
+        unsafe { bindings::reinit_completion(self.as_raw()) };
+    }
+
     /// Wait for completion of a task.
     ///
     /// This method waits for the completion of a task; it is not interruptible and there is no
@@ -110,5 +123,14 @@ impl Completion {
     pub fn wait_for_completion(&self) {
         // SAFETY: `self.as_raw()` is a pointer to a valid `struct completion`.
         unsafe { bindings::wait_for_completion(self.as_raw()) };
+    }
+
+    /// Wait for completion of a task until `timeout` expires.
+    ///
+    /// Returns zero on timeout or the remaining timeout in jiffies when the
+    /// completion is observed.
+    pub fn wait_for_completion_timeout(&self, timeout: Delta) -> usize {
+        // SAFETY: `self.as_raw()` points to a valid `struct completion`.
+        unsafe { bindings::wait_for_completion_timeout(self.as_raw(), timeout.as_jiffies()) }
     }
 }
