@@ -458,6 +458,20 @@ impl<T: ThreadedHandler> ThreadedRegistration<T> {
         &self.handler
     }
 
+    /// Wakes the IRQ thread associated with this registration.
+    ///
+    /// The generic IRQ layer coalesces the wakeup if the thread is already
+    /// pending or running.
+    pub fn wake_thread(&self) -> Result {
+        let inner = self.inner.try_access().ok_or(ENODEV)?;
+
+        // SAFETY: These are the IRQ and cookie used to register this action.
+        // `try_access` guarantees that the devres-owned registration remains
+        // alive for this call.
+        unsafe { bindings::irq_wake_thread(inner.irq, inner.cookie) };
+        Ok(())
+    }
+
     /// Wait for pending IRQ handlers on other CPUs.
     ///
     /// This will attempt to access the inner [`Devres`] container.
