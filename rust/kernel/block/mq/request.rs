@@ -585,6 +585,19 @@ impl<T: Operations> Owned<Request<T>> {
         // layer.
         unsafe { bindings::blk_mq_end_request(request_ptr, status) };
     }
+
+    /// Requeue this request at the block layer.
+    ///
+    /// If `kick_requeue_list` is true, this method schedules processing of the
+    /// requeue list on a workqueue.
+    pub fn requeue(self, kick_requeue_list: bool) {
+        let request_ptr = self.0 .0.get();
+        core::mem::forget(self);
+
+        // SAFETY: By type invariant, the wrapped request is valid. Consuming
+        // `self` transfers the uniquely owned request back to the block layer.
+        unsafe { bindings::blk_mq_requeue_request(request_ptr, kick_requeue_list) };
+    }
 }
 
 impl<T: Operations> Ownable for Request<T> {
