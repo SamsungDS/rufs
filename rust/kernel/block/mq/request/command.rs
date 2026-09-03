@@ -68,3 +68,26 @@ impl Command {
         unsafe { core::mem::transmute(self) }
     }
 }
+
+impl kernel::fmt::Display for Command {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let name = match self {
+            Command::Read => "Read",
+            Command::Write => "Write",
+            Command::Flush => "Flush",
+            Command::Discard => "Discard",
+            Command::SecureErase => "SecureErase",
+            Command::ZoneAppend => "ZoneAppend",
+            Command::WriteZeroes => "WriteZeroes",
+            Command::ZoneOpen => "ZoneOpen",
+            Command::ZoneClose => "ZoneClose",
+            Command::ZoneFinish => "ZoneFinish",
+            Command::ZoneReset => "ZoneReset",
+            Command::ZoneResetAll => "ZoneResetAll",
+            Command::DriverIn => "DriverIn",
+            Command::DriverOut => "DriverOut",
+        };
+
+        f.write_str(name)
+    }
+}
