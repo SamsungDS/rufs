@@ -162,6 +162,26 @@ impl<'a> IrqVectorRegistration<'a> {
         // SAFETY: `irq` is a valid IRQ number for `self.dev`, resolved from this registration.
         Ok(unsafe { IrqVector::new(IrqRequest::new(self.dev.as_ref(), irq as u32), self) })
     }
+
+    /// Returns an IRQ request whose lifetime is tied to the PCI device.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep this vector registration alive until every IRQ
+    /// registration created from the returned request has been dropped.
+    pub unsafe fn request(&self, index: usize) -> Result<IrqRequest<'a>> {
+        let index = u32::try_from(index)?;
+
+        // SAFETY: `self.dev.as_raw()` is a valid pointer to a `struct pci_dev`.
+        let irq = unsafe { bindings::pci_irq_vector(self.dev.as_raw(), index) };
+        if irq < 0 {
+            return Err(Error::from_errno(irq));
+        }
+
+        // SAFETY: `irq` names a vector allocated by this registration for
+        // `self.dev`. The caller keeps the allocation alive for the request.
+        Ok(unsafe { IrqRequest::new(self.dev.as_ref(), irq as u32) })
+    }
 }
 
 impl Drop for IrqVectorRegistration<'_> {
