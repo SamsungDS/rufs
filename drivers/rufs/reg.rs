@@ -223,8 +223,6 @@ const ERROR_MASK: u32 = UIC_ERROR
     | CRYPTO_ENGINE_FATAL_ERROR
     | UTP_ERROR;
 
-const INT_AGGR_STATUS_BIT: u32 = 1 << 20;
-const INT_AGGR_ENABLE: u32 = 1 << 31;
 const UIC_ERROR_FLAG: u32 = 1 << 31;
 const UIC_DL_PA_INIT_ERROR: u32 = 1 << 13;
 const UIC_NL_ERROR_CODE_MASK: u32 = 0x7;
@@ -1336,7 +1334,6 @@ impl UfsReg {
 
     #[inline]
     pub(crate) fn wait_for_ctrl_enable(&self, interval_us: i64, timeout_ms: i64) -> Result<()> {
-        pr_info!("[RUFS] drivers/rufs/ufs_reg: wait_for_ctrl_enable");
         match read_poll_timeout(
             || {
                 let access = self.resources.hci_access()?;
@@ -1436,16 +1433,6 @@ impl UfsReg {
     pub(crate) fn disable_transfer_req_int_aggr(&self) {
         let access = self.resources.hci_access().unwrap();
         access.write_reg(UTP_TRANSFER_REQ_INT_AGG_CONTROL::zeroed().with_value(0 as u32));
-        let value = access.read(UTP_TRANSFER_REQ_INT_AGG_CONTROL).value().get();
-        let int_enable = (value & INT_AGGR_ENABLE) != 0;
-        let int_status = (value & INT_AGGR_STATUS_BIT) != 0;
-
-        pr_info!(
-            "[RUFS] ufs_reg: transfer request interrupt aggregation raw=0x{:08x} enabled={} status={}\n",
-            value,
-            int_enable,
-            int_status,
-        );
     }
 
     pub(crate) fn enable_mcq_interrupts(&self) {

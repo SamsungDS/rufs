@@ -303,7 +303,6 @@ impl UfsTransferBackend {
     ) -> Result<Self> {
         let (ops, interrupt_queues) = match config {
             UfsTransferConfig::Sdb { .. } => {
-                pr_info!("[RUFS] ufs_queue: use SDB backend\n");
                 (
                     KBox::new(SdbTransferBackend::new(reg)?, GFP_KERNEL)?
                         as KBox<dyn UfsTransferOps>,

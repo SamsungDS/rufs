@@ -368,7 +368,6 @@ impl Operations for UfsLuBlockOps {
                 let geometry = lu.geometry();
                 let mask = geometry.sectors_per_block() - 1;
                 if sectors == 0 {
-                    pr_debug!("[RUFS] ufs_lu: zero-length request on LU {}\n", lu.lun());
                     rq.start().end_ok();
                     return Ok(());
                 }
@@ -401,22 +400,12 @@ impl Operations for UfsLuBlockOps {
                 let lba = geometry.sectors_to_logical(sector);
                 let blocks = geometry.sectors_to_logical(u64::from(sectors));
                 let cmd = lu.build_scsi_cmd(command, lba, blocks)?;
-
-                pr_debug!(
-                    "[RUFS] ufs_lu: LU {} command={} lba={} blocks={}\n",
-                    lu.lun(),
-                    command,
-                    lba,
-                    blocks,
-                );
-
                 cmd
             }
             mq::Command::Flush => {
                 let Some(lu) = lu.logical_unit() else {
                     return Err(BLK_STS_IOERR);
                 };
-                pr_debug!("[RUFS] ufs_lu: flush request on LU {}\n", lu.lun());
                 lu.build_scsi_cmd(command, 0, 0)?
             }
             mq::Command::Discard => {
@@ -426,7 +415,6 @@ impl Operations for UfsLuBlockOps {
                 let geometry = lu.geometry();
                 let mask = geometry.sectors_per_block() - 1;
                 if sectors == 0 {
-                    pr_debug!("[RUFS] ufs_lu: zero-length discard on LU {}\n", lu.lun());
                     rq.start().end_ok();
                     return Ok(());
                 }
@@ -459,14 +447,6 @@ impl Operations for UfsLuBlockOps {
                 let lba = geometry.sectors_to_logical(sector);
                 let blocks = geometry.sectors_to_logical(u64::from(sectors));
                 let cmd = lu.build_scsi_cmd(command, lba, blocks)?;
-
-                pr_debug!(
-                    "[RUFS] ufs_lu: discard LU {} lba={} blocks={}\n",
-                    lu.lun(),
-                    lba,
-                    blocks,
-                );
-
                 cmd
             }
             mq::Command::DriverIn | mq::Command::DriverOut => {

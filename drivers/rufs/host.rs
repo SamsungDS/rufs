@@ -131,7 +131,6 @@ impl UfsHost {
             };
 
             if reg.ctrl_enabled() {
-                pr_info!("[RUFS] ufs_host: controller is active, stop before enable\n");
                 stop_hba_controller(&reg);
             }
 
@@ -250,7 +249,7 @@ impl UfsHost {
             lu.init_disk()?;
 
             pr_info!(
-                "[RUFS] ufs_host: allocated LU {} capacity={} logical_block_size={} queue_depth={}",
+                "[RUFS] ufs_host: allocated LU {} capacity={} logical_block_size={} queue_depth={}\n",
                 lun,
                 geometry.capacity_blocks(),
                 geometry.logical_block_size(),

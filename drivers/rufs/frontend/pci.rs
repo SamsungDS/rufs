@@ -120,7 +120,7 @@ impl pci::Driver for UfsPci {
     ) -> impl PinInit<Self::Data<'a>, Error> + 'a {
         pin_init::pin_init_scope(move || {
             pr_info!(
-                "rufs: probe: platform={} vendor={} device=0x{:04x} subvendor=0x{:04x} subdevice=0x{:04x} class={} revision=0x{:02x}",
+                "rufs: probe: platform={} vendor={} device=0x{:04x} subvendor=0x{:04x} subdevice=0x{:04x} class={} revision=0x{:02x}\n",
                 platform.name(),
                 pdev.vendor_id(),
                 pdev.device_id(),
@@ -151,14 +151,11 @@ impl pci::Driver for UfsPci {
                 host.request_mcq_queue_irqs(|| controller_vector.try_into())
             });
 
-            pr_info!("rufs: probe done");
-
             Ok(try_pin_init!(UfsPciData { pdev, host <- host}))
         })
     }
 
-    fn unbind(pdev: &pci::Device<Core<'_>>, this: Pin<&Self::Data<'_>>) {
-        dev_dbg!(pdev.as_ref(), "Remove Rust UFS driver.\n");
+    fn unbind(_pdev: &pci::Device<Core<'_>>, this: Pin<&Self::Data<'_>>) {
         this.host.shutdown();
     }
 }
