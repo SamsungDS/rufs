@@ -76,6 +76,19 @@ impl<'a> IrqRequest<'a> {
     pub fn irq(&self) -> u32 {
         self.irq
     }
+
+    /// Creates another request for the same interrupt.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the interrupt remains allocated for every
+    /// registration created from the returned request.
+    pub unsafe fn duplicate(&self) -> Self {
+        Self {
+            irq: self.irq,
+            _dev: PhantomData,
+        }
+    }
 }
 
 /// A registration of an IRQ handler for a given IRQ line.
