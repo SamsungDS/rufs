@@ -1,0 +1,275 @@
+// SPDX-License-Identifier: GPL-2.0
+
+#![allow(dead_code)]
+#![allow(unused_variables)]
+
+mod prdt;
+
+use crate::lu::UfsLuBlockOps;
+use crate::protocol::query::*;
+use crate::protocol::scsi::*;
+use crate::protocol::upiu::Upiu;
+use crate::protocol::UfsCmd;
+use crate::reg::*;
+use kernel::block::mq::dma_map_iter::DmaMapMempool;
+use kernel::block::mq::dma_map_single::{DetachedStreaming, DetachedStreamingInFlight};
+use kernel::dma;
+use kernel::io::io_project;
+use kernel::io::Io;
+use kernel::sync::{aref::ARef, Arc};
+use kernel::types::Owned;
+use kernel::{
+    block::mq,
+    device::{self, Bound},
+    prelude::*,
+};
+
+pub(crate) use crate::hci::descriptor::{CqEntry, MAX_PRD_ENTRIES};
+use crate::hci::descriptor::{PrdEntry, Ucd, Utmrd, UtpOcs, Utrd};
+use prdt::UfsPrdt;
+pub(crate) use prdt::{UfsActiveMapping, UfsPreparedMapping, PRDT_DATA_BYTE_COUNT_MAX};
+
+pub(crate) struct UfsDma {
+    reg: Arc<UfsReg>,
+    dev: ARef<device::Device>,
+    transfer_slots: usize,
+    ucdl: dma::Coherent<[Ucd]>,
+    utrdl: dma::Coherent<[Utrd]>,
+    utmrdl: dma::Coherent<[Utmrd]>,
+}
+
+impl UfsDma {
+    pub(crate) fn dev(&self) -> &device::Device<Bound> {
+        // SAFETY: `UfsDma` is owned by the bound RUFS driver instance. MCQ queue
+        // allocations only use this reference while the driver owns the device.
+        unsafe { self.dev.as_bound() }
+    }
+
+    pub(crate) fn new(
+        dev: &device::Device<Bound>,
+        reg: Arc<UfsReg>,
+        transfer_slots: usize,
+    ) -> Result<Arc<Self>> {
+        if transfer_slots == 0 {
+            return Err(EINVAL);
+        }
+        let ucdl = dma::Coherent::<Ucd>::zeroed_slice_zerocopy(dev, transfer_slots, GFP_KERNEL)?;
+
+        let utrdl = dma::Coherent::<Utrd>::zeroed_slice_zerocopy(dev, transfer_slots, GFP_KERNEL)?;
+
+        for tag in 0..transfer_slots {
+            // The controller DMA-reads the UTP command descriptor for this tag,
+            // so this must be the descriptor's DMA (bus) address, not its CPU
+            // virtual address. `ucdl` is a contiguous slice, so element `tag`
+            // sits at `tag * size_of::<Ucd>()` bytes from the DMA base.
+            let command_desc_base_addr = io_project!(ucdl, [try: tag]).dma_address();
+
+            let utrd = io_project!(utrdl, [try: tag])
+                .copy_read()
+                .set_command_descriptor(command_desc_base_addr);
+            io_project!(
+                utrdl,
+                [try: tag]
+            )
+            .copy_write(utrd);
+        }
+
+        let nutmrs = reg.nutmrs();
+        let utmrdl = dma::Coherent::<Utmrd>::zeroed_slice_zerocopy(dev, nutmrs, GFP_KERNEL)?;
+
+        Ok(Arc::new(
+            Self {
+                reg,
+                dev: dev.into(),
+                transfer_slots,
+                ucdl,
+                utrdl,
+                utmrdl,
+            },
+            GFP_KERNEL,
+        )?)
+    }
+
+    pub(crate) fn transfer_slots(&self) -> usize {
+        self.transfer_slots
+    }
+
+    pub(crate) fn make_hba_operational(&self) -> Result<()> {
+        // Keep transfer interrupts disabled until the queue and its handler
+        // have both been installed by the host initialization path.
+        self.reg.disable_transfer_req_int_aggr();
+
+        self.reg.set_utrdl_base(self.utrdl.dma_address());
+        self.reg.set_utmrdl_base(self.utmrdl.dma_address());
+
+        self.reg.wait_for_request_ready(1000, 50)?;
+        self.reg.enable_run_stop();
+
+        Ok(())
+    }
+
+    pub(crate) fn compose_devman_upiu(&self, cmd: UfsDevCmd, tag: u32) -> Result<()> {
+        let tag = tag as usize;
+        io_project!(self.ucdl, [try: tag].cmd_upiu).copy_write(Upiu::device(cmd, tag));
+        io_project!(self.ucdl, [try: tag].rsp_upiu).copy_write(Upiu::default());
+
+        let utrd = io_project!(self.utrdl, [try: tag]).copy_read();
+        io_project!(self.utrdl, [try: tag]).copy_write(utrd.build(UfsCmd::Device(cmd)));
+        Ok(())
+    }
+
+    pub(crate) fn compose_scsi_upiu(
+        &self,
+        rq: &Owned<mq::Request<UfsLuBlockOps>>,
+        cmd: UfsSCSICmd,
+        task_tag: u8,
+        mempool: &DmaMapMempool<MAX_PRD_ENTRIES>,
+    ) -> Result<UfsPreparedMapping> {
+        let tag = usize::from(task_tag);
+        let mut write_entry = |index, entry| {
+            io_project!(self.ucdl, [try: tag].prdt[try: index]).copy_write(entry);
+            Ok(())
+        };
+        let prdt = if cmd.is_unmap() {
+            let mapping = self.prepare_unmap(cmd)?;
+            let dma_handle = mapping.dma_handle();
+            let dma_size = mapping.size() as u32;
+            let prdt = UfsPrdt::single(mapping);
+            let entry = PrdEntry::new(dma_handle, dma_size)?;
+            write_entry(0, entry)?;
+            prdt
+        } else {
+            UfsPrdt::map(&self.dev, cmd, rq, mempool, &mut write_entry)?
+        };
+
+        io_project!(self.ucdl, [try: tag].cmd_upiu).copy_write(Upiu::command(cmd, tag));
+        io_project!(self.ucdl, [try: tag].rsp_upiu).copy_write(Upiu::default());
+
+        let prd_entries = prdt.entry_count();
+        let utrd = io_project!(self.utrdl, [try: tag]).copy_read();
+        let utrd = utrd
+            .build(UfsCmd::Scsi(cmd))
+            .set_prd_table_length(prd_entries)?;
+        io_project!(self.utrdl, [try: tag]).copy_write(utrd);
+
+        Ok(prdt.into_mapping())
+    }
+
+    fn prepare_unmap(
+        &self,
+        cmd: UfsSCSICmd,
+    ) -> Result<DetachedStreamingInFlight<KBox<UfsUnmapParameterList>>> {
+        let params = UfsUnmapParameterList::new(cmd.unmap_lba(), cmd.unmap_blocks())?;
+        let buffer = KBox::new(params, GFP_ATOMIC).map_err(|_| EBUSY)?;
+
+        // SAFETY: RUFS drains or safely abandons every request mapping before
+        // its bound frontend instance is dropped. An in-flight mapping whose
+        // controller cannot be stopped leaks its storage and device reference.
+        let mapping =
+            unsafe { DetachedStreaming::new(&self.dev, buffer, dma::DataDirection::ToDevice) }
+                .map_err(map_single_dma_error)?;
+
+        Ok(mapping.submit())
+    }
+
+    pub(crate) fn transfer_request_desc(&self, tag: usize) -> Result<Utrd> {
+        Ok(io_project!(self.utrdl, [try: tag]).copy_read())
+    }
+
+    pub(crate) fn validate_cq_entry(&self, cqe: &CqEntry, queue_id: u32) -> Result<()> {
+        let tag = usize::from(cqe.task_tag());
+        if tag >= self.transfer_slots {
+            return Err(EINVAL);
+        }
+        if u32::from(cqe.submission_queue_id()) != queue_id {
+            return Err(EINVAL);
+        }
+
+        let expected = io_project!(self.ucdl, [try: tag]).dma_address();
+        if !cqe.matches_ucd_base_addr(expected) {
+            return Err(EIO);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn fetch_devman_upiu(&self, cmd: UfsDevCmd, tag: usize) -> Result<UfsCmd> {
+        let utrd = io_project!(self.utrdl, [try: tag]).copy_read();
+        utrd.check_response()?;
+
+        let rsp_upiu = io_project!(self.ucdl, [try: tag].rsp_upiu).copy_read();
+        let cmd = rsp_upiu.fetch_dev(cmd)?;
+
+        Ok(UfsCmd::Device(cmd))
+    }
+
+    pub(crate) fn fetch_mcq_devman_upiu(
+        &self,
+        cmd: UfsDevCmd,
+        tag: usize,
+        cqe: CqEntry,
+    ) -> Result<UfsCmd> {
+        match cqe.overall_status().into() {
+            UtpOcs::Success => {}
+            UtpOcs::InvalidCmdTableAttr => return Err(EINVAL),
+            UtpOcs::InvalidPrdtAttr => return Err(EINVAL),
+            UtpOcs::MismatchDataBufSize => return Err(EINVAL),
+            UtpOcs::MisMatchRespUpiuSize => return Err(EINVAL),
+            UtpOcs::InvalidCryptoConfig => return Err(EINVAL),
+            UtpOcs::GeneralCryptoError => return Err(EINVAL),
+            _ => return Err(EIO),
+        }
+
+        let rsp_upiu = io_project!(self.ucdl, [try: tag].rsp_upiu).copy_read();
+        let cmd = rsp_upiu.fetch_dev(cmd)?;
+
+        Ok(UfsCmd::Device(cmd))
+    }
+
+    pub(crate) fn fetch_scsi_completion(&self, tag: usize) -> UfsScsiResult {
+        let utrd = match (|| -> Result<_> { Ok(io_project!(self.utrdl, [try: tag]).copy_read()) })()
+        {
+            Ok(utrd) => utrd,
+            Err(_) => return UfsScsiResult::error(UtpOcs::InvalidCommandStatus as u8),
+        };
+        let ocs = utrd.ocs();
+
+        if utrd.check_response().is_err() {
+            return match utrd.ocs().into() {
+                UtpOcs::Aborted | UtpOcs::InvalidCommandStatus => UfsScsiResult::requeue(ocs),
+                _ => UfsScsiResult::error(ocs),
+            };
+        }
+
+        match (|| -> Result<_> { Ok(io_project!(self.ucdl, [try: tag].rsp_upiu).copy_read()) })() {
+            Ok(rsp_upiu) => rsp_upiu.scsi_result(ocs),
+            Err(_) => UfsScsiResult::error(ocs),
+        }
+    }
+
+    pub(crate) fn fetch_mcq_scsi_completion(&self, tag: usize, cqe: CqEntry) -> UfsScsiResult {
+        let ocs = cqe.overall_status();
+
+        if !matches!(ocs.into(), UtpOcs::Success) {
+            return match ocs.into() {
+                UtpOcs::Aborted | UtpOcs::InvalidCommandStatus => UfsScsiResult::requeue(ocs),
+                _ => UfsScsiResult::error(ocs),
+            };
+        }
+
+        match (|| -> Result<_> { Ok(io_project!(self.ucdl, [try: tag].rsp_upiu).copy_read()) })() {
+            Ok(rsp_upiu) => rsp_upiu.scsi_result(ocs),
+            Err(_) => UfsScsiResult::error(UtpOcs::InvalidCommandStatus as u8),
+        }
+    }
+}
+
+fn map_single_dma_error(error: Error) -> Error {
+    if error == EIO {
+        // Match the block DMA iterator: a DMA API mapping failure is a
+        // transient resource shortage and should be retried by blk-mq.
+        EBUSY
+    } else {
+        error
+    }
+}

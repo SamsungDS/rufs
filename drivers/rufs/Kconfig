@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+menuconfig RUFS
+	tristate "Rust UFS host controller driver"
+	depends on RUST
+	help
+	  Enable the experimental Rust UFS host controller driver. RUFS exposes
+	  UFS logical units as native blk-mq block devices without depending on
+	  the SCSI midlayer. The driver supports UFSHCI single-doorbell and
+	  multi-circular-queue controllers.
+
+if RUFS
+
+config RUFS_PCI
+	bool "PCI bus frontend"
+	depends on PCI
+	default y if PCI
+	help
+	  Build the PCI frontend for RUFS. This supports the QEMU UFS controller
+	  and PCI-attached UFS controllers using the IDs listed by the driver.
+	  Select this option when RUFS should probe UFS host controllers exposed
+	  through the PCI bus.
+
+config RUFS_QCOM
+	bool "Qualcomm platform frontend"
+	depends on OF
+	depends on COMMON_CLK
+	depends on GENERIC_PHY
+	depends on GPIOLIB
+	depends on INTERCONNECT
+	depends on PM_OPP
+	depends on RESET_CONTROLLER
+	depends on ARCH_QCOM || COMPILE_TEST
+	help
+	  Build the Qualcomm platform frontend. The frontend maps the UFSHCI
+	  resource and configures the clocks, PHY, reset and interconnect paths
+	  needed by supported Qualcomm UFS controllers. Select this option when
+	  RUFS should probe UFS host controllers described by Qualcomm device
+	  tree bindings.
+
+endif

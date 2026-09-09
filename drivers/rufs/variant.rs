@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! Host-controller variant operations.
+
+use crate::reg::{McqRegisterLayout, UfsReg};
+use crate::uic::{UfsPaLayerAttr, UfsUic};
+use kernel::prelude::*;
+
+#[derive(Clone, Copy)]
+pub(crate) enum NotifyPhase {
+    Pre,
+    Post,
+}
+
+pub(crate) trait UfsVariantOps: Send + Sync {
+    /// Prepare controller-specific resources before common host initialization.
+    fn initialize(&self, _reg: &UfsReg) -> Result<()> {
+        Ok(())
+    }
+
+    /// Release controller-specific resources after the common host is stopped.
+    fn shutdown(&self, _reg: &UfsReg) {}
+
+    fn mcq_register_layout(&self, reg: &UfsReg) -> Result<McqRegisterLayout> {
+        reg.standard_mcq_register_layout()
+    }
+
+    /// Return whether this variant has provided an accessible MCQ topology.
+    fn mcq_enabled(&self) -> bool {
+        true
+    }
+
+    /// Restrict the number of active MCQ commands for this variant.
+    fn constrain_mcq_active_commands(&self, reported: usize) -> usize {
+        reported
+    }
+
+    /// Reset the attached UFS device before enabling the controller.
+    fn device_reset(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn hce_enable_notify(&self, _reg: &UfsReg, _phase: NotifyPhase) -> Result<()> {
+        Ok(())
+    }
+
+    fn link_startup_notify(&self, _reg: &UfsReg, _uic: &UfsUic, _phase: NotifyPhase) -> Result<()> {
+        Ok(())
+    }
+
+    /// Return whether link startup negotiated a usable link.
+    fn link_startup_valid(&self, _uic: &UfsUic) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn constrain_power_mode(&self, desired: UfsPaLayerAttr) -> Result<UfsPaLayerAttr> {
+        Ok(desired)
+    }
+
+    fn power_mode_notify(
+        &self,
+        _reg: &UfsReg,
+        _uic: &UfsUic,
+        _mode: UfsPaLayerAttr,
+        _phase: NotifyPhase,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
