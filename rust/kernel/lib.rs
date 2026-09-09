@@ -122,6 +122,7 @@ pub mod ptr;
 pub mod pwm;
 pub mod rbtree;
 pub mod regulator;
+#[cfg(CONFIG_RESET_CONTROLLER)]
 pub mod reset;
 pub mod revocable;
 pub mod safety;

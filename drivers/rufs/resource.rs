@@ -8,16 +8,23 @@ use kernel::devres::Devres;
 use kernel::io::mem::IoMem;
 use kernel::io::{IoBase, Mmio, MmioBackend, Region};
 use kernel::sync::{aref::ARef, Arc};
-use kernel::{c_str, pci, platform, prelude::*};
+#[cfg(CONFIG_RUFS_PCI)]
+use kernel::{c_str, pci};
+#[cfg(CONFIG_RUFS_QCOM)]
+use kernel::platform;
+use kernel::prelude::*;
 
 use crate::variant::UfsVariantOps;
 
 pub(crate) const HCI_MMIO_SIZE: usize = 0x1000;
 
+#[cfg(CONFIG_RUFS_PCI)]
 type PciHciMmio = pci::Bar<'static, HCI_MMIO_SIZE>;
 
 pub(crate) enum HciMmio {
+    #[cfg(CONFIG_RUFS_PCI)]
     Pci(Devres<PciHciMmio>),
+    #[cfg(CONFIG_RUFS_QCOM)]
     Platform(Devres<IoMem<'static, HCI_MMIO_SIZE>>),
 }
 
@@ -28,6 +35,7 @@ pub(crate) enum HciMmio {
 pub(crate) struct McqMmio(Devres<IoMem<'static>>);
 
 impl McqMmio {
+    #[cfg(CONFIG_RUFS_QCOM)]
     pub(crate) fn from_platform(mmio: Devres<IoMem<'static>>) -> Self {
         Self(mmio)
     }
@@ -41,6 +49,7 @@ impl McqMmio {
 }
 
 impl HciMmio {
+    #[cfg(CONFIG_RUFS_PCI)]
     pub(crate) fn from_pci(pdev: &pci::Device<Bound>) -> Result<Self> {
         Ok(Self::Pci(
             pdev.iomap_region_sized::<HCI_MMIO_SIZE>(0, c_str!("rufs_pci"))?
@@ -48,6 +57,7 @@ impl HciMmio {
         ))
     }
 
+    #[cfg(CONFIG_RUFS_QCOM)]
     pub(crate) fn from_platform(pdev: &platform::Device<Bound>) -> Result<Self> {
         let request = pdev.io_request_by_index(0).ok_or(ENODEV)?;
 
@@ -61,7 +71,9 @@ impl HciMmio {
         dev: &'a device::Device<Bound>,
     ) -> Result<HciMmioAccess<'a>> {
         match self {
+            #[cfg(CONFIG_RUFS_PCI)]
             Self::Pci(mmio) => Ok(HciMmioAccess::Pci(mmio.access(dev)?)),
+            #[cfg(CONFIG_RUFS_QCOM)]
             Self::Platform(mmio) => Ok(HciMmioAccess::Platform(mmio.access(dev)?)),
         }
     }
@@ -69,7 +81,9 @@ impl HciMmio {
 
 #[derive(Clone, Copy)]
 pub(crate) enum HciMmioAccess<'a> {
+    #[cfg(CONFIG_RUFS_PCI)]
     Pci(&'a PciHciMmio),
+    #[cfg(CONFIG_RUFS_QCOM)]
     Platform(&'a IoMem<'static, HCI_MMIO_SIZE>),
 }
 
@@ -79,7 +93,9 @@ impl<'a> IoBase<'a> for HciMmioAccess<'a> {
 
     fn as_view(self) -> Mmio<'a, Self::Target> {
         match self {
+            #[cfg(CONFIG_RUFS_PCI)]
             Self::Pci(mmio) => mmio.as_view(),
+            #[cfg(CONFIG_RUFS_QCOM)]
             Self::Platform(mmio) => mmio.as_view(),
         }
     }
