@@ -12,7 +12,7 @@ use kernel::bindings;
 use kernel::block::error::code::BLK_STS_IOERR;
 use kernel::block::mq::gen_disk::BoundGenDisk;
 use kernel::block::mq::LimitsBuilder;
-use kernel::sync::{Arc, Mutex, SpinLock};
+use kernel::sync::{Arc, Mutex, SpinLock, SpinLockIrq};
 use kernel::types::{OwnableRefCounted, Owned};
 use kernel::{
     block::{
@@ -25,7 +25,7 @@ use kernel::{
     },
     sync::aref::ARef,
 };
-use kernel::{new_mutex, new_spinlock, prelude::*};
+use kernel::{new_mutex, new_spinlock, new_spinlock_irq, prelude::*};
 
 const SECTOR_SIZE_U64: u64 = SECTOR_SIZE as u64;
 const MAX_DISCARD_SEGMENTS: u16 = 1;
@@ -277,7 +277,7 @@ fn complete_unsubmitted(rq: Owned<mq::Request<UfsLuBlockOps>>, e: Error) {
 #[pin_data]
 pub(crate) struct UfsRequestData {
     #[pin]
-    pub(crate) inner: SpinLock<UfsRequestInner>,
+    pub(crate) inner: SpinLockIrq<UfsRequestInner>,
 }
 
 pub(crate) struct TagSetData {
@@ -346,7 +346,7 @@ impl Operations for UfsLuBlockOps {
 
     fn new_request_data() -> impl PinInit<Self::RequestData> {
         pin_init!(UfsRequestData {
-            inner <- new_spinlock!(UfsRequestInner::default()),
+            inner <- new_spinlock_irq!(UfsRequestInner::default()),
         })
     }
 
