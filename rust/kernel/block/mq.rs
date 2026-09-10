@@ -71,6 +71,7 @@
 //! impl Operations for MyBlkDevice {
 //!     type RequestData = ();
 //!     type QueueData = ();
+//!     type TagSetData = ();
 //!
 //!     fn new_request_data(
 //!     ) -> impl PinInit<()> {
@@ -95,6 +96,7 @@
 //! let tagset: Arc<TagSet<MyBlkDevice>> = Arc::pin_init(
 //!     TagSet::new(
 //!         1,
+//!         (),
 //!         256,
 //!         1,
 //!         NumaNode::NO_NODE,
