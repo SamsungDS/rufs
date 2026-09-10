@@ -27,7 +27,7 @@ use crate::{
     sync::aref::ARef,
     transmute::{
         AsBytes,
-        FromBytes, //
+        FromBytes as KernelFromBytes, //
     },
     uaccess::UserSliceWriter, //
 };
@@ -39,6 +39,7 @@ use core::{
     },
     ptr::NonNull, //
 };
+use zerocopy::{FromBytes as ZerocopyFromBytes, Immutable, IntoBytes};
 
 /// DMA address type.
 ///
@@ -426,7 +427,7 @@ impl From<DataDirection> for bindings::dma_data_direction {
 /// ```
 pub struct CoherentBox<T: KnownSize + ?Sized>(Coherent<T>);
 
-impl<T: AsBytes + FromBytes> CoherentBox<[T]> {
+impl<T: AsBytes + KernelFromBytes> CoherentBox<[T]> {
     /// [`CoherentBox`] variant of [`Coherent::zeroed_slice_with_attrs`].
     #[inline]
     pub fn zeroed_slice_with_attrs(
@@ -532,7 +533,7 @@ impl<T: AsBytes + FromBytes> CoherentBox<[T]> {
     }
 }
 
-impl<T: AsBytes + FromBytes> CoherentBox<T> {
+impl<T: AsBytes + KernelFromBytes> CoherentBox<T> {
     /// Same as [`CoherentBox::zeroed_slice_with_attrs`], but for a single element.
     #[inline]
     pub fn zeroed_with_attrs(
@@ -563,7 +564,7 @@ impl<T: KnownSize + ?Sized> Deref for CoherentBox<T> {
     }
 }
 
-impl<T: AsBytes + FromBytes + KnownSize + ?Sized> DerefMut for CoherentBox<T> {
+impl<T: AsBytes + KernelFromBytes + KnownSize + ?Sized> DerefMut for CoherentBox<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         // SAFETY:
@@ -574,7 +575,7 @@ impl<T: AsBytes + FromBytes + KnownSize + ?Sized> DerefMut for CoherentBox<T> {
     }
 }
 
-impl<T: AsBytes + FromBytes + KnownSize + ?Sized> From<CoherentBox<T>> for Coherent<T> {
+impl<T: AsBytes + KernelFromBytes + KnownSize + ?Sized> From<CoherentBox<T>> for Coherent<T> {
     #[inline]
     fn from(value: CoherentBox<T>) -> Self {
         value.0
@@ -598,9 +599,9 @@ pub unsafe trait ContiguousBuffer {
     /// The CPU-side view of the region.
     ///
     /// [`FromBytes`] because the device may write an arbitrary byte pattern into the region,
-    /// [`AsBytes`] because it may read the region, which must therefore have no uninitialized
+    /// [`IntoBytes`] because it may read the region, which must therefore have no uninitialized
     /// padding.
-    type Data: ?Sized + FromBytes + AsBytes;
+    type Data: ?Sized + ZerocopyFromBytes + IntoBytes;
 
     /// Returns a pointer to the start of the region.
     fn ptr(&mut self) -> *mut c_void;
@@ -614,7 +615,7 @@ pub unsafe trait ContiguousBuffer {
 
 // SAFETY: `KBox` allocates via `kmalloc()`, which returns a single physically contiguous,
 // DMA-safe region in the kernel's linear mapping. All three methods describe that allocation.
-unsafe impl<T: FromBytes + AsBytes> ContiguousBuffer for KBox<T> {
+unsafe impl<T: ZerocopyFromBytes + IntoBytes> ContiguousBuffer for KBox<T> {
     type Data = T;
 
     fn ptr(&mut self) -> *mut c_void {
@@ -1112,9 +1113,57 @@ impl<T: KnownSize + ?Sized> Coherent<T> {
         // SAFETY: per safety requirement.
         unsafe { &mut *self.as_mut_ptr() }
     }
+
+    /// Allocates an uninitialized coherent slice.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the allocated bytes are a valid value of
+    /// `[T]` before creating a reference to the allocation.
+    unsafe fn alloc_slice_with_attrs_unchecked(
+        dev: &device::Device<Bound>,
+        len: usize,
+        gfp_flags: kernel::alloc::Flags,
+        dma_attrs: Attrs,
+    ) -> Result<Coherent<[T]>>
+    where
+        T: Sized,
+    {
+        const {
+            assert!(
+                core::mem::size_of::<T>() > 0,
+                "It doesn't make sense for the allocated type to be a ZST"
+            );
+        }
+
+        if len == 0 {
+            return Err(EINVAL);
+        }
+
+        let size = core::mem::size_of::<T>().checked_mul(len).ok_or(ENOMEM)?;
+        let mut dma_addr = 0;
+        // SAFETY: Device pointer is valid by the `Device` type invariant.
+        let addr = unsafe {
+            bindings::dma_alloc_attrs(
+                dev.as_raw(),
+                size,
+                &mut dma_addr,
+                gfp_flags.as_raw(),
+                dma_attrs.as_raw(),
+            )
+        };
+        let cpu_addr = NonNull::slice_from_raw_parts(NonNull::new(addr.cast()).ok_or(ENOMEM)?, len);
+
+        Ok(Coherent {
+            dev: dev.into(),
+            dma_addr,
+            cpu_addr,
+            dma_attrs,
+        })
+    }
 }
 
-impl<T: AsBytes + FromBytes> Coherent<T> {
+impl<T: AsBytes + KernelFromBytes> Coherent<T> {
     /// Allocates a region of `T` of coherent memory.
     fn alloc_with_attrs(
         dev: &device::Device<Bound>,
@@ -1232,41 +1281,9 @@ impl<T: AsBytes + FromBytes> Coherent<T> {
         gfp_flags: kernel::alloc::Flags,
         dma_attrs: Attrs,
     ) -> Result<Coherent<[T]>> {
-        const {
-            assert!(
-                core::mem::size_of::<T>() > 0,
-                "It doesn't make sense for the allocated type to be a ZST"
-            );
-        }
-
-        // `dma_alloc_attrs` cannot handle zero-length allocation, bail early.
-        if len == 0 {
-            Err(EINVAL)?;
-        }
-
-        let size = core::mem::size_of::<T>().checked_mul(len).ok_or(ENOMEM)?;
-        let mut dma_addr = 0;
-        // SAFETY: Device pointer is guaranteed as valid by the type invariant on `Device`.
-        let addr = unsafe {
-            bindings::dma_alloc_attrs(
-                dev.as_raw(),
-                size,
-                &mut dma_addr,
-                gfp_flags.as_raw(),
-                dma_attrs.as_raw(),
-            )
-        };
-        let cpu_addr = NonNull::slice_from_raw_parts(NonNull::new(addr.cast()).ok_or(ENOMEM)?, len);
-        // INVARIANT:
-        // - We just successfully allocated a coherent region which is adequately sized for
-        //   `[T; len]`, hence the cpu address is valid.
-        // - We also hold a refcounted reference to the device.
-        Ok(Coherent {
-            dev: dev.into(),
-            dma_addr,
-            cpu_addr,
-            dma_attrs,
-        })
+        // SAFETY: `AsBytes + FromBytes` guarantees that every byte pattern is
+        // valid for `T` and that `T` has no uninitialized padding.
+        unsafe { Self::alloc_slice_with_attrs_unchecked(dev, len, gfp_flags, dma_attrs) }
     }
 
     /// Allocates a zeroed region of type `T` of coherent memory.
@@ -1360,6 +1377,31 @@ impl<T: AsBytes + FromBytes> Coherent<T> {
     }
 }
 
+impl<T: ZerocopyFromBytes + IntoBytes> Coherent<T> {
+    /// Allocates a zeroed coherent slice validated by zerocopy traits.
+    pub fn zeroed_slice_zerocopy_with_attrs(
+        dev: &device::Device<Bound>,
+        len: usize,
+        gfp_flags: kernel::alloc::Flags,
+        dma_attrs: Attrs,
+    ) -> Result<Coherent<[T]>> {
+        // SAFETY: `FromBytes + IntoBytes` guarantees that every byte pattern is
+        // valid for `T` and that `T` has no uninitialized padding.
+        unsafe {
+            Self::alloc_slice_with_attrs_unchecked(dev, len, gfp_flags | __GFP_ZERO, dma_attrs)
+        }
+    }
+
+    /// Allocates a zeroed coherent slice validated by zerocopy traits.
+    pub fn zeroed_slice_zerocopy(
+        dev: &device::Device<Bound>,
+        len: usize,
+        gfp_flags: kernel::alloc::Flags,
+    ) -> Result<Coherent<[T]>> {
+        Self::zeroed_slice_zerocopy_with_attrs(dev, len, gfp_flags, Attrs(0))
+    }
+}
+
 impl<T> Coherent<[T]> {
     /// Returns the number of elements `T` in this allocation.
     ///
@@ -1399,9 +1441,9 @@ unsafe impl<T: KnownSize + Send + ?Sized> Send for Coherent<T> {}
 // methods that access the buffer contents (`field_read`, `field_write`, `as_slice`,
 // `as_slice_mut`) are `unsafe`, and callers are responsible for ensuring no data races occur.
 // The safe methods only return metadata or raw pointers whose use requires `unsafe`.
-unsafe impl<T: KnownSize + ?Sized + AsBytes + FromBytes + Sync> Sync for Coherent<T> {}
+unsafe impl<T: KnownSize + ?Sized + Sync> Sync for Coherent<T> {}
 
-impl<T: KnownSize + AsBytes + ?Sized> debugfs::BinaryWriter for Coherent<T> {
+impl<T: KnownSize + Immutable + IntoBytes + ?Sized> debugfs::BinaryWriter for Coherent<T> {
     fn write_to_slice(
         &self,
         writer: &mut UserSliceWriter,

@@ -16,6 +16,7 @@ use crate::{
     transmute::{AsBytes, FromBytes},
 };
 use core::mem::{size_of, MaybeUninit};
+use zerocopy::IntoBytes;
 
 /// A pointer into userspace.
 ///
@@ -525,7 +526,7 @@ impl UserSliceWriter {
     ///     writer.write_dma(alloc, 0, 256)
     /// }
     /// ```
-    pub fn write_dma<T: KnownSize + AsBytes + ?Sized>(
+    pub fn write_dma<T: KnownSize + IntoBytes + ?Sized>(
         &mut self,
         alloc: &Coherent<T>,
         offset: usize,
