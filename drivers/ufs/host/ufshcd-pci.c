@@ -411,6 +411,7 @@ static int ufs_intel_lkf_init(struct ufs_hba *hba)
 
 	hba->nop_out_timeout = 200;
 	hba->quirks |= UFSHCD_QUIRK_BROKEN_AUTO_HIBERN8;
+	hba->caps &= ~UFSHCD_CAP_WB_EN;
 	hba->caps |= UFSHCD_CAP_CRYPTO;
 	err = ufs_intel_common_init(hba);
 	/* LKF always needs a full reset, so set PM accordingly */
