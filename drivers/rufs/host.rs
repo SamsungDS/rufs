@@ -454,16 +454,24 @@ impl UfsHostShared {
 
         let result = (|| {
             let variant = self.resources.variant();
-            variant.device_reset()?;
-            variant.hce_enable_notify(&self.reg, NotifyPhase::Pre)?;
-            self.reg.ctrl_enable();
-            fsleep(Delta::from_micros(HBA_ENABLE_DELAY_US));
-            self.reg.wait_for_ctrl_enable(1000, 50)?;
-            variant.hce_enable_notify(&self.reg, NotifyPhase::Post)?;
+            enable_hba_controller(&self.resources, &self.reg)?;
 
-            variant.link_startup_notify(&self.reg, &self.uic, NotifyPhase::Pre)?;
-            self.uic.link_startup()?;
-            variant.link_startup_notify(&self.reg, &self.uic, NotifyPhase::Post)?;
+            let mut retries = LINK_STARTUP_RETRIES;
+            loop {
+                match start_link(&self.resources, &self.reg, &self.uic)? {
+                    true => break,
+                    false if retries > 0 => {
+                        pr_warn!(
+                            "[RUFS] ufs_host: retry degraded recovery link, retries_left={}\n",
+                            retries,
+                        );
+                        retries -= 1;
+                        let _dma_ended = self.stop_controller()?;
+                        enable_hba_controller(&self.resources, &self.reg)?;
+                    }
+                    false => return Err(EIO),
+                }
+            }
 
             // Restore common descriptor state and the active transfer backend
             // before accepting transfer interrupts again.
@@ -477,7 +485,6 @@ impl UfsHostShared {
                 recovery_transfer,
                 &self.device_info,
             )?;
-            self.queue.enable_interrupts();
 
             if let Err(e) = self.restore_power_mode(variant) {
                 pr_warn!(
@@ -485,6 +492,10 @@ impl UfsHostShared {
                     e.to_errno(),
                 );
             }
+            // RUFS does not currently enable any volatile UFS feature state.
+            // Restore driver-owned feature flags here before opening the
+            // normal transfer completion path when such support is added.
+            self.queue.enable_interrupts();
             Ok(recovery_transfer.finish())
         })();
 
