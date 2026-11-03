@@ -287,6 +287,13 @@ impl UfsHwQueue {
         }
     }
 
+    pub(crate) fn supports_polling(&self) -> bool {
+        match &self.inner {
+            UfsHwQueueKind::Sdb(_) => true,
+            UfsHwQueueKind::Mcq(queue) => queue.supports_polling(),
+        }
+    }
+
     pub(crate) fn submit<F>(&self, tag: u32, polled: bool, publish: F) -> SubmissionOutcome
     where
         F: FnOnce() -> Result<()>,

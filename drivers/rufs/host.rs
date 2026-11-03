@@ -16,6 +16,7 @@ use crate::device::*;
 use crate::dma::*;
 use crate::irq::*;
 use crate::lu::*;
+use crate::protocol::query::UfsDevCmd;
 use crate::queue::*;
 use crate::reg::*;
 use crate::resource::HostResources;
@@ -464,8 +465,10 @@ impl UfsHostShared {
             // Restore common descriptor state and the active transfer backend
             // before accepting transfer interrupts again.
             self.dma.make_hba_operational()?;
-            self.queue.reset_backend()?;
+            let recovery_transfer = self.queue.prepare_recovery_transfer(dma_ended)?;
             self.task_management.reset_after_controller_reset()?;
+            let (recovery_transfer, _) =
+                recovery_transfer.execute_device_command(UfsDevCmd::Nop)?;
             self.queue.enable_interrupts();
 
             if let Err(e) = self.restore_power_mode(variant) {
@@ -474,11 +477,11 @@ impl UfsHostShared {
                     e.to_errno(),
                 );
             }
-            Ok(())
+            Ok(recovery_transfer.finish())
         })();
 
         match result {
-            Ok(()) => ControllerResetResult::Restored(dma_ended),
+            Ok(dma_ended) => ControllerResetResult::Restored(dma_ended),
             Err(error) => match self.stop_controller() {
                 Ok(dma_ended) => ControllerResetResult::Stopped { dma_ended, error },
                 Err(stop_error) => ControllerResetResult::UnsafeStop {

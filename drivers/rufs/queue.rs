@@ -15,6 +15,7 @@ use kernel::alloc::mempool::MemPool;
 use kernel::block::mq;
 use kernel::block::mq::dma_map_iter::DmaMapMempool;
 use kernel::block::mq::TagSet;
+use kernel::io::poll::read_poll_timeout;
 use kernel::sync::{Arc, MutexGuard};
 use kernel::time::{delay::fsleep, Delta};
 use kernel::types::{OwnableRefCounted, Owned};
@@ -24,6 +25,7 @@ const RECOVERY_OWNERSHIP_RETRIES: usize = 100;
 const RECOVERY_OWNERSHIP_RETRY_DELAY_US: i64 = 100;
 const TASK_QUERY_RETRIES: usize = 100;
 const TASK_QUERY_RETRY_DELAY_US: i64 = 100;
+const RECOVERY_DEVICE_POLL_DELAY_US: i64 = 100;
 
 fn retryable_check_condition(sense: Option<&ScsiSense>) -> bool {
     matches!(sense, Some(sense) if sense.is_unit_attention())
@@ -284,6 +286,19 @@ enum LogicalUnitRecoveryResult {
 /// Proof that the controller can no longer access previously published DMA
 /// mappings.
 pub(crate) struct DmaAccessEnded;
+
+/// Exclusive access to one transfer slot while Host recovery owns dispatch.
+///
+/// The task tag is part of the normal blk-mq tag space. The lease may only be
+/// created after the Host has quiesced normal dispatch and stopped the old
+/// controller instance, as proven by `DmaAccessEnded`. It therefore borrows
+/// that proof exclusively for its lifetime.
+pub(crate) struct RecoveryTransferLease<'a> {
+    queue: &'a UfsQueue,
+    hw_queue: &'a UfsHwQueue,
+    task_tag: TaskTag,
+    dma_ended: DmaAccessEnded,
+}
 
 pub(crate) enum ControllerResetResult {
     Restored(DmaAccessEnded),
@@ -1076,6 +1091,26 @@ pub(crate) struct UfsQueue {
     reg: Arc<UfsReg>,
     dma: Arc<UfsDma>,
     backend: UfsTransferBackend,
+    recovery_transfer_hw_queue: UfsHwQueue,
+    recovery_transfer_tag: TaskTag,
+}
+
+impl RecoveryTransferLease<'_> {
+    pub(crate) fn execute_device_command(
+        self,
+        cmd: UfsDevCmd,
+    ) -> Result<(Self, UfsCmd)> {
+        let response = self.queue.execute_recovery_device_command(
+            self.hw_queue,
+            self.task_tag,
+            cmd,
+        )?;
+        Ok((self, response))
+    }
+
+    pub(crate) fn finish(self) -> DmaAccessEnded {
+        self.dma_ended
+    }
 }
 
 impl UfsQueue {
@@ -1088,10 +1123,21 @@ impl UfsQueue {
         let hw_queues = backend.hw_queues()?;
         let queue_map = config.queue_map()?;
         let nr_hw_queues = queue_map.nr_hw_queues();
-        let queue_depth = config.queue_depth();
-        if queue_depth == 0 || nr_hw_queues == 0 || hw_queues.len() != nr_hw_queues {
+        let transfer_slots = config.queue_depth();
+        if transfer_slots == 0 || nr_hw_queues == 0 || hw_queues.len() != nr_hw_queues {
             return Err(EINVAL);
         }
+        // Recovery temporarily borrows this ordinary transfer tag only after
+        // normal dispatch has been quiesced and the old controller instance
+        // has stopped. It is not excluded from the blk-mq tag set.
+        let recovery_transfer_tag = TaskTag::new(
+            u32::try_from(transfer_slots - 1).map_err(|_| EOVERFLOW)?,
+        )?;
+        let recovery_transfer_hw_queue = hw_queues
+            .iter()
+            .find(|queue| queue.supports_polling())
+            .ok_or(EOPNOTSUPP)?
+            .clone();
         let tagset_data = KBox::new(
             TagSetData {
                 queue_map,
@@ -1110,7 +1156,7 @@ impl UfsQueue {
             TagSet::<UfsLuBlockOps>::new(
                 nr_hw_queues as u32,
                 tagset_data,
-                u32::try_from(queue_depth).map_err(|_| EOVERFLOW)?,
+                u32::try_from(transfer_slots).map_err(|_| EOVERFLOW)?,
                 queue_map.num_maps(),
                 kernel::alloc::NumaNode::NO_NODE,
                 tagset_flags,
@@ -1124,6 +1170,8 @@ impl UfsQueue {
                 reg,
                 dma,
                 backend,
+                recovery_transfer_hw_queue,
+                recovery_transfer_tag,
             }),
             GFP_KERNEL,
         )?;
@@ -1143,8 +1191,71 @@ impl UfsQueue {
         self.backend.enable_interrupts();
     }
 
-    pub(crate) fn reset_backend(&self) -> Result<()> {
-        self.backend.reset()
+    /// Reset the transfer backend and temporarily borrow an ordinary transfer
+    /// slot for Host recovery.
+    ///
+    /// The Host control lock, quiesced tag set, and reset transfer backend are
+    /// the serialized recovery boundary. Requiring exclusive access to the
+    /// controller-stop proof is moved into the lease. A successful command
+    /// returns the lease for reuse; a failed command consumes the proof so the
+    /// Host must stop the controller again before reclaiming old DMA mappings.
+    pub(crate) fn prepare_recovery_transfer<'a>(
+        &'a self,
+        dma_ended: DmaAccessEnded,
+    ) -> Result<RecoveryTransferLease<'a>> {
+        self.backend.reset()?;
+        Ok(RecoveryTransferLease {
+            queue: self,
+            hw_queue: &self.recovery_transfer_hw_queue,
+            task_tag: self.recovery_transfer_tag,
+            dma_ended,
+        })
+    }
+
+    fn execute_recovery_device_command(
+        &self,
+        hw_queue: &UfsHwQueue,
+        task_tag: TaskTag,
+        cmd: UfsDevCmd,
+    ) -> Result<UfsCmd> {
+        self.compose_dev(cmd, task_tag)?;
+
+        match hw_queue.submit(u32::from(task_tag.value()), true, || Ok(())) {
+            SubmissionOutcome::Submitted => {}
+            SubmissionOutcome::NotSubmitted(error)
+            | SubmissionOutcome::PublishFailed(error) => return Err(error),
+        }
+
+        let payload = read_poll_timeout(
+            || {
+                let mut completed = CompletionBatch::new();
+                hw_queue.poll(&mut completed)?;
+                if let Some(fault) = completed.take_fault() {
+                    pr_err!(
+                        "rufs: recovery device command completion fault reason={} queue={:?} tag={}\n",
+                        fault.reason,
+                        fault.queue_id,
+                        fault.tag,
+                    );
+                    return Err(EIO);
+                }
+
+                let Some(completion) = completed.take_next() else {
+                    return Ok(None);
+                };
+                if completed.take_next().is_some() || completion.task_tag() != task_tag {
+                    return Err(EIO);
+                }
+                let (_, _, payload) = completion.into_parts();
+                Ok(Some(payload))
+            },
+            |payload| payload.is_some(),
+            Delta::from_micros(RECOVERY_DEVICE_POLL_DELAY_US),
+            cmd.timeout(),
+        )?
+        .ok_or(ETIMEDOUT)?;
+
+        self.fetch_dev(cmd, task_tag, payload)
     }
 
     fn completion_pass_limit(&self) -> usize {

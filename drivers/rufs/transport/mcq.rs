@@ -546,6 +546,10 @@ impl McqHwQueue {
         self.queue.descriptor.id()
     }
 
+    pub(crate) fn supports_polling(&self) -> bool {
+        self.poll
+    }
+
     pub(crate) fn submit<F>(&self, tag: u32, publish: F) -> SubmissionOutcome
     where
         F: FnOnce() -> Result<()>,
