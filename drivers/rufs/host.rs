@@ -264,6 +264,7 @@ pub(crate) struct UfsHostShared {
     pub(crate) dma: Arc<UfsDma>,
     pub(crate) uic: Arc<UfsUic>,
     pub(crate) task_management: Arc<TaskManagement>,
+    device_info: Arc<Mutex<UfsDevInfo>>,
     #[pin]
     pub(crate) control_lock: Mutex<()>,
     #[pin]
@@ -286,6 +287,7 @@ impl UfsHostShared {
         dma: Arc<UfsDma>,
         uic: Arc<UfsUic>,
         task_management: Arc<TaskManagement>,
+        device_info: Arc<Mutex<UfsDevInfo>>,
     ) -> Result<Arc<Self>> {
         let recovery_requests =
             KVec::with_capacity(queue.tags.queue_depth() as usize, GFP_KERNEL)?;
@@ -297,6 +299,7 @@ impl UfsHostShared {
                 dma,
                 uic,
                 task_management,
+                device_info,
                 control_lock <- new_mutex!(()),
                 recovery <- new_spinlock!(RecoveryControl::new()),
                 recovery_requests <- new_mutex!(recovery_requests),
@@ -470,6 +473,10 @@ impl UfsHostShared {
             let (recovery_transfer, _) =
                 recovery_transfer.execute_device_command(UfsDevCmd::Nop)?;
             let recovery_transfer = UfsDev::complete_recovery_dev_init(recovery_transfer)?;
+            let recovery_transfer = UfsDev::validate_recovery_params(
+                recovery_transfer,
+                &self.device_info,
+            )?;
             self.queue.enable_interrupts();
 
             if let Err(e) = self.restore_power_mode(variant) {
@@ -595,6 +602,8 @@ impl<'a> UfsHost<'a> {
                 reg.clone(),
                 dma.clone(),
             )?;
+            let device_info =
+                Arc::pin_init(new_mutex!(UfsDevInfo::default()), GFP_KERNEL)?;
             let shared = UfsHostShared::new(
                 ufs_queue.clone(),
                 resources.clone(),
@@ -602,8 +611,13 @@ impl<'a> UfsHost<'a> {
                 dma.clone(),
                 uic.clone(),
                 task_management.clone(),
+                device_info.clone(),
             )?;
-            let dev = UfsDev::new(ufs_queue.clone(), shared.clone())?;
+            let dev = UfsDev::new(
+                ufs_queue.clone(),
+                shared.clone(),
+                device_info,
+            )?;
             let host = try_pin_init!(Self {
                 resources,
                 reg,
@@ -667,7 +681,7 @@ impl<'a> UfsHost<'a> {
 
         while lun < num_lu {
             let lun_id = u8::try_from(lun).map_err(|_| EOVERFLOW)?;
-            let desc = self.dev.read_unit_desc(lun_id)?;
+            let desc = self.dev.lu_info(lun)?;
 
             if !desc.enabled() {
                 lun = lun.checked_add(1).ok_or(EOVERFLOW)?;
@@ -678,7 +692,7 @@ impl<'a> UfsHost<'a> {
                 desc.logical_block_shift(),
                 desc.logical_block_count(),
             )?;
-            let queue_depth = match desc.lu_queue_depth() {
+            let queue_depth = match desc.queue_depth() {
                 0 => self.queue.tags.queue_depth(),
                 depth => core::cmp::min(depth as u32, self.queue.tags.queue_depth()),
             };

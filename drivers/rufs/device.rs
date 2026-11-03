@@ -11,7 +11,7 @@ use kernel::block::mq::{self, BoundRequestQueue, LimitsBuilder, RequestQueue};
 use kernel::io::poll::read_poll_timeout;
 use kernel::sync::{Arc, Mutex};
 use kernel::time::{delay::fsleep, Delta, Instant, Monotonic};
-use kernel::{new_mutex, prelude::*};
+use kernel::prelude::*;
 
 const FDEVICE_COMPL_TIMEOUT_MS: i64 = 1500;
 const FDEVICE_COMPL_TICK_US: i64 = 500;
@@ -26,6 +26,42 @@ pub(crate) struct UfsDevInfo {
     queue_depth: usize,
     rtt_cap: u8,
     luns_avail: usize,
+    luns: KVec<UfsLuInfo>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UfsLuInfo {
+    enabled: bool,
+    logical_block_shift: u8,
+    logical_block_count: u64,
+    queue_depth: usize,
+}
+
+impl UfsLuInfo {
+    fn from_desc(desc: UnitDesc) -> Self {
+        Self {
+            enabled: desc.enabled(),
+            logical_block_shift: desc.logical_block_shift(),
+            logical_block_count: desc.logical_block_count(),
+            queue_depth: desc.lu_queue_depth(),
+        }
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub(crate) fn logical_block_shift(&self) -> u8 {
+        self.logical_block_shift
+    }
+
+    pub(crate) fn logical_block_count(&self) -> u64 {
+        self.logical_block_count
+    }
+
+    pub(crate) fn queue_depth(&self) -> usize {
+        self.queue_depth
+    }
 }
 
 #[pin_data]
@@ -33,8 +69,7 @@ pub(crate) struct UfsDev {
     ufs_queue: Arc<UfsQueue>,
     pub(crate) request_queue: BoundRequestQueue<UfsLuBlockOps>,
 
-    #[pin]
-    pub(crate) info: Mutex<UfsDevInfo>,
+    info: Arc<Mutex<UfsDevInfo>>,
 
 }
 
@@ -68,9 +103,86 @@ impl UfsDev {
         }
     }
 
+    fn recovery_read_desc<'a>(
+        recovery_transfer: RecoveryTransferLease<'a>,
+        idn: DescIdn,
+        index: u8,
+    ) -> Result<(RecoveryTransferLease<'a>, Desc)> {
+        let read_desc = UfsDevCmd::query()
+            .read_desc(idn, index, 0)
+            .get_device()?;
+        let (recovery_transfer, cmd) =
+            recovery_transfer.execute_device_command(read_desc)?;
+        let desc = cmd
+            .get_device()?
+            .get_query()?
+            .get_read_desc()?
+            .desc;
+        Ok((recovery_transfer, desc))
+    }
+
+    pub(crate) fn validate_recovery_params<'a>(
+        recovery_transfer: RecoveryTransferLease<'a>,
+        info: &Mutex<UfsDevInfo>,
+    ) -> Result<RecoveryTransferLease<'a>> {
+        let (recovery_transfer, geometry) =
+            Self::recovery_read_desc(recovery_transfer, DescIdn::Geometry, 0)?;
+        let geometry = geometry.get_geometry()?;
+        let current_max_lu = match geometry.max_number_lu() {
+            1 => 32,
+            _ => 8,
+        };
+        if info.lock().max_lu != current_max_lu {
+            pr_err!("[RUFS] ufs_dev: geometry changed after controller reset\n");
+            return Err(EIO);
+        }
+
+        let (mut recovery_transfer, device) =
+            Self::recovery_read_desc(recovery_transfer, DescIdn::Device, 0)?;
+        let device = device.get_device()?;
+        let num_lu = {
+            let info = info.lock();
+            if info.manufacturer_id != device.manufacturer_id()
+                || info.spec_version != device.spec_version()
+                || info.queue_depth != device.queue_depth()
+                || info.rtt_cap != device.device_rtt_cap()
+                || info.num_lu != device.number_lu() as usize
+                || info.num_wlu != device.number_wlu() as usize
+                || info.luns_avail != (device.number_lu() + device.number_wlu()) as usize
+            {
+                pr_err!("[RUFS] ufs_dev: device parameters changed after controller reset\n");
+                return Err(EIO);
+            }
+            info.num_lu
+        };
+
+        for lun in 0..num_lu {
+            let lun = u8::try_from(lun).map_err(|_| EOVERFLOW)?;
+            let (next, desc) =
+                Self::recovery_read_desc(recovery_transfer, DescIdn::Unit, lun)?;
+            recovery_transfer = next;
+            let current = UfsLuInfo::from_desc(desc.get_unit()?);
+            let matches = info
+                .lock()
+                .luns
+                .get(lun as usize)
+                .is_some_and(|expected| *expected == current);
+            if !matches {
+                pr_err!(
+                    "[RUFS] ufs_dev: LU {} topology changed after controller reset\n",
+                    lun,
+                );
+                return Err(EIO);
+            }
+        }
+
+        Ok(recovery_transfer)
+    }
+
     pub(crate) fn new(
         ufs_queue: Arc<UfsQueue>,
         host: Arc<UfsHostShared>,
+        info: Arc<Mutex<UfsDevInfo>>,
     ) -> Result<Arc<Self>> {
         let limits = LimitsBuilder::<UfsLuBlockOps>::new().build()?;
 
@@ -85,7 +197,7 @@ impl UfsDev {
             try_pin_init!(Self {
                 ufs_queue,
                 request_queue,
-                info <- new_mutex!(UfsDevInfo::default()),
+                info,
             }),
             GFP_KERNEL,
         )?;
@@ -122,8 +234,12 @@ impl UfsDev {
         cmd.get_device()?.get_query()?.get_attr_value()
     }
 
-    pub(crate) fn read_unit_desc(&self, lun: u8) -> Result<UnitDesc> {
+    fn read_unit_desc(&self, lun: u8) -> Result<UnitDesc> {
         self.read_desc(DescIdn::Unit, lun, 0)?.get_unit()
+    }
+
+    pub(crate) fn lu_info(&self, lun: usize) -> Result<UfsLuInfo> {
+        self.info.lock().luns.get(lun).copied().ok_or(EINVAL)
     }
 
     pub(crate) fn num_lu(&self) -> usize {
@@ -187,6 +303,14 @@ impl UfsDev {
     pub(crate) fn device_params_init(&self) -> Result<()> {
         self.get_geometry_info()?;
         self.get_device_info()?;
+        let num_lu = self.info.lock().num_lu;
+        let mut luns = KVec::with_capacity(num_lu, GFP_KERNEL)?;
+        for lun in 0..num_lu {
+            let lun = u8::try_from(lun).map_err(|_| EOVERFLOW)?;
+            let desc = self.read_unit_desc(lun)?;
+            luns.push(UfsLuInfo::from_desc(desc), GFP_KERNEL)?;
+        }
+        self.info.lock().luns = luns;
         Ok(())
     }
 
