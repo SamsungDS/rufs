@@ -10,7 +10,7 @@ use crate::queue::*;
 use kernel::block::mq::{self, BoundRequestQueue, LimitsBuilder, RequestQueue};
 use kernel::io::poll::read_poll_timeout;
 use kernel::sync::{Arc, Mutex};
-use kernel::time::Delta;
+use kernel::time::{delay::fsleep, Delta, Instant, Monotonic};
 use kernel::{new_mutex, prelude::*};
 
 const FDEVICE_COMPL_TIMEOUT_MS: i64 = 1500;
@@ -39,6 +39,35 @@ pub(crate) struct UfsDev {
 }
 
 impl UfsDev {
+    pub(crate) fn complete_recovery_dev_init(
+        recovery_transfer: RecoveryTransferLease<'_>,
+    ) -> Result<RecoveryTransferLease<'_>> {
+        let set_device_init = UfsDevCmd::query()
+            .set_flag(FlagIdn::FDeviceInit, 0, 0)
+            .get_device()?;
+        let (mut recovery_transfer, _) =
+            recovery_transfer.execute_device_command(set_device_init)?;
+        let start: Instant<Monotonic> = Instant::now();
+
+        loop {
+            let read_device_init = UfsDevCmd::query()
+                .read_flag(FlagIdn::FDeviceInit, 0, 0)
+                .get_device()?;
+            let (next, cmd) =
+                recovery_transfer.execute_device_command(read_device_init)?;
+            recovery_transfer = next;
+
+            if cmd.get_device()?.get_query()?.get_flag_value()? == 0 {
+                return Ok(recovery_transfer);
+            }
+            if start.elapsed() > Delta::from_millis(FDEVICE_COMPL_TIMEOUT_MS) {
+                pr_err!("[RUFS] ufs_dev: recovery fDeviceInit was not cleared\n");
+                return Err(EBUSY);
+            }
+            fsleep(Delta::from_micros(FDEVICE_COMPL_TICK_US));
+        }
+    }
+
     pub(crate) fn new(
         ufs_queue: Arc<UfsQueue>,
         host: Arc<UfsHostShared>,

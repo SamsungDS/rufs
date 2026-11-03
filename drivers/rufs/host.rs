@@ -469,6 +469,7 @@ impl UfsHostShared {
             self.task_management.reset_after_controller_reset()?;
             let (recovery_transfer, _) =
                 recovery_transfer.execute_device_command(UfsDevCmd::Nop)?;
+            let recovery_transfer = UfsDev::complete_recovery_dev_init(recovery_transfer)?;
             self.queue.enable_interrupts();
 
             if let Err(e) = self.restore_power_mode(variant) {
