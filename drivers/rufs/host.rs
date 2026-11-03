@@ -638,8 +638,11 @@ impl<'a> UfsHost<'a> {
                 if let Err(e) = host.configure_power_mode() {
                     pr_warn!("rufs: power mode configuration failed: {}\n", e.to_errno(),);
                 }
-                host.alloc_luns()?;
+                // Publishing a disk may immediately start partition-scan I/O.
+                // Make Host recovery available before any LU queue becomes
+                // visible to the block layer.
                 host.shared.promote_to_operational()?;
+                host.alloc_luns()?;
                 Ok(())
             });
 
