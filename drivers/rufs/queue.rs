@@ -922,7 +922,7 @@ impl UfsRequestData {
         if let Some(UfsCmd::Scsi(cmd)) = cmd {
             let cdb = cmd.cdb();
             pr_err!(
-                "[RUFS] ufs_queue: SCSI request timeout tag={} lun={} opcode=0x{:02x}\n",
+                "[RUFS] ufs_queue: request timeout tag={} lun={} opcode=0x{:02x}\n",
                 tag,
                 cmd.lun(),
                 cdb[0],
