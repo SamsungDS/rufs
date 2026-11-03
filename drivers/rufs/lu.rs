@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 use crate::dma::{MAX_PRD_ENTRIES, PRDT_DATA_BYTE_COUNT_MAX};
+use crate::host::UfsHostShared;
 use crate::protocol::scsi::UfsSCSICmd;
 use crate::queue::*;
 use crate::transport::UfsHwQueue;
@@ -12,7 +13,7 @@ use kernel::bindings;
 use kernel::block::error::code::BLK_STS_IOERR;
 use kernel::block::mq::gen_disk::BoundGenDisk;
 use kernel::block::mq::LimitsBuilder;
-use kernel::sync::{Arc, Mutex, SpinLock, SpinLockIrq};
+use kernel::sync::{Arc, Mutex, SpinLockIrq};
 use kernel::types::{OwnableRefCounted, Owned};
 use kernel::{
     block::{
@@ -25,18 +26,11 @@ use kernel::{
     },
     sync::aref::ARef,
 };
-use kernel::{new_mutex, new_spinlock, new_spinlock_irq, prelude::*};
+use kernel::{new_mutex, new_spinlock_irq, prelude::*};
 
 const SECTOR_SIZE_U64: u64 = SECTOR_SIZE as u64;
 const MAX_DISCARD_SEGMENTS: u16 = 1;
 const MAX_SECTORS: u32 = 1024 * 1024 / 512;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum UfsLuState {
-    Reset,
-    Operational,
-    Error,
-}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct UfsLuGeometry {
@@ -144,12 +138,10 @@ impl UfsLuGeometry {
 #[pin_data]
 pub(crate) struct UfsLu {
     pub(crate) queue: Arc<UfsQueue>,
+    pub(crate) host: Arc<UfsHostShared>,
     lun: u8,
     geometry: UfsLuGeometry,
     queue_depth: u32,
-
-    #[pin]
-    state: SpinLock<UfsLuState>,
 
     #[pin]
     disk: Mutex<Option<BoundGenDisk<UfsLuBlockOps>>>,
@@ -158,6 +150,7 @@ pub(crate) struct UfsLu {
 impl UfsLu {
     pub(crate) fn new(
         queue: Arc<UfsQueue>,
+        host: Arc<UfsHostShared>,
         lun: u8,
         geometry: UfsLuGeometry,
         queue_depth: u32,
@@ -165,10 +158,10 @@ impl UfsLu {
         Arc::pin_init(
             try_pin_init!(Self {
                 queue,
+                host,
                 lun,
                 geometry,
                 queue_depth,
-                state <- new_spinlock!(UfsLuState::Reset),
                 disk <- new_mutex!(None),
             }),
             GFP_KERNEL,
@@ -205,12 +198,10 @@ impl UfsLu {
         }
 
         current.replace(disk);
-        self.set_state(UfsLuState::Operational);
         Ok(())
     }
 
     pub(crate) fn remove_disk(&self) {
-        self.set_state(UfsLuState::Reset);
         let disk = self.disk.lock().take();
         drop(disk);
     }
@@ -221,18 +212,6 @@ impl UfsLu {
 
     pub(crate) fn geometry(&self) -> UfsLuGeometry {
         self.geometry
-    }
-
-    pub(crate) fn state(&self) -> UfsLuState {
-        *self.state.lock()
-    }
-
-    pub(crate) fn set_state(&self, state: UfsLuState) {
-        *self.state.lock() = state;
-    }
-
-    pub(crate) fn is_operational(&self) -> bool {
-        self.state() == UfsLuState::Operational
     }
 
     fn build_scsi_cmd(&self, command: mq::Command, lba: u64, blocks: u64) -> Result<UfsSCSICmd> {
@@ -265,12 +244,35 @@ pub(crate) struct UfsLuBlockOps;
 // Because the command was not submitted, no hardware completion can race with
 // returning the request to blk-mq.
 fn complete_unsubmitted(rq: Owned<mq::Request<UfsLuBlockOps>>, e: Error) {
-    rq.data_ref().inner.lock().reset();
+    let requeue = e == EBUSY;
+    if rq
+        .data_ref()
+        .inner
+        .lock()
+        .prepare_unsubmitted_return(requeue)
+        .is_err()
+    {
+        let host = rq.queue_data().host().clone();
+        let tag = rq.tag() as usize;
+        pr_err!(
+            "[RUFS] ufs_lu: unsubmitted request owns active DMA tag={}\n",
+            tag,
+        );
+        host.require_recovery("unsubmitted request owns active DMA", tag);
+        drop(rq);
+        return;
+    }
 
-    if e == EBUSY {
-        rq.requeue(true);
+    let returned = if requeue {
+        UfsRequestData::try_requeue_request(rq)
     } else {
-        rq.end(bindings::BLK_STS_IOERR);
+        UfsRequestData::try_end_request(rq, bindings::BLK_STS_IOERR)
+    };
+    if let Err(rq) = returned {
+        let host = rq.queue_data().host().clone();
+        let tag = rq.tag() as usize;
+        host.require_recovery("unsubmitted request is not returnable", tag);
+        drop(rq);
     }
 }
 
@@ -293,18 +295,22 @@ enum QueueOwner {
 
 pub(crate) struct QueueData {
     owner: QueueOwner,
+    host: Arc<UfsHostShared>,
 }
 
 impl QueueData {
-    pub(crate) fn dev(queue: Arc<UfsQueue>) -> Self {
+    pub(crate) fn dev(queue: Arc<UfsQueue>, host: Arc<UfsHostShared>) -> Self {
         Self {
             owner: QueueOwner::Dev(queue),
+            host,
         }
     }
 
     pub(crate) fn lu(lu: Arc<UfsLu>) -> Self {
+        let host = lu.host.clone();
         Self {
             owner: QueueOwner::Lu(lu),
+            host,
         }
     }
 
@@ -317,6 +323,10 @@ impl QueueData {
             QueueOwner::Dev(queue) => queue,
             QueueOwner::Lu(lu) => &lu.queue,
         }
+    }
+
+    pub(crate) fn host(&self) -> &Arc<UfsHostShared> {
+        &self.host
     }
 
     pub(crate) fn dev_queue(&self) -> Option<&Arc<UfsQueue>> {
@@ -491,31 +501,51 @@ impl Operations for UfsLuBlockOps {
     }
 
     fn complete(rq: ARef<mq::Request<Self>>) {
-        let queue = rq.queue_data().queue_arc().clone();
+        let host = rq.queue_data().host().clone();
         let tag = rq.tag() as usize;
         let rq = match OwnableRefCounted::try_from_shared(rq) {
             Ok(rq) => rq,
             Err(_rq) => {
                 pr_err!("[RUFS] ufs_lu: scheduled completion ownership conflict\n");
-                queue.require_recovery("scheduled completion ownership conflict", tag);
+                host.require_recovery("scheduled completion ownership conflict", tag);
                 return;
             }
         };
-        let disposition = match rq.data_ref().inner.lock().take_scheduled_completion() {
+        let scheduled = {
+            let mut request = rq.data_ref().inner.lock();
+            request.take_scheduled_completion()
+        };
+        let disposition = match scheduled {
             Ok(disposition) => disposition,
             Err(_) => {
                 pr_err!("[RUFS] ufs_lu: invalid scheduled completion state\n");
-                rq.data_ref().inner.lock().reset();
-                queue.require_recovery("invalid scheduled completion state", tag);
+                host.require_recovery("invalid scheduled completion state", tag);
+                let cleared = {
+                    let mut request = rq.data_ref().inner.lock();
+                    request.clear_dma_free()
+                };
+                if cleared.is_err() {
+                    drop(rq);
+                    return;
+                }
                 CompletionDisposition::End(u32::from(bindings::BLK_STS_IOERR))
             }
         };
 
         match disposition {
             CompletionDisposition::End(status) => {
-                rq.end(u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR))
+                let status = u8::try_from(status).unwrap_or(bindings::BLK_STS_IOERR);
+                if let Err(rq) = UfsRequestData::try_end_request(rq, status) {
+                    host.require_recovery("completed request is not returnable", tag);
+                    drop(rq);
+                }
             }
-            CompletionDisposition::Requeue => rq.requeue(true),
+            CompletionDisposition::Requeue => {
+                if let Err(rq) = UfsRequestData::try_requeue_request(rq) {
+                    host.require_recovery("completed request is not requeueable", tag);
+                    drop(rq);
+                }
+            }
         }
     }
 
@@ -528,13 +558,12 @@ impl Operations for UfsLuBlockOps {
             Ok(Some(request)) => request,
             Ok(None) | Err(_) => return mq::RequestTimeoutStatus::RetryLater,
         };
-        let status = UfsRequestData::timeout(&request, tag);
-
-        if status {
-            mq::RequestTimeoutStatus::Completed
-        } else {
-            mq::RequestTimeoutStatus::RetryLater
+        let host = UfsRequestData::timeout(&request, tag);
+        drop(request);
+        if let Some(host) = host {
+            host.require_timeout_recovery(tag as usize);
         }
+        mq::RequestTimeoutStatus::RetryLater
     }
 
     fn poll(
@@ -545,7 +574,7 @@ impl Operations for UfsLuBlockOps {
         let Some(lu) = queue_data.logical_unit() else {
             return Err(EIO);
         };
-        Ok(lu.queue.poll(hw_queue, batch))
+        Ok(lu.queue.poll(hw_queue, batch, queue_data.host()))
     }
 
     fn map_queues(tag_set: Pin<&mut TagSet<Self>>) {

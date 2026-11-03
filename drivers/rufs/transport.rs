@@ -13,9 +13,28 @@ use kernel::sync::Arc;
 pub(crate) mod mcq;
 pub(crate) mod sdb;
 
-pub(crate) use mcq::McqInterruptQueue;
-use mcq::{McqHwQueue, McqTransferBackend};
+pub(crate) use mcq::{
+    McqInterruptQueue, McqLogicalResetTarget, McqRequestsDmaAccessEnded,
+};
+use mcq::{
+    McqHwQueue, McqTransferBackend,
+};
+pub(crate) use sdb::SdbRequestsDmaAccessEnded;
 use sdb::{SdbHwQueue, SdbTransferBackend};
+
+pub(crate) struct RequestDmaAccessEnded {
+    task_tag: TaskTag,
+}
+
+impl RequestDmaAccessEnded {
+    fn new(task_tag: TaskTag) -> Self {
+        Self { task_tag }
+    }
+
+    pub(crate) fn task_tag(&self) -> TaskTag {
+        self.task_tag
+    }
+}
 
 const UFS_MCQ_DEFAULT_READ_QUEUES: usize = 0;
 const UFS_MCQ_DEFAULT_POLL_QUEUES: usize = 1;
@@ -105,38 +124,44 @@ impl UfsTransferConfig {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum TransferCompletion {
+pub(crate) enum CompletionPayload {
     Sdb,
     Mcq(CqEntry),
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum CompletedRequest {
-    Sdb(TaskTag),
-    Mcq { queue_id: u32, cqe: CqEntry },
+pub(crate) struct BackendCompletion {
+    task_tag: TaskTag,
+    queue_id: u32,
+    payload: CompletionPayload,
 }
 
-impl CompletedRequest {
-    pub(crate) fn task_tag(self) -> TaskTag {
-        match self {
-            Self::Sdb(task_tag) => task_tag,
-            Self::Mcq { cqe, .. } => TaskTag::from_value(cqe.task_tag()),
+impl BackendCompletion {
+    fn sdb(task_tag: TaskTag) -> Self {
+        Self {
+            task_tag,
+            queue_id: 0,
+            payload: CompletionPayload::Sdb,
         }
     }
 
-    pub(crate) fn queue_id(self) -> u32 {
-        match self {
-            Self::Sdb(_) => 0,
-            Self::Mcq { queue_id, .. } => queue_id,
+    fn mcq(queue_id: u32, cqe: CqEntry) -> Self {
+        Self {
+            task_tag: TaskTag::from_value(cqe.task_tag()),
+            queue_id,
+            payload: CompletionPayload::Mcq(cqe),
         }
     }
 
-    pub(crate) fn completion(self) -> TransferCompletion {
-        match self {
-            Self::Sdb(_) => TransferCompletion::Sdb,
-            Self::Mcq { cqe, .. } => TransferCompletion::Mcq(cqe),
-        }
+    pub(crate) fn task_tag(&self) -> TaskTag {
+        self.task_tag
+    }
+
+    pub(crate) fn queue_id(&self) -> u32 {
+        self.queue_id
+    }
+
+    pub(crate) fn into_parts(self) -> (TaskTag, u32, CompletionPayload) {
+        (self.task_tag, self.queue_id, self.payload)
     }
 }
 
@@ -147,39 +172,39 @@ pub(crate) struct CompletionFault {
     pub(crate) queue_id: Option<u32>,
 }
 
-pub(crate) struct CompletedRequests {
-    requests: [Option<CompletedRequest>; COMPLETION_BATCH_SIZE],
+pub(crate) struct CompletionBatch {
+    completions: [Option<BackendCompletion>; COMPLETION_BATCH_SIZE],
     len: usize,
     pos: usize,
     fault: Option<CompletionFault>,
 }
 
-impl CompletedRequests {
+impl CompletionBatch {
     pub(crate) const fn capacity() -> usize {
         COMPLETION_BATCH_SIZE
     }
 
     pub(crate) fn new() -> Self {
         Self {
-            requests: [None; COMPLETION_BATCH_SIZE],
+            completions: [const { None }; COMPLETION_BATCH_SIZE],
             len: 0,
             pos: 0,
             fault: None,
         }
     }
 
-    fn insert(&mut self, request: CompletedRequest) -> Result<()> {
-        if self.len == self.requests.len() {
+    fn insert(&mut self, completion: BackendCompletion) -> Result<()> {
+        if self.len == self.completions.len() {
             return Err(ENOMEM);
         }
 
-        self.requests[self.len] = Some(request);
+        self.completions[self.len] = Some(completion);
         self.len += 1;
         Ok(())
     }
 
     pub(crate) fn insert_mcq(&mut self, queue_id: u32, cqe: CqEntry) -> Result<()> {
-        self.insert(CompletedRequest::Mcq { queue_id, cqe })
+        self.insert(BackendCompletion::mcq(queue_id, cqe))
     }
 
     pub(crate) fn insert_sdb_mask(&mut self, mut mask: u32) -> Result<u32> {
@@ -189,7 +214,7 @@ impl CompletedRequests {
             let tag = mask.trailing_zeros();
             let tag_mask = 1u32 << tag;
             mask &= !tag_mask;
-            self.insert(CompletedRequest::Sdb(TaskTag::new(tag)?))?;
+            self.insert(BackendCompletion::sdb(TaskTag::new(tag)?))?;
             inserted |= tag_mask;
         }
 
@@ -197,7 +222,7 @@ impl CompletedRequests {
     }
 
     pub(crate) fn is_full(&self) -> bool {
-        self.len == self.requests.len()
+        self.len == self.completions.len()
     }
 
     pub(crate) fn record_fault(&mut self, reason: &'static str, tag: usize, queue_id: Option<u32>) {
@@ -214,14 +239,14 @@ impl CompletedRequests {
         self.fault.take()
     }
 
-    pub(crate) fn take_next(&mut self) -> Option<CompletedRequest> {
+    pub(crate) fn take_next(&mut self) -> Option<BackendCompletion> {
         if self.pos == self.len {
             return None;
         }
 
-        let request = self.requests[self.pos].take();
+        let completion = self.completions[self.pos].take();
         self.pos += 1;
-        request
+        completion
     }
 }
 
@@ -272,7 +297,7 @@ impl UfsHwQueue {
         }
     }
 
-    pub(crate) fn poll(&self, completed: &mut CompletedRequests) -> Result<()> {
+    pub(crate) fn poll(&self, completed: &mut CompletionBatch) -> Result<()> {
         match &self.inner {
             UfsHwQueueKind::Sdb(queue) => queue.poll(completed),
             UfsHwQueueKind::Mcq(queue) => queue.poll(completed),
@@ -283,9 +308,96 @@ impl UfsHwQueue {
 pub(crate) trait UfsTransferOps: Send + Sync {
     fn hw_queues(&self) -> Result<KVec<UfsHwQueue>>;
     fn dump_state(&self, tag: usize, reason: &str);
-    fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()>;
+    fn collect_completions(&self, completed: &mut CompletionBatch) -> Result<()>;
+    fn collect_recovery_completions(&self, completed: &mut CompletionBatch) -> Result<()>;
     fn enable_interrupts(&self);
     fn reset(&self) -> Result<()>;
+    fn supports_sdb_task_abort(&self) -> bool {
+        false
+    }
+    fn claim_sdb_task(&self, _task_tag: TaskTag) -> Result<()> {
+        Err(EOPNOTSUPP)
+    }
+    fn finish_sdb_task(&self, _task_tag: TaskTag) -> Result<RequestDmaAccessEnded> {
+        Err(EOPNOTSUPP)
+    }
+    fn supports_sdb_logical_reset(&self) -> bool {
+        false
+    }
+    fn claim_sdb_logical_unit(
+        &self,
+        _task_mask: u32,
+        _task_claimed_mask: u32,
+    ) -> Result<()> {
+        Err(EOPNOTSUPP)
+    }
+    fn finish_sdb_logical_unit(
+        &self,
+        _task_mask: u32,
+    ) -> Result<SdbRequestsDmaAccessEnded> {
+        Err(EOPNOTSUPP)
+    }
+    fn supports_mcq_task_abort(&self) -> bool {
+        false
+    }
+    fn claim_mcq_task(
+        &self,
+        _queue_id: u32,
+        _task_tag: TaskTag,
+    ) -> Result<()> {
+        Err(EOPNOTSUPP)
+    }
+    fn begin_mcq_task_cleanup(
+        &self,
+        _queue_id: u32,
+        _task_tag: TaskTag,
+        _lun: u8,
+    ) -> Result<()> {
+        Err(EOPNOTSUPP)
+    }
+    fn finish_mcq_task(
+        &self,
+        _queue_id: u32,
+        _task_tag: TaskTag,
+    ) -> Result<RequestDmaAccessEnded> {
+        Err(EOPNOTSUPP)
+    }
+    fn claim_mcq_sqe_nullification(
+        &self,
+        _queue_id: u32,
+        _task_tag: TaskTag,
+    ) -> Result<()> {
+        Err(EOPNOTSUPP)
+    }
+    fn finish_mcq_sqe_nullification(
+        &self,
+        _queue_id: u32,
+        _task_tag: TaskTag,
+    ) -> Result<RequestDmaAccessEnded> {
+        Err(EOPNOTSUPP)
+    }
+    fn supports_mcq_logical_reset(&self) -> bool {
+        false
+    }
+    fn claim_mcq_logical_unit(
+        &self,
+        _targets: &mut [McqLogicalResetTarget],
+    ) -> Result<()> {
+        Err(EOPNOTSUPP)
+    }
+    fn begin_mcq_logical_unit_cleanup(
+        &self,
+        _targets: &[McqLogicalResetTarget],
+        _lun: u8,
+    ) -> Result<()> {
+        Err(EOPNOTSUPP)
+    }
+    fn finish_mcq_logical_unit(
+        &self,
+        _targets: &[McqLogicalResetTarget],
+    ) -> Result<McqRequestsDmaAccessEnded> {
+        Err(EOPNOTSUPP)
+    }
 }
 
 pub(crate) struct UfsTransferBackend {
@@ -332,8 +444,15 @@ impl UfsTransferBackend {
         self.ops.hw_queues()
     }
 
-    pub(crate) fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()> {
+    pub(crate) fn collect_completions(&self, completed: &mut CompletionBatch) -> Result<()> {
         self.ops.collect_completions(completed)
+    }
+
+    pub(crate) fn collect_recovery_completions(
+        &self,
+        completed: &mut CompletionBatch,
+    ) -> Result<()> {
+        self.ops.collect_recovery_completions(completed)
     }
 
     pub(crate) fn interrupt_queues(&self) -> &[McqInterruptQueue] {
@@ -350,5 +469,110 @@ impl UfsTransferBackend {
 
     pub(crate) fn reset(&self) -> Result<()> {
         self.ops.reset()
+    }
+
+    pub(crate) fn supports_sdb_task_abort(&self) -> bool {
+        self.ops.supports_sdb_task_abort()
+    }
+
+    pub(crate) fn claim_sdb_task(&self, task_tag: TaskTag) -> Result<()> {
+        self.ops.claim_sdb_task(task_tag)
+    }
+
+    pub(crate) fn finish_sdb_task(&self, task_tag: TaskTag) -> Result<RequestDmaAccessEnded> {
+        self.ops.finish_sdb_task(task_tag)
+    }
+
+    pub(crate) fn supports_sdb_logical_reset(&self) -> bool {
+        self.ops.supports_sdb_logical_reset()
+    }
+
+    pub(crate) fn claim_sdb_logical_unit(
+        &self,
+        task_mask: u32,
+        task_claimed_mask: u32,
+    ) -> Result<()> {
+        self.ops
+            .claim_sdb_logical_unit(task_mask, task_claimed_mask)
+    }
+
+    pub(crate) fn finish_sdb_logical_unit(
+        &self,
+        task_mask: u32,
+    ) -> Result<SdbRequestsDmaAccessEnded> {
+        self.ops.finish_sdb_logical_unit(task_mask)
+    }
+
+    pub(crate) fn supports_mcq_task_abort(&self) -> bool {
+        self.ops.supports_mcq_task_abort()
+    }
+
+    pub(crate) fn claim_mcq_task(
+        &self,
+        queue_id: u32,
+        task_tag: TaskTag,
+    ) -> Result<()> {
+        self.ops.claim_mcq_task(queue_id, task_tag)
+    }
+
+    pub(crate) fn begin_mcq_task_cleanup(
+        &self,
+        queue_id: u32,
+        task_tag: TaskTag,
+        lun: u8,
+    ) -> Result<()> {
+        self.ops.begin_mcq_task_cleanup(queue_id, task_tag, lun)
+    }
+
+    pub(crate) fn finish_mcq_task(
+        &self,
+        queue_id: u32,
+        task_tag: TaskTag,
+    ) -> Result<RequestDmaAccessEnded> {
+        self.ops.finish_mcq_task(queue_id, task_tag)
+    }
+
+    pub(crate) fn claim_mcq_sqe_nullification(
+        &self,
+        queue_id: u32,
+        task_tag: TaskTag,
+    ) -> Result<()> {
+        self.ops
+            .claim_mcq_sqe_nullification(queue_id, task_tag)
+    }
+
+    pub(crate) fn finish_mcq_sqe_nullification(
+        &self,
+        queue_id: u32,
+        task_tag: TaskTag,
+    ) -> Result<RequestDmaAccessEnded> {
+        self.ops
+            .finish_mcq_sqe_nullification(queue_id, task_tag)
+    }
+
+    pub(crate) fn supports_mcq_logical_reset(&self) -> bool {
+        self.ops.supports_mcq_logical_reset()
+    }
+
+    pub(crate) fn claim_mcq_logical_unit(
+        &self,
+        targets: &mut [McqLogicalResetTarget],
+    ) -> Result<()> {
+        self.ops.claim_mcq_logical_unit(targets)
+    }
+
+    pub(crate) fn begin_mcq_logical_unit_cleanup(
+        &self,
+        targets: &[McqLogicalResetTarget],
+        lun: u8,
+    ) -> Result<()> {
+        self.ops.begin_mcq_logical_unit_cleanup(targets, lun)
+    }
+
+    pub(crate) fn finish_mcq_logical_unit(
+        &self,
+        targets: &[McqLogicalResetTarget],
+    ) -> Result<McqRequestsDmaAccessEnded> {
+        self.ops.finish_mcq_logical_unit(targets)
     }
 }

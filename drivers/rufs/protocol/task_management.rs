@@ -22,7 +22,7 @@ pub(crate) enum TaskManagementFunction {
 pub(crate) struct TaskManagementRequest {
     function: TaskManagementFunction,
     lun: u8,
-    task_tag: TaskTag,
+    task_tag: Option<TaskTag>,
 }
 
 impl TaskManagementRequest {
@@ -34,7 +34,15 @@ impl TaskManagementRequest {
         Self {
             function,
             lun,
-            task_tag,
+            task_tag: Some(task_tag),
+        }
+    }
+
+    pub(crate) const fn logical_reset(lun: u8) -> Self {
+        Self {
+            function: TaskManagementFunction::LogicalReset,
+            lun,
+            task_tag: None,
         }
     }
 
@@ -46,7 +54,7 @@ impl TaskManagementRequest {
         self.lun
     }
 
-    pub(crate) const fn task_tag(self) -> TaskTag {
+    pub(crate) const fn task_tag(self) -> Option<TaskTag> {
         self.task_tag
     }
 }

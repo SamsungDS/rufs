@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use crate::queue::*;
+use crate::host::UfsHostShared;
 use crate::reg::*;
 use crate::task_management::TaskManagement;
 use crate::transport::McqInterruptQueue;
@@ -30,6 +31,7 @@ struct UfsUicHandler {
 struct UfsQueueHandler {
     reg: Arc<UfsReg>,
     queue: Arc<UfsQueue>,
+    host: Arc<UfsHostShared>,
     task_management: Arc<TaskManagement>,
     policy: UfsInterruptPolicy,
     pending_interrupts: Atomic<u32>,
@@ -39,13 +41,19 @@ struct UfsQueueHandler {
 #[pin_data]
 struct UfsMcqQueueHandler {
     queue: Arc<UfsQueue>,
+    host: Arc<UfsHostShared>,
     interrupt_queue: McqInterruptQueue,
 }
 
 impl UfsMcqQueueHandler {
-    fn new(queue: Arc<UfsQueue>, interrupt_queue: McqInterruptQueue) -> impl PinInit<Self, Error> {
+    fn new(
+        queue: Arc<UfsQueue>,
+        host: Arc<UfsHostShared>,
+        interrupt_queue: McqInterruptQueue,
+    ) -> impl PinInit<Self, Error> {
         try_pin_init!(Self {
             queue,
+            host,
             interrupt_queue,
         })
     }
@@ -182,11 +190,11 @@ impl irq::ThreadedHandler for UfsQueueHandler {
                     errors.dme,
                 );
                 if errors.requires_recovery() {
-                    self.queue.require_uic_recovery(errors);
+                    self.host.require_uic_recovery(errors);
                 }
             }
             if is_transfer_recovery_interrupt(interrupt_status) {
-                self.queue.require_recovery("transfer error interrupt", 0);
+                self.host.require_recovery("transfer error interrupt", 0);
             }
             if is_task_management_completion(interrupt_status) {
                 self.task_management.complete();
@@ -194,7 +202,7 @@ impl irq::ThreadedHandler for UfsQueueHandler {
             if !self.per_queue_irqs_active.load(Acquire)
                 && has_queue_completion_or_error(interrupt_status)
             {
-                self.queue.complete();
+                self.queue.complete(&self.host);
             }
         }
 
@@ -211,7 +219,8 @@ impl irq::ThreadedHandler for UfsMcqQueueHandler {
     }
 
     fn handle_threaded(&self) -> IrqReturn {
-        self.queue.complete_queue(&self.interrupt_queue);
+        self.queue
+            .complete_queue(&self.interrupt_queue, &self.host);
         IrqReturn::Handled
     }
 }
@@ -274,12 +283,14 @@ impl<'a> UfsIrq<'a> {
         request: IrqRequest<'a>,
         reg: Arc<UfsReg>,
         queue: Arc<UfsQueue>,
+        host: Arc<UfsHostShared>,
         task_management: Arc<TaskManagement>,
         policy: UfsInterruptPolicy,
     ) -> Result<()> {
         let handler = try_pin_init!(UfsQueueHandler {
             reg,
             queue,
+            host,
             task_management,
             policy,
             pending_interrupts: Atomic::new(0),
@@ -306,6 +317,7 @@ impl<'a> UfsIrq<'a> {
     pub(crate) fn request_mcq_queue_irqs<F>(
         &self,
         queue: Arc<UfsQueue>,
+        host: Arc<UfsHostShared>,
         interrupt_queues: &[McqInterruptQueue],
         mut request: F,
     ) -> Result<()>
@@ -323,8 +335,11 @@ impl<'a> UfsIrq<'a> {
         let mut registrations = KVec::new();
 
         for interrupt_queue in interrupt_queues {
-            let handler =
-                UfsMcqQueueHandler::new(queue.clone(), McqInterruptQueue::clone(interrupt_queue));
+            let handler = UfsMcqQueueHandler::new(
+                queue.clone(),
+                host.clone(),
+                McqInterruptQueue::clone(interrupt_queue),
+            );
             let request = match request() {
                 Ok(request) => request,
                 Err(e) => {

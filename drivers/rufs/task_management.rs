@@ -4,9 +4,10 @@
 
 #![allow(dead_code)]
 
+use crate::command::TaskTag;
 use crate::dma::UfsDma;
 use crate::protocol::task_management::{
-    TaskManagementRequest, TaskManagementServiceResponse,
+    TaskManagementFunction, TaskManagementRequest, TaskManagementServiceResponse,
 };
 use crate::reg::UfsReg;
 use kernel::sync::{barrier, Arc, Completion, Mutex, SpinLock};
@@ -109,6 +110,37 @@ impl TaskManagement {
             .fetch_task_management_response(slot, request);
         *self.state.lock() = TaskManagementState::Ready;
         response
+    }
+
+    pub(crate) fn query_task(
+        &self,
+        lun: u8,
+        task_tag: TaskTag,
+    ) -> Result<TaskManagementServiceResponse> {
+        self.execute(TaskManagementRequest::new(
+            TaskManagementFunction::QueryTask,
+            lun,
+            task_tag,
+        ))
+    }
+
+    pub(crate) fn abort_task(
+        &self,
+        lun: u8,
+        task_tag: TaskTag,
+    ) -> Result<TaskManagementServiceResponse> {
+        self.execute(TaskManagementRequest::new(
+            TaskManagementFunction::AbortTask,
+            lun,
+            task_tag,
+        ))
+    }
+
+    pub(crate) fn logical_reset(
+        &self,
+        lun: u8,
+    ) -> Result<TaskManagementServiceResponse> {
+        self.execute(TaskManagementRequest::logical_reset(lun))
     }
 
     pub(crate) fn complete(&self) {

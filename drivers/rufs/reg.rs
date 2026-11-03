@@ -154,8 +154,8 @@ register! {
     MCQ_SQHP(u32) @ McqOprBase + 0x00 { 31:0 value; }
     MCQ_SQTP(u32) @ McqOprBase + 0x04 { 31:0 value; }
     MCQ_SQRTC(u32) @ McqOprBase + 0x08 {
-        2:2 initiate_cleanup => bool;
-        1:0 operation;
+        1:1 initiate_cleanup => bool;
+        0:0 stop => bool;
     }
     MCQ_SQCTI(u32) @ McqOprBase + 0x0c {
         15:8 lun;
@@ -163,7 +163,7 @@ register! {
     }
     MCQ_SQRTS(u32) @ McqOprBase + 0x10 {
         7:4 cleanup_error_code;
-        1:1 cleanup_in_progress => bool;
+        1:1 cleanup_complete => bool;
         0:0 stopped => bool;
     }
     MCQ_CQHP(u32) @ McqOprBase + 0x00 { 31:0 value; }
@@ -182,9 +182,6 @@ const MCQ_ENTRY_SIZE_IN_DWORD: u32 = 8;
 const MCQ_DEFAULT_OPR_STRIDE: usize = 48;
 const MCQ_POLL_INTERVAL_US: i64 = 20;
 const MCQ_POLL_TIMEOUT_US: i64 = 500000;
-
-const MCQ_SQ_START: u32 = 0x0;
-const MCQ_SQ_STOP: u32 = 0x1;
 
 // IS - Interrupt Status
 const UTP_TRANSFER_REQ_COMPL: u32 = 0x00000001;
@@ -508,9 +505,53 @@ impl UfsReg {
     }
 
     #[inline]
-    pub(crate) fn clear_utrl_slots(&self, mask: u32) {
+    pub(crate) fn clear_utrl_slot(&self, slot: u32) -> Result<()> {
+        let mask = 1u32.checked_shl(slot).ok_or(EINVAL)?;
+        self.clear_utrl_slots(mask)
+    }
+
+    #[inline]
+    pub(crate) fn clear_utrl_slots(&self, mask: u32) -> Result<()> {
+        if mask == 0 {
+            return Err(EINVAL);
+        }
         let access = self.resources.hci_access().unwrap();
-        access.write_reg(UTP_TRANSFER_REQ_LIST_CLEAR::zeroed().with_value(mask))
+        access.write_reg(UTP_TRANSFER_REQ_LIST_CLEAR::zeroed().with_value(!mask));
+        Ok(())
+    }
+
+    pub(crate) fn wait_for_utrl_slot_clear(
+        &self,
+        slot: u32,
+        interval_us: i64,
+        timeout_ms: i64,
+    ) -> Result<()> {
+        let mask = 1u32.checked_shl(slot).ok_or(EINVAL)?;
+        read_poll_timeout(
+            || Ok(self.read_utrl_doorbell()),
+            |doorbell: &u32| doorbell & mask == 0,
+            Delta::from_micros(interval_us),
+            Delta::from_millis(timeout_ms),
+        )
+        .map(|_| ())
+    }
+
+    pub(crate) fn wait_for_utrl_slots_clear(
+        &self,
+        mask: u32,
+        interval_us: i64,
+        timeout_ms: i64,
+    ) -> Result<()> {
+        if mask == 0 {
+            return Err(EINVAL);
+        }
+        read_poll_timeout(
+            || Ok(self.read_utrl_doorbell()),
+            |doorbell: &u32| doorbell & mask == 0,
+            Delta::from_micros(interval_us),
+            Delta::from_millis(timeout_ms),
+        )
+        .map(|_| ())
     }
 
     // UTMRL(Task Management)
@@ -1038,9 +1079,9 @@ impl UfsReg {
         &self,
         oprs: &UfsMcqOprSet,
         queue: usize,
-        value: u32,
+        stop: bool,
     ) -> Result<()> {
-        let value = MCQ_SQRTC::zeroed().try_with_operation(value)?;
+        let value = MCQ_SQRTC::zeroed().with_stop(stop);
         self.write_mcq_opr(oprs, UfsMcqOprRegion::Sqd, queue, value)
     }
 
@@ -1066,12 +1107,12 @@ impl UfsReg {
     }
 
     pub(crate) fn stop_mcq_sq(&self, oprs: &UfsMcqOprSet, queue: usize) -> Result<()> {
-        self.write_mcq_sq_runtime_control(oprs, queue, MCQ_SQ_STOP)?;
+        self.write_mcq_sq_runtime_control(oprs, queue, true)?;
         self.wait_mcq_sq_stopped(oprs, queue, true)
     }
 
     pub(crate) fn start_mcq_sq(&self, oprs: &UfsMcqOprSet, queue: usize) -> Result<()> {
-        self.write_mcq_sq_runtime_control(oprs, queue, MCQ_SQ_START)?;
+        self.write_mcq_sq_runtime_control(oprs, queue, false)?;
         self.wait_mcq_sq_stopped(oprs, queue, false)
     }
 
@@ -1094,7 +1135,7 @@ impl UfsReg {
         self.write_mcq_opr(oprs, UfsMcqOprRegion::Sqd, queue, rtc)?;
         read_poll_timeout(
             || self.read_mcq_opr::<MCQ_SQRTS>(oprs, UfsMcqOprRegion::Sqd, queue),
-            |v: &MCQ_SQRTS| v.cleanup_in_progress(),
+            |v: &MCQ_SQRTS| v.cleanup_complete(),
             Delta::from_micros(MCQ_POLL_INTERVAL_US),
             Delta::from_micros(MCQ_POLL_TIMEOUT_US),
         )

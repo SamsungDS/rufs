@@ -20,6 +20,7 @@ const ALIGNED_UPIU_SIZE: usize = 512;
 
 enum UtpCmdType {
     UfsStorage = 0x1,
+    Null = 0xf,
 }
 
 enum UtpDataDirection {
@@ -228,6 +229,16 @@ impl CqEntry {
 }
 
 impl Utrd {
+    pub(crate) fn matches_command_descriptor(&self, other: &Self) -> bool {
+        let this = u64::from_le(self.command_desc_base_addr) & CQE_UCD_BASE_ADDR;
+        let other = u64::from_le(other.command_desc_base_addr) & CQE_UCD_BASE_ADDR;
+        this == other
+    }
+
+    pub(crate) fn nullify(&mut self) {
+        self.header.set_cmd_type(UtpCmdType::Null);
+    }
+
     pub(crate) fn set_command_descriptor(mut self, command_desc_base_addr: u64) -> Self {
         self.command_desc_base_addr = command_desc_base_addr.to_le();
         self.rsp_upiu_length = ((ALIGNED_UPIU_SIZE >> 2) as u16).to_le();

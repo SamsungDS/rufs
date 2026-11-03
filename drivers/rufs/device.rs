@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 use crate::lu::{QueueData, UfsLuBlockOps};
+use crate::host::UfsHostShared;
 use crate::protocol::query::*;
 use crate::protocol::UfsCmd;
 use crate::queue::*;
@@ -38,13 +39,16 @@ pub(crate) struct UfsDev {
 }
 
 impl UfsDev {
-    pub(crate) fn new(ufs_queue: Arc<UfsQueue>) -> Result<Arc<Self>> {
+    pub(crate) fn new(
+        ufs_queue: Arc<UfsQueue>,
+        host: Arc<UfsHostShared>,
+    ) -> Result<Arc<Self>> {
         let limits = LimitsBuilder::<UfsLuBlockOps>::new().build()?;
 
         let request_queue = RequestQueue::new(
             ufs_queue.tags.clone(),
             limits,
-            KBox::new(QueueData::dev(ufs_queue.clone()), GFP_KERNEL)?,
+            KBox::new(QueueData::dev(ufs_queue.clone(), host), GFP_KERNEL)?,
             ufs_queue.tags.queue_depth(),
         )?;
 

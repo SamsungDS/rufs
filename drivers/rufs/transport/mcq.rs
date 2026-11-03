@@ -2,11 +2,13 @@
 
 //! UFSHCI multi-circular queue transport.
 
+use crate::command::{TaskTag, TASK_TAG_COUNT};
 use crate::dma::UfsDma;
-use crate::hci::descriptor::{CqEntry, SqEntry};
+use crate::hci::descriptor::{CqEntry, SqEntry, UtpOcs};
 use crate::reg::{McqRegisterLayout, UfsMcqOprRegion, UfsMcqOprSet, UfsReg};
 use crate::transport::{
-    CompletedRequests, McqConfig, SubmissionOutcome, UfsHwQueue, UfsTransferOps,
+    CompletionBatch, McqConfig, RequestDmaAccessEnded, SubmissionOutcome,
+    UfsHwQueue, UfsTransferOps,
 };
 use kernel::io::{io_project, Io};
 use kernel::sync::{barrier, Arc, SpinLock};
@@ -38,6 +40,82 @@ struct UfsMcqCompletionQueue {
     cqe: dma::Coherent<[CqEntry]>,
     cq_tail_slot: u32,
     cq_head_slot: u32,
+    recovery: KVec<McqRecoveryCompletion>,
+}
+
+struct McqRecoveryCompletion {
+    task_tag: TaskTag,
+    cqe: Option<CqEntry>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct McqLogicalResetTarget {
+    queue_id: u32,
+    task_tag: TaskTag,
+    task_claimed: bool,
+    unfetched: bool,
+}
+
+impl McqLogicalResetTarget {
+    pub(crate) fn new(queue_id: u32, task_tag: TaskTag, task_claimed: bool) -> Self {
+        Self {
+            queue_id,
+            task_tag,
+            task_claimed,
+            unfetched: false,
+        }
+    }
+
+    pub(crate) fn task_claimed(&self) -> bool {
+        self.task_claimed
+    }
+}
+
+const MCQ_TASK_TAG_WORDS: usize = TASK_TAG_COUNT / u64::BITS as usize;
+
+pub(crate) struct McqRequestsDmaAccessEnded {
+    task_tags: [u64; MCQ_TASK_TAG_WORDS],
+}
+
+impl McqRequestsDmaAccessEnded {
+    fn insert(&mut self, task_tag: TaskTag) -> Result<()> {
+        let index = task_tag.index() / u64::BITS as usize;
+        let bit = task_tag.index() % u64::BITS as usize;
+        let mask = 1u64 << bit;
+        if self.task_tags[index] & mask != 0 {
+            return Err(EEXIST);
+        }
+        self.task_tags[index] |= mask;
+        Ok(())
+    }
+
+    pub(crate) fn contains(&self, task_tag: TaskTag) -> bool {
+        let index = task_tag.index() / u64::BITS as usize;
+        let bit = task_tag.index() % u64::BITS as usize;
+        self.task_tags[index] & (1u64 << bit) != 0
+    }
+
+    pub(crate) fn take(&mut self, task_tag: TaskTag) -> Result<RequestDmaAccessEnded> {
+        let index = task_tag.index() / u64::BITS as usize;
+        let bit = task_tag.index() % u64::BITS as usize;
+        let mask = 1u64 << bit;
+        if self.task_tags[index] & mask == 0 {
+            return Err(ENOENT);
+        }
+        self.task_tags[index] &= !mask;
+        Ok(RequestDmaAccessEnded::new(task_tag))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.task_tags.iter().all(|word| *word == 0)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.task_tags
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
 }
 
 impl UfsMcqQueue {
@@ -52,6 +130,7 @@ impl UfsMcqQueue {
         }
 
         let entries = max_entries as usize;
+        let recovery = KVec::with_capacity(entries, GFP_KERNEL)?;
         Ok(Self {
             descriptor: UfsMcqQueueDescriptor {
                 id,
@@ -66,6 +145,7 @@ impl UfsMcqQueue {
                 cqe: dma::Coherent::<CqEntry>::zeroed_slice_zerocopy(dev, entries, GFP_KERNEL)?,
                 cq_tail_slot: 0,
                 cq_head_slot: 0,
+                recovery,
             },
         })
     }
@@ -172,6 +252,44 @@ impl UfsMcqSubmissionQueue {
 
         Ok(Self::sq_slot_offset(self.sq_tail_slot))
     }
+
+    fn find_task_slot(
+        &self,
+        reg: &UfsReg,
+        descriptor: &UfsMcqQueueDescriptor,
+        target: &SqEntry,
+    ) -> Result<Option<u32>> {
+        let mut slot = descriptor.offset_to_slot(
+            reg.read_mcq_sq_head(descriptor.oprs(), descriptor.id() as usize)?,
+            core::mem::size_of::<SqEntry>() as u32,
+        )?;
+
+        while slot != self.sq_tail_slot {
+            let sqe = io_project!(self.sqe, [try: slot as usize]).copy_read();
+            if sqe.matches_command_descriptor(target) {
+                return Ok(Some(slot));
+            }
+            slot = self.next_slot(descriptor, slot);
+        }
+
+        Ok(None)
+    }
+
+    fn next_slot(&self, descriptor: &UfsMcqQueueDescriptor, slot: u32) -> u32 {
+        let next = slot + 1;
+        if next == descriptor.max_entries {
+            0
+        } else {
+            next
+        }
+    }
+
+    fn nullify_slot(&mut self, slot: u32) -> Result<()> {
+        let mut sqe = io_project!(self.sqe, [try: slot as usize]).copy_read();
+        sqe.nullify();
+        io_project!(self.sqe, [try: slot as usize]).copy_write(sqe);
+        Ok(())
+    }
 }
 
 impl UfsMcqCompletionQueue {
@@ -202,6 +320,90 @@ impl UfsMcqCompletionQueue {
     fn reset(&mut self) {
         self.cq_tail_slot = 0;
         self.cq_head_slot = 0;
+        self.recovery.clear();
+    }
+
+    fn contains_task_tag(
+        &self,
+        descriptor: &UfsMcqQueueDescriptor,
+        task_tag: TaskTag,
+    ) -> Result<bool> {
+        let mut slot = self.cq_head_slot;
+        while slot != self.cq_tail_slot {
+            let cqe = io_project!(self.cqe, [try: slot as usize]).copy_read();
+            if cqe.is_empty() {
+                return Err(EIO);
+            }
+            if cqe.task_tag() == task_tag.value() {
+                return Ok(true);
+            }
+            slot += 1;
+            if slot == descriptor.max_entries {
+                slot = 0;
+            }
+        }
+        Ok(false)
+    }
+
+    fn commit_task_recovery(
+        &mut self,
+        descriptor: &UfsMcqQueueDescriptor,
+        task_tag: TaskTag,
+    ) -> Result<()> {
+        if self
+            .recovery
+            .iter()
+            .any(|recovery| recovery.task_tag == task_tag)
+        {
+            return Err(EBUSY);
+        }
+        if self.contains_task_tag(descriptor, task_tag)? {
+            return Err(EAGAIN);
+        }
+        self.recovery
+            .push_within_capacity(McqRecoveryCompletion {
+                task_tag,
+                cqe: None,
+            })
+            .map_err(|_| EOVERFLOW)?;
+        Ok(())
+    }
+
+    fn store_recovery_completion(&mut self, cqe: CqEntry) -> Result<bool> {
+        let Some(recovery) = self
+            .recovery
+            .iter_mut()
+            .find(|recovery| cqe.task_tag() == recovery.task_tag.value())
+        else {
+            return Ok(false);
+        };
+        if recovery.cqe.replace(cqe).is_some() {
+            return Err(EIO);
+        }
+        Ok(true)
+    }
+
+    fn take_recovery_completion(&mut self, task_tag: TaskTag) -> Result<CqEntry> {
+        let Some(index) = self
+            .recovery
+            .iter()
+            .position(|recovery| recovery.task_tag == task_tag)
+        else {
+            return Err(ENOENT);
+        };
+        if self.recovery[index].cqe.is_none() {
+            return Err(EAGAIN);
+        }
+        let recovery = self.recovery.remove(index).map_err(|_| EIO)?;
+        recovery.cqe.ok_or(EIO)
+    }
+
+    fn has_recovery_completion(&self, task_tag: TaskTag) -> Result<bool> {
+        self.recovery
+            .iter()
+            .find(|recovery| recovery.task_tag == task_tag)
+            .map(|recovery| recovery.cqe.is_some())
+            .ok_or(ENOENT)
     }
 
     fn consume_entry(&mut self, descriptor: &UfsMcqQueueDescriptor) -> Result<Option<CqEntry>> {
@@ -292,7 +494,7 @@ impl McqHardwareQueue {
         &self,
         reg: &UfsReg,
         dma: &UfsDma,
-        completed_requests: &mut CompletedRequests,
+        completed_requests: &mut CompletionBatch,
     ) -> Result<()> {
         let mut completion = self.completion.lock();
         self.descriptor.acknowledge_completion_events(reg)?;
@@ -312,6 +514,7 @@ impl McqHardwareQueue {
 
                 consumed = true;
                 match dma.validate_cq_entry(&cqe, self.descriptor.id()) {
+                    Ok(()) if completion.store_recovery_completion(cqe)? => {}
                     Ok(()) => completed_requests.insert_mcq(self.descriptor.id(), cqe)?,
                     Err(_) => completed_requests.record_fault(
                         "invalid MCQ completion descriptor",
@@ -350,7 +553,7 @@ impl McqHwQueue {
         self.queue.submit(&self.reg, &self.dma, tag, publish)
     }
 
-    pub(crate) fn poll(&self, completed: &mut CompletedRequests) -> Result<()> {
+    pub(crate) fn poll(&self, completed: &mut CompletionBatch) -> Result<()> {
         if !self.poll {
             return Err(EINVAL);
         }
@@ -377,7 +580,7 @@ impl McqInterruptQueue {
             .acknowledge_completion_events(&self.reg)
     }
 
-    pub(crate) fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()> {
+    pub(crate) fn collect_completions(&self, completed: &mut CompletionBatch) -> Result<()> {
         self.queue
             .collect_completions(&self.reg, &self.dma, completed)
     }
@@ -402,7 +605,7 @@ impl McqQueueSet {
         reg: &UfsReg,
         dma: &UfsDma,
         nr_queues: usize,
-        completed_requests: &mut CompletedRequests,
+        completed_requests: &mut CompletionBatch,
     ) -> Result<()> {
         for queue in self.queues.iter().take(nr_queues) {
             queue.collect_completions(reg, dma, completed_requests)?;
@@ -621,13 +824,361 @@ impl McqTransferBackend {
     // MCQ CQE consumption is destructive because the software CQ head advances.
     // Snapshot each CQE before returning its tag so request finalization can
     // decode the consumed CQE after the backend lock is released.
-    fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()> {
+    fn collect_completions(&self, completed: &mut CompletionBatch) -> Result<()> {
         self.queues.poll_completions(
             &self.reg,
             &self.dma,
             self.config.interrupt_queues,
             completed,
         )
+    }
+
+    fn collect_recovery_completions(&self, completed: &mut CompletionBatch) -> Result<()> {
+        self.queues
+            .poll_completions(&self.reg, &self.dma, self.queues.len(), completed)
+    }
+
+    fn claim_task(&self, queue_id: u32, task_tag: TaskTag) -> Result<()> {
+        let queue_id = usize::try_from(queue_id).map_err(|_| EINVAL)?;
+        let queue = self.queues.queues.get(queue_id).ok_or(EINVAL)?;
+        let _submission = queue.submission.lock();
+
+        self.reg
+            .stop_mcq_sq(queue.descriptor.oprs(), queue_id)?;
+
+        let commit = {
+            let mut completion = queue.completion.lock();
+            completion.update_tail(&self.reg, &queue.descriptor)?;
+            barrier::dma_mb(barrier::Read);
+            completion.commit_task_recovery(&queue.descriptor, task_tag)
+        };
+        if let Err(error) = commit {
+            self.reg
+                .start_mcq_sq(queue.descriptor.oprs(), queue_id)?;
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    fn begin_task_cleanup(
+        &self,
+        queue_id: u32,
+        task_tag: TaskTag,
+        lun: u8,
+    ) -> Result<()> {
+        let queue_id = usize::try_from(queue_id).map_err(|_| EINVAL)?;
+        let queue = self.queues.queues.get(queue_id).ok_or(EINVAL)?;
+        self.reg.write_mcq_sq_cleanup_target(
+            queue.descriptor.oprs(),
+            queue_id,
+            lun,
+            task_tag.value(),
+        )?;
+        self.reg
+            .initiate_mcq_sq_cleanup(queue.descriptor.oprs(), queue_id)?;
+        if self
+            .reg
+            .mcq_sq_cleanup_error_code(queue.descriptor.oprs(), queue_id)?
+            != 0
+        {
+            return Err(EIO);
+        }
+        Ok(())
+    }
+
+    fn claim_sqe_nullification(&self, queue_id: u32, task_tag: TaskTag) -> Result<()> {
+        let queue_id = usize::try_from(queue_id).map_err(|_| EINVAL)?;
+        let queue = self.queues.queues.get(queue_id).ok_or(EINVAL)?;
+        let mut submission = queue.submission.lock();
+
+        self.reg
+            .stop_mcq_sq(queue.descriptor.oprs(), queue_id)?;
+
+        let mut claimed = false;
+        let result = (|| {
+            let target = self.dma.transfer_request_desc(task_tag.index())?;
+            let mut completion = queue.completion.lock();
+            completion.update_tail(&self.reg, &queue.descriptor)?;
+            barrier::dma_mb(barrier::Read);
+            if completion.contains_task_tag(&queue.descriptor, task_tag)? {
+                return Err(EAGAIN);
+            }
+
+            let Some(slot) = submission.find_task_slot(
+                &self.reg,
+                &queue.descriptor,
+                &target,
+            )? else {
+                return Err(ENOENT);
+            };
+
+            completion.commit_task_recovery(&queue.descriptor, task_tag)?;
+            claimed = true;
+            submission.nullify_slot(slot)?;
+            barrier::dma_mb(barrier::Write);
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            if claimed {
+                return Err(EIO);
+            }
+            self.reg
+                .start_mcq_sq(queue.descriptor.oprs(), queue_id)?;
+            return Err(error);
+        }
+
+        if let Err(error) = self
+            .reg
+            .start_mcq_sq(queue.descriptor.oprs(), queue_id)
+        {
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    fn finish_sqe_nullification(
+        &self,
+        queue_id: u32,
+        task_tag: TaskTag,
+    ) -> Result<RequestDmaAccessEnded> {
+        let queue_id = usize::try_from(queue_id).map_err(|_| EINVAL)?;
+        let queue = self
+            .queues
+            .queues
+            .get(queue_id)
+            .ok_or(EINVAL)?;
+        let cqe = queue
+            .completion
+            .lock()
+            .take_recovery_completion(task_tag)?;
+        if !matches!(cqe.overall_status().into(), UtpOcs::Aborted) {
+            return Err(EIO);
+        }
+        Ok(RequestDmaAccessEnded::new(task_tag))
+    }
+
+    fn finish_task(&self, queue_id: u32, task_tag: TaskTag) -> Result<RequestDmaAccessEnded> {
+        let queue_id = usize::try_from(queue_id).map_err(|_| EINVAL)?;
+        let queue = self.queues.queues.get(queue_id).ok_or(EINVAL)?;
+        let cqe = queue
+            .completion
+            .lock()
+            .take_recovery_completion(task_tag)?;
+        if !matches!(cqe.overall_status().into(), UtpOcs::Aborted) {
+            return Err(EIO);
+        }
+        self.reg
+            .start_mcq_sq(queue.descriptor.oprs(), queue_id)?;
+        Ok(RequestDmaAccessEnded::new(task_tag))
+    }
+
+    fn restart_logical_unit_queues(
+        &self,
+        targets: &[McqLogicalResetTarget],
+    ) -> Result<()> {
+        for (index, target) in targets.iter().enumerate() {
+            if targets[..index]
+                .iter()
+                .any(|previous| previous.queue_id == target.queue_id)
+            {
+                continue;
+            }
+            let queue_id = usize::try_from(target.queue_id).map_err(|_| EINVAL)?;
+            let queue = self.queues.queues.get(queue_id).ok_or(EINVAL)?;
+            self.reg
+                .start_mcq_sq(queue.descriptor.oprs(), queue_id)?;
+        }
+        Ok(())
+    }
+
+    fn restart_new_logical_unit_queues(
+        &self,
+        targets: &[McqLogicalResetTarget],
+        count: usize,
+    ) -> Result<()> {
+        for (index, target) in targets[..count].iter().enumerate() {
+            if targets[..index]
+                .iter()
+                .any(|previous| previous.queue_id == target.queue_id)
+                || targets
+                    .iter()
+                    .any(|candidate| candidate.queue_id == target.queue_id && candidate.task_claimed)
+            {
+                continue;
+            }
+            let queue_id = usize::try_from(target.queue_id).map_err(|_| EINVAL)?;
+            let queue = self.queues.queues.get(queue_id).ok_or(EINVAL)?;
+            self.reg
+                .start_mcq_sq(queue.descriptor.oprs(), queue_id)?;
+        }
+        Ok(())
+    }
+
+    fn claim_logical_unit(
+        &self,
+        targets: &mut [McqLogicalResetTarget],
+    ) -> Result<()> {
+        if targets.is_empty() {
+            return Err(EINVAL);
+        }
+
+        let mut task_claimed = 0usize;
+        for (index, target) in targets.iter().enumerate() {
+            let queue_id = usize::try_from(target.queue_id).map_err(|_| EINVAL)?;
+            if self.queues.queues.get(queue_id).is_none()
+                || targets[..index]
+                    .iter()
+                    .any(|previous| previous.task_tag == target.task_tag)
+            {
+                return Err(EINVAL);
+            }
+            if target.task_claimed {
+                task_claimed += 1;
+                self.queues.queues[queue_id]
+                    .completion
+                    .lock()
+                    .has_recovery_completion(target.task_tag)?;
+            }
+        }
+        if task_claimed > 1 {
+            return Err(EINVAL);
+        }
+
+        for (index, target) in targets.iter().enumerate() {
+            if targets[..index]
+                .iter()
+                .any(|previous| previous.queue_id == target.queue_id)
+                || targets
+                    .iter()
+                    .any(|candidate| candidate.queue_id == target.queue_id && candidate.task_claimed)
+            {
+                continue;
+            }
+            let queue_id = usize::try_from(target.queue_id).map_err(|_| EINVAL)?;
+            let queue = self.queues.queues.get(queue_id).ok_or(EINVAL)?;
+            if let Err(error) = self
+                .reg
+                .stop_mcq_sq(queue.descriptor.oprs(), queue_id)
+            {
+                let _ = self.restart_new_logical_unit_queues(targets, index);
+                return Err(error);
+            }
+        }
+
+        let mut claimed = task_claimed != 0;
+        for index in 0..targets.len() {
+            let result = (|| {
+                let queue_id =
+                    usize::try_from(targets[index].queue_id).map_err(|_| EINVAL)?;
+                let task_tag = targets[index].task_tag;
+                let task_claimed = targets[index].task_claimed;
+                let queue = self.queues.queues.get(queue_id).ok_or(EINVAL)?;
+                let mut submission = queue.submission.lock();
+                let target = self.dma.transfer_request_desc(task_tag.index())?;
+                let mut completion = queue.completion.lock();
+                completion.update_tail(&self.reg, &queue.descriptor)?;
+                barrier::dma_mb(barrier::Read);
+
+                if !task_claimed {
+                    completion.commit_task_recovery(&queue.descriptor, task_tag)?;
+                    claimed = true;
+                }
+                let slot = submission.find_task_slot(
+                    &self.reg,
+                    &queue.descriptor,
+                    &target,
+                )?;
+                if let Some(slot) = slot {
+                    submission.nullify_slot(slot)?;
+                    targets[index].unfetched = true;
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                if claimed {
+                    barrier::dma_mb(barrier::Write);
+                    return Err(EIO);
+                }
+                let _ = self.restart_new_logical_unit_queues(targets, targets.len());
+                return Err(error);
+            }
+        }
+        barrier::dma_mb(barrier::Write);
+
+        Ok(())
+    }
+
+    fn begin_logical_unit_cleanup(
+        &self,
+        targets: &[McqLogicalResetTarget],
+        lun: u8,
+    ) -> Result<()> {
+        for target in targets.iter().filter(|target| !target.unfetched) {
+            let queue_id = usize::try_from(target.queue_id).map_err(|_| EINVAL)?;
+            let queue = self.queues.queues.get(queue_id).ok_or(EINVAL)?;
+            if queue
+                .completion
+                .lock()
+                .has_recovery_completion(target.task_tag)?
+            {
+                continue;
+            }
+            self.reg.write_mcq_sq_cleanup_target(
+                queue.descriptor.oprs(),
+                queue_id,
+                lun,
+                target.task_tag.value(),
+            )?;
+            self.reg
+                .initiate_mcq_sq_cleanup(queue.descriptor.oprs(), queue_id)?;
+            let cleanup_status = self.reg.mcq_sq_cleanup_error_code(
+                queue.descriptor.oprs(),
+                queue_id,
+            )?;
+            if cleanup_status > 1 {
+                return Err(EIO);
+            }
+            // A status of one means that the SQ no longer contains the
+            // target. The request may have completed after the reset was
+            // committed; the bounded CQ retirement below decides whether DMA
+            // really ended. Other cleanup errors make that proof impossible.
+        }
+
+        self.restart_logical_unit_queues(targets)
+    }
+
+    fn finish_logical_unit(
+        &self,
+        targets: &[McqLogicalResetTarget],
+    ) -> Result<McqRequestsDmaAccessEnded> {
+        for target in targets.iter() {
+            let queue_id = usize::try_from(target.queue_id).map_err(|_| EINVAL)?;
+            let queue = self.queues.queues.get(queue_id).ok_or(EINVAL)?;
+            if !queue
+                .completion
+                .lock()
+                .has_recovery_completion(target.task_tag)?
+            {
+                return Err(EAGAIN);
+            }
+        }
+
+        let mut proof = McqRequestsDmaAccessEnded {
+            task_tags: [0; MCQ_TASK_TAG_WORDS],
+        };
+        for target in targets.iter() {
+            let queue_id = usize::try_from(target.queue_id).map_err(|_| EINVAL)?;
+            let queue = self.queues.queues.get(queue_id).ok_or(EINVAL)?;
+            queue
+                .completion
+                .lock()
+                .take_recovery_completion(target.task_tag)?;
+            proof.insert(target.task_tag)?;
+        }
+        Ok(proof)
     }
 }
 
@@ -640,8 +1191,12 @@ impl UfsTransferOps for McqTransferBackend {
         McqTransferBackend::dump_state(self, tag, reason);
     }
 
-    fn collect_completions(&self, completed: &mut CompletedRequests) -> Result<()> {
+    fn collect_completions(&self, completed: &mut CompletionBatch) -> Result<()> {
         McqTransferBackend::collect_completions(self, completed)
+    }
+
+    fn collect_recovery_completions(&self, completed: &mut CompletionBatch) -> Result<()> {
+        McqTransferBackend::collect_recovery_completions(self, completed)
     }
 
     fn enable_interrupts(&self) {
@@ -651,5 +1206,76 @@ impl UfsTransferOps for McqTransferBackend {
 
     fn reset(&self) -> Result<()> {
         self.activate()
+    }
+
+    fn supports_mcq_task_abort(&self) -> bool {
+        true
+    }
+
+    fn claim_mcq_task(
+        &self,
+        queue_id: u32,
+        task_tag: TaskTag,
+    ) -> Result<()> {
+        self.claim_task(queue_id, task_tag)
+    }
+
+    fn begin_mcq_task_cleanup(
+        &self,
+        queue_id: u32,
+        task_tag: TaskTag,
+        lun: u8,
+    ) -> Result<()> {
+        self.begin_task_cleanup(queue_id, task_tag, lun)
+    }
+
+    fn finish_mcq_task(
+        &self,
+        queue_id: u32,
+        task_tag: TaskTag,
+    ) -> Result<RequestDmaAccessEnded> {
+        self.finish_task(queue_id, task_tag)
+    }
+
+    fn claim_mcq_sqe_nullification(
+        &self,
+        queue_id: u32,
+        task_tag: TaskTag,
+    ) -> Result<()> {
+        self.claim_sqe_nullification(queue_id, task_tag)
+    }
+
+    fn finish_mcq_sqe_nullification(
+        &self,
+        queue_id: u32,
+        task_tag: TaskTag,
+    ) -> Result<RequestDmaAccessEnded> {
+        self.finish_sqe_nullification(queue_id, task_tag)
+    }
+
+    fn supports_mcq_logical_reset(&self) -> bool {
+        true
+    }
+
+    fn claim_mcq_logical_unit(
+        &self,
+        targets: &mut [McqLogicalResetTarget],
+    ) -> Result<()> {
+        self.claim_logical_unit(targets)
+    }
+
+    fn begin_mcq_logical_unit_cleanup(
+        &self,
+        targets: &[McqLogicalResetTarget],
+        lun: u8,
+    ) -> Result<()> {
+        self.begin_logical_unit_cleanup(targets, lun)
+    }
+
+    fn finish_mcq_logical_unit(
+        &self,
+        targets: &[McqLogicalResetTarget],
+    ) -> Result<McqRequestsDmaAccessEnded> {
+        self.finish_logical_unit(targets)
     }
 }

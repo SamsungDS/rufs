@@ -255,7 +255,10 @@ impl UpiuTmReq {
         Self {
             header: UpiuHeader::task_management(request, request_tag),
             input_param1: u32::from(request.lun()).to_be(),
-            input_param2: u32::from(request.task_tag().value()).to_be(),
+            input_param2: request
+                .task_tag()
+                .map_or(0, |task_tag| u32::from(task_tag.value()))
+                .to_be(),
             ..Default::default()
         }
     }
