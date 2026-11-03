@@ -320,6 +320,27 @@ where
         unsafe { T::QueueData::borrow((*self.0.get()).queuedata) }
     }
 
+    /// Stop dispatch from this request queue and wait for in-progress dispatch
+    /// callbacks to finish.
+    ///
+    /// Request completion is not blocked while the queue is quiesced. Calls
+    /// may be nested, but each call must be paired with [`Self::unquiesce`].
+    pub fn quiesce(&self) {
+        // SAFETY: By type invariant, `self.0` is a valid request queue. The
+        // block layer serializes the quiesce depth and waits for dispatch-side
+        // readers before returning.
+        unsafe { bindings::blk_mq_quiesce_queue(self.0.get()) }
+    }
+
+    /// Resume dispatch on this request queue after a matching
+    /// [`Self::quiesce`] call.
+    pub fn unquiesce(&self) {
+        // SAFETY: By type invariant, `self.0` is a valid request queue. The
+        // caller is responsible for pairing this operation with a previous
+        // `quiesce` call.
+        unsafe { bindings::blk_mq_unquiesce_queue(self.0.get()) }
+    }
+
     /// Stop all hardware queues of this [`RequestQueue`].
     pub fn stop_hw_queues(&self) {
         // SAFETY: By type invariant, `self.0` is a valid `request_queue`.
