@@ -393,7 +393,7 @@ impl UfsHostShared {
             );
         }
         if schedule {
-            let _ = workqueue::system().enqueue(self.clone());
+            let _ = workqueue::system_default().enqueue(self.clone());
         }
     }
 
