@@ -7,6 +7,7 @@ use crate::protocol::scsi::*;
 use crate::protocol::{query::UfsDevCmd, UfsCmd};
 use crate::reg::*;
 use crate::resource::HostResources;
+use crate::task_management::TaskManagement;
 use crate::transport::*;
 use crate::uic::UfsUic;
 use crate::variant::{NotifyPhase, UfsVariantOps};
@@ -751,6 +752,7 @@ pub(crate) struct UfsQueue {
     reg: Arc<UfsReg>,
     dma: Arc<UfsDma>,
     uic: Arc<UfsUic>,
+    task_management: Arc<TaskManagement>,
     backend: UfsTransferBackend,
     #[pin]
     recovery: SpinLock<RecoveryState>,
@@ -769,6 +771,7 @@ impl UfsQueue {
         reg: Arc<UfsReg>,
         dma: Arc<UfsDma>,
         uic: Arc<UfsUic>,
+        task_management: Arc<TaskManagement>,
     ) -> Result<Arc<Self>> {
         let backend = UfsTransferBackend::new(config, reg.clone(), dma.clone())?;
         let hw_queues = backend.hw_queues()?;
@@ -812,6 +815,7 @@ impl UfsQueue {
                 reg,
                 dma,
                 uic,
+                task_management,
                 backend,
                 recovery <- new_spinlock!(RecoveryState::Operational),
                 recovery_work <- new_work!("UfsQueue::recovery"),
@@ -892,6 +896,7 @@ impl UfsQueue {
             // during initial host bring-up.
             self.dma.make_hba_operational()?;
             self.backend.reset()?;
+            self.task_management.reset_after_controller_reset()?;
             self.enable_interrupts();
 
             if let Err(e) = self.restore_power_mode(variant) {

@@ -4,6 +4,7 @@
 
 use crate::queue::*;
 use crate::reg::*;
+use crate::task_management::TaskManagement;
 use crate::transport::McqInterruptQueue;
 use crate::uic::*;
 use kernel::irq::{self, Flags, IrqRequest, IrqReturn, ThreadedIrqReturn};
@@ -29,6 +30,7 @@ struct UfsUicHandler {
 struct UfsQueueHandler {
     reg: Arc<UfsReg>,
     queue: Arc<UfsQueue>,
+    task_management: Arc<TaskManagement>,
     policy: UfsInterruptPolicy,
     pending_interrupts: Atomic<u32>,
     per_queue_irqs_active: Atomic<bool>,
@@ -186,7 +188,12 @@ impl irq::ThreadedHandler for UfsQueueHandler {
             if is_transfer_recovery_interrupt(interrupt_status) {
                 self.queue.require_recovery("transfer error interrupt", 0);
             }
-            if !self.per_queue_irqs_active.load(Acquire) {
+            if is_task_management_completion(interrupt_status) {
+                self.task_management.complete();
+            }
+            if !self.per_queue_irqs_active.load(Acquire)
+                && has_queue_completion_or_error(interrupt_status)
+            {
                 self.queue.complete();
             }
         }
@@ -267,11 +274,13 @@ impl<'a> UfsIrq<'a> {
         request: IrqRequest<'a>,
         reg: Arc<UfsReg>,
         queue: Arc<UfsQueue>,
+        task_management: Arc<TaskManagement>,
         policy: UfsInterruptPolicy,
     ) -> Result<()> {
         let handler = try_pin_init!(UfsQueueHandler {
             reg,
             queue,
+            task_management,
             policy,
             pending_interrupts: Atomic::new(0),
             per_queue_irqs_active: Atomic::new(false),

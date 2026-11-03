@@ -18,6 +18,7 @@ use crate::lu::*;
 use crate::queue::*;
 use crate::reg::*;
 use crate::resource::HostResources;
+use crate::task_management::TaskManagement;
 use crate::transport::UfsTransferConfig;
 use crate::uic::*;
 use crate::variant::NotifyPhase;
@@ -83,6 +84,7 @@ pub(crate) struct UfsHost<'a> {
     dma: Arc<UfsDma>,
     irq: Arc<UfsIrq<'a>>,
     uic: Arc<UfsUic>,
+    task_management: Arc<TaskManagement>,
     queue: Arc<UfsQueue>,
     dev: Arc<UfsDev>,
 
@@ -155,6 +157,7 @@ impl<'a> UfsHost<'a> {
                 }
             }
             dma.make_hba_operational()?;
+            let task_management = TaskManagement::new(reg.clone(), dma.clone())?;
 
             let ufs_queue = UfsQueue::new(
                 transfer_config,
@@ -162,6 +165,7 @@ impl<'a> UfsHost<'a> {
                 reg.clone(),
                 dma.clone(),
                 uic.clone(),
+                task_management.clone(),
             )?;
             let dev = UfsDev::new(ufs_queue.clone())?;
             let host = try_pin_init!(Self {
@@ -170,6 +174,7 @@ impl<'a> UfsHost<'a> {
                 dma,
                 irq,
                 uic,
+                task_management,
                 queue: ufs_queue,
                 dev,
                 luns <- new_mutex!(KVec::new()),
@@ -185,6 +190,7 @@ impl<'a> UfsHost<'a> {
                     queue_irq,
                     host.reg.clone(),
                     host.queue.clone(),
+                    host.task_management.clone(),
                     interrupt_policy,
                 )?;
                 // Transfer and backend completion interrupts must not become
@@ -197,7 +203,6 @@ impl<'a> UfsHost<'a> {
                     pr_warn!("rufs: power mode configuration failed: {}\n", e.to_errno(),);
                 }
                 host.alloc_luns()?;
-                host.dev.alloc_tmf_queue(host.reg.nutmrs())?;
                 host.promote_to_operational()?;
                 Ok(())
             });

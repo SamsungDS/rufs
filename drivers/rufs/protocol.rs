@@ -9,6 +9,7 @@ use self::scsi::UfsSCSICmd;
 
 pub(crate) mod query;
 pub(crate) mod scsi;
+pub(crate) mod task_management;
 pub(crate) mod upiu;
 
 #[derive(Copy, Clone)]

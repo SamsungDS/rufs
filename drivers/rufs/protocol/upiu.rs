@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
-use super::{query::*, scsi::*};
+use super::{query::*, scsi::*, task_management::*};
 use kernel::prelude::*;
 use zerocopy_derive::{Immutable, KnownLayout};
 
@@ -165,6 +165,16 @@ impl UpiuHeader {
             ..Default::default()
         }
     }
+
+    fn task_management(request: TaskManagementRequest, request_tag: u8) -> Self {
+        Self {
+            transaction_code: UpiuTransaction::TaskReq as u8,
+            lun: request.lun(),
+            task_tag: request_tag,
+            query_func: request.function() as u8,
+            ..Default::default()
+        }
+    }
 }
 
 #[repr(C, packed)]
@@ -238,6 +248,52 @@ pub(crate) struct UpiuTmRsp {
     reserved: [u32; 3],
     // Task Management doesn't have padding
     // because it is pre-allocated in UTMRD DMA aree directly
+}
+
+impl UpiuTmReq {
+    pub(crate) fn new(request: TaskManagementRequest, request_tag: u8) -> Self {
+        Self {
+            header: UpiuHeader::task_management(request, request_tag),
+            input_param1: u32::from(request.lun()).to_be(),
+            input_param2: u32::from(request.task_tag().value()).to_be(),
+            ..Default::default()
+        }
+    }
+}
+
+impl UpiuTmRsp {
+    pub(crate) fn service_response(
+        &self,
+        request: TaskManagementRequest,
+        request_tag: u8,
+    ) -> Result<TaskManagementServiceResponse> {
+        if !matches!(
+            UpiuTransaction::from(self.header.transaction_code),
+            UpiuTransaction::TaskRsp
+        ) || self.header.lun != request.lun()
+            || self.header.task_tag != request_tag
+        {
+            return Err(EIO);
+        }
+
+        let response = u32::from_be(self.output_param1) & 0xff;
+        let service_response = TaskManagementServiceResponse::try_from(response as u8)?;
+        let expected_success = matches!(
+            service_response,
+            TaskManagementServiceResponse::FunctionComplete
+                | TaskManagementServiceResponse::FunctionSucceeded
+        );
+        let expected_result = if expected_success {
+            TaskManagementCommandResult::Success
+        } else {
+            TaskManagementCommandResult::Failure
+        };
+        if self.header.response != expected_result as u8 {
+            return Err(EIO);
+        }
+
+        Ok(service_response)
+    }
 }
 
 enum QueryOpcode {

@@ -8,6 +8,9 @@ mod prdt;
 use crate::lu::UfsLuBlockOps;
 use crate::protocol::query::*;
 use crate::protocol::scsi::*;
+use crate::protocol::task_management::{
+    TaskManagementRequest, TaskManagementServiceResponse,
+};
 use crate::protocol::upiu::Upiu;
 use crate::protocol::UfsCmd;
 use crate::reg::*;
@@ -92,6 +95,27 @@ impl UfsDma {
 
     pub(crate) fn transfer_slots(&self) -> usize {
         self.transfer_slots
+    }
+
+    pub(crate) fn compose_task_management_request(
+        &self,
+        slot: usize,
+        request: TaskManagementRequest,
+    ) -> Result<()> {
+        let request_tag = u8::try_from(slot).map_err(|_| EINVAL)?;
+        io_project!(self.utmrdl, [try: slot]).copy_write(Utmrd::new(request, request_tag));
+        Ok(())
+    }
+
+    pub(crate) fn fetch_task_management_response(
+        &self,
+        slot: usize,
+        request: TaskManagementRequest,
+    ) -> Result<TaskManagementServiceResponse> {
+        let request_tag = u8::try_from(slot).map_err(|_| EINVAL)?;
+        io_project!(self.utmrdl, [try: slot])
+            .copy_read()
+            .service_response(request, request_tag)
     }
 
     pub(crate) fn make_hba_operational(&self) -> Result<()> {

@@ -1,99 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
 
-use crate::dma::MAX_PRD_ENTRIES;
 use crate::lu::{QueueData, UfsLuBlockOps};
 use crate::protocol::query::*;
 use crate::protocol::UfsCmd;
 use crate::queue::*;
-use kernel::alloc::mempool::MemPool;
-use kernel::block::error::BlkResult;
-use kernel::block::mq::dma_map_iter::DmaMapMempool;
-use kernel::block::mq::{
-    self, BoundRequestQueue, IdleRequest, LimitsBuilder, Request, RequestQueue,
-};
-use kernel::error::{from_err_ptr, to_result};
+use kernel::block::mq::{self, BoundRequestQueue, LimitsBuilder, RequestQueue};
 use kernel::io::poll::read_poll_timeout;
-use kernel::sync::{aref::ARef, Arc, Mutex};
-use kernel::time::{delay, Delta};
-use kernel::types::Owned;
-use kernel::uapi::NUMA_NO_NODE;
-use kernel::{bindings, kvec, new_mutex, prelude::*};
+use kernel::sync::{Arc, Mutex};
+use kernel::time::Delta;
+use kernel::{new_mutex, prelude::*};
 
 const FDEVICE_COMPL_TIMEOUT_MS: i64 = 1500;
 const FDEVICE_COMPL_TICK_US: i64 = 500;
-
-struct TaskManagementOps {}
-
-#[vtable]
-impl mq::Operations for TaskManagementOps {
-    const MODULE: &'static kernel::ThisModule = crate::RUFS_MODULE;
-
-    type RequestData = ();
-    type QueueData = ();
-    type HwData = ();
-    type TagSetData = ();
-    type GenDiskData = ();
-
-    fn new_request_data() -> impl PinInit<Self::RequestData> {}
-
-    fn queue_rq(
-        hw_data: (),
-        queue_data: (),
-        rq: Owned<IdleRequest<Self>>,
-        is_last: bool,
-    ) -> BlkResult {
-        todo!()
-    }
-
-    fn commit_rqs(hw_data: (), queue_data: ()) {
-        todo!()
-    }
-
-    fn init_hctx(tagset_data: (), hctx_idx: u32) -> Result<Self::HwData> {
-        Ok(())
-    }
-
-    fn complete(rq: ARef<Request<Self>>) {
-        todo!()
-    }
-}
-
-// This queue is scaffolding for future task-management/error-recovery support.
-// RUFS does not issue TMF requests yet; `queue_tmf()` is only a guard callback
-// so accidental dispatch is rejected instead of silently completing.
-struct TmfQueue {
-    tag_set: Arc<mq::TagSet<TaskManagementOps>>,
-    queue: BoundRequestQueue<TaskManagementOps>,
-}
-
-impl TmfQueue {
-    fn new(depth: usize) -> Result<Self> {
-        let tag_set = Arc::pin_init(
-            mq::TagSet::new(
-                1,
-                (),
-                depth.try_into()?,
-                1,
-                kernel::alloc::NumaNode::NO_NODE,
-                mq::tag_set::Flags::empty(),
-            ),
-            GFP_KERNEL,
-        )?;
-
-        let queue = mq::RequestQueue::new(
-            tag_set.clone(),
-            LimitsBuilder::<TaskManagementOps>::new().build()?,
-            (),
-            depth as u32,
-        )?;
-
-        Ok(Self { tag_set, queue })
-    }
-}
 
 #[derive(Default)]
 pub(crate) struct UfsDevInfo {
@@ -115,8 +35,6 @@ pub(crate) struct UfsDev {
     #[pin]
     pub(crate) info: Mutex<UfsDevInfo>,
 
-    #[pin]
-    tmf_queue: Mutex<Option<TmfQueue>>,
 }
 
 impl UfsDev {
@@ -135,26 +53,11 @@ impl UfsDev {
                 ufs_queue,
                 request_queue,
                 info <- new_mutex!(UfsDevInfo::default()),
-                tmf_queue <- new_mutex!(None),
             }),
             GFP_KERNEL,
         )?;
 
         Ok(this)
-    }
-
-    // Allocate the placeholder TMF blk-mq objects early so the ownership and
-    // cleanup path are exercised, but do not treat this as functional TMF
-    // support. Real TMF request composition/completion belongs with error
-    // recovery.
-    pub(crate) fn alloc_tmf_queue(&self, depth: usize) -> Result<()> {
-        let mut tmf_queue = self.tmf_queue.lock();
-        if tmf_queue.is_some() {
-            return Err(EBUSY);
-        }
-
-        tmf_queue.replace(TmfQueue::new(depth)?);
-        Ok(())
     }
 
     fn submit(&self, cmd: UfsCmd) -> Result<UfsCmd> {
@@ -168,7 +71,7 @@ impl UfsDev {
     }
 
     fn nop(&self) -> Result<()> {
-        let cmd = self.submit(UfsDevCmd::nop())?;
+        self.submit(UfsDevCmd::nop())?;
         Ok(())
     }
 

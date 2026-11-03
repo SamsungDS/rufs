@@ -22,6 +22,7 @@ mod protocol;
 mod queue;
 mod reg;
 mod resource;
+mod task_management;
 mod transport;
 mod uic;
 mod variant;

@@ -209,7 +209,7 @@ const UIC_INTR_HIBERNATE_MASK: u32 = UIC_HIBERNATE_EXIT | UIC_HIBERNATE_ENTER;
 const UIC_INTR_POWER_MASK: u32 = UIC_POWER_MODE | UIC_INTR_HIBERNATE_MASK;
 const UIC_INTR_MASK: u32 = UIC_INTR_POWER_MASK | UIC_COMMAND_COMPL;
 
-const UTP_REQ_COMPL_MASK: u32 = UTP_TRANSFER_REQ_COMPL;
+const UTP_REQ_COMPL_MASK: u32 = UTP_TRANSFER_REQ_COMPL | UTP_TASK_REQ_COMPL;
 const ERROR_MASK: u32 = UIC_ERROR
     | UIC_LINK_LOST
     | DEVICE_FATAL_ERROR
@@ -545,9 +545,27 @@ impl UfsReg {
     }
 
     #[inline]
-    pub(crate) fn clear_utmrl_slots(&self, mask: u32) {
+    pub(crate) fn clear_utmrl_slot(&self, slot: u32) -> Result<()> {
+        let mask = 1u32.checked_shl(slot).ok_or(EINVAL)?;
         let access = self.resources.hci_access().unwrap();
-        access.write_reg(UTP_TASK_REQ_LIST_CLEAR::zeroed().with_value(mask))
+        access.write_reg(UTP_TASK_REQ_LIST_CLEAR::zeroed().with_value(!mask));
+        Ok(())
+    }
+
+    pub(crate) fn wait_for_utmrl_slot_clear(
+        &self,
+        slot: u32,
+        interval_us: i64,
+        timeout_ms: i64,
+    ) -> Result<()> {
+        let mask = 1u32.checked_shl(slot).ok_or(EINVAL)?;
+        read_poll_timeout(
+            || Ok(self.read_utmrl_doorbell()),
+            |doorbell: &u32| doorbell & mask == 0,
+            Delta::from_micros(interval_us),
+            Delta::from_millis(timeout_ms),
+        )
+        .map(|_| ())
     }
 
     // UIC command
@@ -1343,11 +1361,11 @@ impl UfsReg {
     pub(crate) fn read_transfer_interrupts(&self) -> u32 {
         self.read_is()
             & self.read_ie()
-            & (UTP_TRANSFER_REQ_COMPL | MCQ_CQ_EVENT_STATUS | ERROR_MASK)
+            & (UTP_REQ_COMPL_MASK | MCQ_CQ_EVENT_STATUS | ERROR_MASK)
     }
 
     pub(crate) fn confirm_transfer_interrupts(&self, value: u32) {
-        self.write_is(value & (UTP_TRANSFER_REQ_COMPL | MCQ_CQ_EVENT_STATUS | ERROR_MASK));
+        self.write_is(value & (UTP_REQ_COMPL_MASK | MCQ_CQ_EVENT_STATUS | ERROR_MASK));
     }
 
     pub(crate) fn confirm_mcq_cq_events(&self, value: u32) {
@@ -1355,7 +1373,7 @@ impl UfsReg {
     }
 
     pub(crate) fn confirm_deferred_transfer_interrupts(&self, value: u32) {
-        self.write_is(value & (UTP_TRANSFER_REQ_COMPL | ERROR_MASK));
+        self.write_is(value & (UTP_REQ_COMPL_MASK | ERROR_MASK));
     }
 
     pub(crate) fn enable_transfer_interrupts(&self) {
@@ -1431,7 +1449,17 @@ pub(crate) fn is_error_interrupt(interrupt_status: u32) -> bool {
 
 #[inline]
 pub(crate) fn has_deferred_transfer_interrupts(interrupt_status: u32) -> bool {
-    (interrupt_status & (UTP_TRANSFER_REQ_COMPL | ERROR_MASK)) != 0
+    (interrupt_status & (UTP_REQ_COMPL_MASK | ERROR_MASK)) != 0
+}
+
+#[inline]
+pub(crate) fn is_task_management_completion(interrupt_status: u32) -> bool {
+    (interrupt_status & UTP_TASK_REQ_COMPL) != 0
+}
+
+#[inline]
+pub(crate) fn has_queue_completion_or_error(interrupt_status: u32) -> bool {
+    (interrupt_status & (UTP_TRANSFER_REQ_COMPL | MCQ_CQ_EVENT_STATUS | ERROR_MASK)) != 0
 }
 
 #[inline]

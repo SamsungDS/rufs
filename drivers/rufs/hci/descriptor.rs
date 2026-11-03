@@ -3,6 +3,9 @@
 //! UFSHCI request and queue descriptor layouts.
 
 use crate::protocol::scsi::*;
+use crate::protocol::task_management::{
+    TaskManagementRequest, TaskManagementServiceResponse,
+};
 use crate::protocol::upiu::{Upiu, UpiuTmReq, UpiuTmRsp};
 use crate::protocol::UfsCmd;
 use kernel::bits::{genmask_u64, genmask_u8};
@@ -125,6 +128,10 @@ struct ReqDescHeader {
 }
 
 impl ReqDescHeader {
+    fn ocs(&self) -> u8 {
+        self.ocs & MASK_OCS
+    }
+
     fn set_cmd_type(&mut self, cmd_type: UtpCmdType) {
         self.ctrl &= !genmask_u8(4..=7);
         self.ctrl |= ((cmd_type as u8) << 4) & genmask_u8(4..=7);
@@ -256,16 +263,43 @@ impl Utrd {
     }
 
     pub(crate) fn ocs(&self) -> u8 {
-        self.header.ocs & MASK_OCS
+        self.header.ocs()
     }
 }
 
 #[repr(C, packed)]
-#[derive(FromBytes, IntoBytes)]
+#[derive(Default, Clone, Copy, FromBytes, IntoBytes)]
 pub(crate) struct Utmrd {
     header: ReqDescHeader,
     upiu_req: UpiuTmReq,
     upiu_rsp: UpiuTmRsp,
+}
+
+impl Utmrd {
+    pub(crate) fn new(request: TaskManagementRequest, request_tag: u8) -> Self {
+        Self {
+            header: ReqDescHeader::device(),
+            upiu_req: UpiuTmReq::new(request, request_tag),
+            upiu_rsp: UpiuTmRsp::default(),
+        }
+    }
+
+    pub(crate) fn service_response(
+        &self,
+        request: TaskManagementRequest,
+        request_tag: u8,
+    ) -> Result<TaskManagementServiceResponse> {
+        match self.header.ocs().into() {
+            UtpOcs::Success => self.upiu_rsp.service_response(request, request_tag),
+            UtpOcs::InvalidCmdTableAttr
+            | UtpOcs::InvalidPrdtAttr
+            | UtpOcs::MismatchDataBufSize
+            | UtpOcs::MisMatchRespUpiuSize
+            | UtpOcs::InvalidCryptoConfig
+            | UtpOcs::GeneralCryptoError => Err(EINVAL),
+            _ => Err(EIO),
+        }
+    }
 }
 
 const _: () = assert!(size_of::<ReqDescHeader>() == 16);
