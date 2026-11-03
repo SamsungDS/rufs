@@ -1047,6 +1047,16 @@ pub fn system() -> &'static Queue {
     unsafe { Queue::from_raw(bindings::system_wq) }
 }
 
+/// Returns the default unbound system work queue (`system_dfl_wq`).
+///
+/// Workers are not bound to a specific CPU, and work items execute subject to
+/// the queue's `max_active` limit. This is the default queue for work that does
+/// not require per-CPU concurrency management.
+pub fn system_default() -> &'static Queue {
+    // SAFETY: `system_dfl_wq` is a C global, always available.
+    unsafe { Queue::from_raw(bindings::system_dfl_wq) }
+}
+
 /// Returns the system high-priority work queue (`system_highpri_wq`).
 ///
 /// It is similar to the one returned by [`system`] but for work items which require higher
