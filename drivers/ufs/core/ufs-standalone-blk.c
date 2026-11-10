@@ -19,7 +19,49 @@ struct ufs_sa_host {
 	struct ufs_hba *hba;
 	struct ufs_sa_lu lus[UFS_SA_MAX_LUS];
 	unsigned int nr_lus;
+	struct mutex tm_lock;
 };
+
+enum ufs_sa_tm_op {
+	UFS_SA_TM_QUERY_TASK,
+	UFS_SA_TM_ABORT_TASK,
+	UFS_SA_TM_LOGICAL_RESET,
+};
+
+struct ufs_sa_tm_result {
+	int error;
+	u8 response;
+};
+
+static struct ufs_sa_tm_result ufs_sa_exec_tm(struct ufs_sa_host *host,
+					       enum ufs_sa_tm_op op, u8 lun,
+					       u8 task_tag)
+{
+	struct ufs_sa_tm_result result = { .response = 0xff };
+	u8 function;
+
+	switch (op) {
+	case UFS_SA_TM_QUERY_TASK:
+		function = UFS_QUERY_TASK;
+		break;
+	case UFS_SA_TM_ABORT_TASK:
+		function = UFS_ABORT_TASK;
+		break;
+	case UFS_SA_TM_LOGICAL_RESET:
+		function = UFS_LOGICAL_RESET;
+		task_tag = 0;
+		break;
+	default:
+		result.error = -EINVAL;
+		return result;
+	}
+
+	mutex_lock(&host->tm_lock);
+	result.error = ufshcd_issue_tm_cmd(host->hba, lun, task_tag, function,
+					   &result.response);
+	mutex_unlock(&host->tm_lock);
+	return result;
+}
 
 struct ufs_sa_pdu {
 	struct scsi_cmnd cmd;
@@ -300,6 +342,7 @@ static int ufs_sa_init(struct ufs_hba *hba)
 	if (!host)
 		return -ENOMEM;
 	host->hba = hba;
+	mutex_init(&host->tm_lock);
 	hba->standalone_host = host;
 	memset(set, 0, sizeof(*set));
 	set->ops = &ufs_sa_mq_ops;
