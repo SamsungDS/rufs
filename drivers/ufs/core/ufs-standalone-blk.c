@@ -29,6 +29,7 @@ enum ufs_sa_request_state {
 	UFS_SA_REQ_ACTIVE,
 	UFS_SA_REQ_TIMED_OUT,
 	UFS_SA_REQ_ABORT_COMMITTED,
+	UFS_SA_REQ_LU_RESET_COMMITTED,
 	UFS_SA_REQ_RETIRED,
 };
 
@@ -371,6 +372,11 @@ struct ufs_sa_timeout_set {
 	unsigned long tags;
 };
 
+struct ufs_sa_lu_request_set {
+	u8 lun;
+	unsigned long tags;
+};
+
 static bool ufs_sa_collect_timeout(struct request *rq, void *data)
 {
 	struct ufs_sa_timeout_set *set = data;
@@ -387,6 +393,31 @@ static bool ufs_sa_collect_timeout(struct request *rq, void *data)
 static struct request *ufs_sa_tag_to_rq(struct ufs_hba *hba, unsigned int tag)
 {
 	return blk_mq_tag_to_rq(hba->standalone_tag_set.shared_tags, tag);
+}
+
+static bool ufs_sa_commit_lu_request(struct request *rq, void *data)
+{
+	struct ufs_sa_lu_request_set *set = data;
+	struct ufs_sa_lu *lu = rq->q->queuedata;
+	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
+	unsigned long flags;
+
+	if (lu->lun != set->lun)
+		return true;
+
+	spin_lock_irqsave(&pdu->state_lock, flags);
+	switch (pdu->state) {
+	case UFS_SA_REQ_ACTIVE:
+	case UFS_SA_REQ_TIMED_OUT:
+	case UFS_SA_REQ_ABORT_COMMITTED:
+		pdu->state = UFS_SA_REQ_LU_RESET_COMMITTED;
+		__set_bit(rq->tag, &set->tags);
+		break;
+	default:
+		break;
+	}
+	spin_unlock_irqrestore(&pdu->state_lock, flags);
+	return true;
 }
 
 static void ufs_sa_release_hardware(struct ufs_hba *hba,
@@ -477,12 +508,60 @@ static void ufs_sa_reconcile_completions(struct ufs_hba *hba)
 	for (queue = 0; queue < hba->nr_hw_queues; queue++)
 		ufshcd_mcq_poll_cqe_lock(hba, &hba->uhq[queue]);
 }
+
+static int ufs_sa_retire_reset_request(struct ufs_sa_host *host,
+				       struct request *rq)
+{
+	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
+	unsigned long flags;
+	int clear_error;
+
+	clear_error = ufshcd_clear_cmd(host->hba, rq->tag);
+	spin_lock_irqsave(&pdu->state_lock, flags);
+	if (clear_error && pdu->state != UFS_SA_REQ_RETIRED) {
+		spin_unlock_irqrestore(&pdu->state_lock, flags);
+		return clear_error;
+	}
+	pdu->state = UFS_SA_REQ_RETIRED;
+	spin_unlock_irqrestore(&pdu->state_lock, flags);
+	ufs_sa_requeue_recovered(rq);
+	return 0;
+}
+
+static int ufs_sa_recover_lu(struct ufs_sa_host *host, u8 lun)
+{
+	struct ufs_hba *hba = host->hba;
+	struct ufs_sa_lu_request_set requests = { .lun = lun };
+	struct ufs_sa_tm_result result;
+	unsigned int tag;
+	int error = 0;
+
+	blk_mq_tagset_busy_iter(&hba->standalone_tag_set,
+				ufs_sa_commit_lu_request, &requests);
+	if (!requests.tags)
+		return 0;
+
+	result = ufs_sa_exec_tm(host, UFS_SA_TM_LOGICAL_RESET, lun, 0);
+	if (result.error)
+		return result.error;
+	if (result.response != UPIU_TASK_MANAGEMENT_FUNC_COMPL)
+		return -EIO;
+
+	for_each_set_bit(tag, &requests.tags, hba->nutrs) {
+		struct request *rq = ufs_sa_tag_to_rq(hba, tag);
+
+		if (rq && ufs_sa_retire_reset_request(host, rq) && !error)
+			error = -EIO;
+	}
+	return error;
+}
 static void ufs_sa_recovery_work(struct work_struct *work)
 {
 	struct ufs_sa_host *host = container_of(work, struct ufs_sa_host,
 						 recovery_work);
 	struct ufs_hba *hba = host->hba;
 	struct ufs_sa_timeout_set timed_out = { };
+	unsigned long failed_lus = 0;
 	unsigned int tag;
 	bool failed = false;
 
@@ -496,6 +575,13 @@ static void ufs_sa_recovery_work(struct work_struct *work)
 
 		if (rq && ufs_sa_abort_request(host, rq)) {
 			dev_err(hba->dev, "task recovery failed for tag %u\n", tag);
+			__set_bit(((struct ufs_sa_lu *)rq->q->queuedata)->lun,
+				  &failed_lus);
+		}
+	}
+	for_each_set_bit(tag, &failed_lus, UFS_SA_MAX_LUS) {
+		if (ufs_sa_recover_lu(host, tag)) {
+			dev_err(hba->dev, "LU recovery failed for LUN %u\n", tag);
 			failed = true;
 		}
 	}
@@ -585,7 +671,8 @@ static void ufs_sa_complete_from_hardware(struct ufs_hba *hba,
 		complete = true;
 		break;
 	case UFS_SA_REQ_ABORT_COMMITTED:
-		/* Recovery owns disposition after the commitment boundary. */
+	case UFS_SA_REQ_LU_RESET_COMMITTED:
+		/* Recovery owns disposition after either commitment boundary. */
 		pdu->state = UFS_SA_REQ_RETIRED;
 		break;
 	default:
