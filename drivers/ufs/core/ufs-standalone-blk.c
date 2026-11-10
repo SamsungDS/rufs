@@ -3,6 +3,7 @@
 
 #define UFS_SA_MAX_LUS UFS_UPIU_MAX_UNIT_NUM_ID
 #define UFS_SA_INLINE_SG 4
+#define UFS_SA_MAX_REQUEST_RETRIES 5
 
 struct ufs_sa_lu {
 	struct ufs_hba *hba;
@@ -43,6 +44,12 @@ enum ufs_sa_tm_op {
 	UFS_SA_TM_QUERY_TASK,
 	UFS_SA_TM_ABORT_TASK,
 	UFS_SA_TM_LOGICAL_RESET,
+};
+
+enum ufs_sa_disposition {
+	UFS_SA_DISPOSITION_REQUEUE,
+	UFS_SA_DISPOSITION_END_TIMEOUT,
+	UFS_SA_DISPOSITION_END_IOERR,
 };
 
 struct ufs_sa_tm_result {
@@ -88,6 +95,8 @@ struct ufs_sa_pdu {
 	spinlock_t state_lock;
 	enum ufs_sa_request_state state;
 	bool hardware_released;
+	bool timed_out_origin;
+	u8 retries;
 };
 
 static struct ufs_sa_host *ufs_sa_host(struct ufs_hba *hba)
@@ -204,19 +213,73 @@ static blk_status_t ufs_sa_queue_rq(struct blk_mq_hw_ctx *hctx,
 	spin_lock_irq(&pdu->state_lock);
 	pdu->state = UFS_SA_REQ_ACTIVE;
 	pdu->hardware_released = false;
+	pdu->timed_out_origin = false;
 	spin_unlock_irq(&pdu->state_lock);
 	blk_mq_start_request(rq);
 	ufshcd_send_command(hba, cmd, hwq);
 	return BLK_STS_OK;
 }
 
+static bool ufs_sa_retryable_completion(struct scsi_cmnd *cmd)
+{
+	struct scsi_sense_hdr sense;
+	u8 status = status_byte(cmd->result);
+
+	if (host_byte(cmd->result) == DID_REQUEUE)
+		return true;
+	if (status == SAM_STAT_BUSY || status == SAM_STAT_TASK_SET_FULL)
+		return true;
+	return status == SAM_STAT_CHECK_CONDITION &&
+		scsi_command_normalize_sense(cmd, &sense) &&
+		sense.sense_key == UNIT_ATTENTION;
+}
+
+static bool ufs_sa_consume_retry(struct request *rq)
+{
+	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
+	unsigned long flags;
+	bool retry = false;
+
+	if (rq->cmd_flags & REQ_FAILFAST_MASK)
+		return false;
+	spin_lock_irqsave(&pdu->state_lock, flags);
+	if (pdu->retries < UFS_SA_MAX_REQUEST_RETRIES) {
+		pdu->retries++;
+		retry = true;
+	}
+	spin_unlock_irqrestore(&pdu->state_lock, flags);
+	return retry;
+}
+
+static void ufs_sa_reset_retries(struct ufs_sa_pdu *pdu)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdu->state_lock, flags);
+	pdu->retries = 0;
+	spin_unlock_irqrestore(&pdu->state_lock, flags);
+}
+
 static void ufs_sa_complete(struct request *rq)
 {
 	struct ufs_sa_lu *lu = rq->q->queuedata;
-	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
-	blk_status_t status = cmd->result ? BLK_STS_IOERR : BLK_STS_OK;
+	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
+	struct scsi_cmnd *cmd = &pdu->cmd;
+	bool error = cmd->result || scsi_get_resid(cmd);
+	bool retry = error && ufs_sa_retryable_completion(cmd) &&
+		ufs_sa_consume_retry(rq);
+	blk_status_t status = error ? BLK_STS_IOERR : BLK_STS_OK;
+	unsigned long flags;
 
 	ufs_sa_unmap(lu->hba, cmd);
+	spin_lock_irqsave(&pdu->state_lock, flags);
+	pdu->state = UFS_SA_REQ_IDLE;
+	spin_unlock_irqrestore(&pdu->state_lock, flags);
+	if (retry) {
+		blk_mq_requeue_request(rq, true);
+		return;
+	}
+	ufs_sa_reset_retries(pdu);
 	blk_mq_end_request(rq, status);
 }
 
@@ -231,6 +294,7 @@ static enum blk_eh_timer_return ufs_sa_timeout(struct request *rq)
 	spin_lock_irqsave(&pdu->state_lock, flags);
 	if (pdu->state == UFS_SA_REQ_ACTIVE) {
 		pdu->state = UFS_SA_REQ_TIMED_OUT;
+		pdu->timed_out_origin = true;
 		schedule = true;
 	}
 	spin_unlock_irqrestore(&pdu->state_lock, flags);
@@ -469,7 +533,23 @@ static void ufs_sa_release_hardware(struct ufs_hba *hba,
 	}
 }
 
-static void ufs_sa_requeue_recovered(struct request *rq)
+static enum ufs_sa_disposition ufs_sa_recovery_disposition(struct request *rq)
+{
+	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
+	unsigned long flags;
+	bool timed_out;
+
+	if (ufs_sa_consume_retry(rq))
+		return UFS_SA_DISPOSITION_REQUEUE;
+	spin_lock_irqsave(&pdu->state_lock, flags);
+	timed_out = pdu->timed_out_origin;
+	spin_unlock_irqrestore(&pdu->state_lock, flags);
+	return timed_out ? UFS_SA_DISPOSITION_END_TIMEOUT :
+		UFS_SA_DISPOSITION_END_IOERR;
+}
+
+static void ufs_sa_return_recovered(struct request *rq,
+				    enum ufs_sa_disposition disposition)
 {
 	struct ufs_sa_lu *lu = rq->q->queuedata;
 	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
@@ -480,7 +560,14 @@ static void ufs_sa_requeue_recovered(struct request *rq)
 	spin_lock_irqsave(&pdu->state_lock, flags);
 	pdu->state = UFS_SA_REQ_IDLE;
 	spin_unlock_irqrestore(&pdu->state_lock, flags);
-	blk_mq_requeue_request(rq, true);
+	if (disposition == UFS_SA_DISPOSITION_REQUEUE) {
+		blk_mq_requeue_request(rq, true);
+		return;
+	}
+	ufs_sa_reset_retries(pdu);
+	blk_mq_end_request(rq,
+		disposition == UFS_SA_DISPOSITION_END_TIMEOUT ?
+		BLK_STS_TIMEOUT : BLK_STS_IOERR);
 }
 
 static int ufs_sa_abort_request(struct ufs_sa_host *host, struct request *rq)
@@ -524,7 +611,7 @@ static int ufs_sa_abort_request(struct ufs_sa_host *host, struct request *rq)
 		pdu->state = UFS_SA_REQ_RETIRED;
 	}
 	spin_unlock_irqrestore(&pdu->state_lock, flags);
-	ufs_sa_requeue_recovered(rq);
+	ufs_sa_return_recovered(rq, ufs_sa_recovery_disposition(rq));
 	return 0;
 }
 
@@ -555,7 +642,7 @@ static int ufs_sa_retire_reset_request(struct ufs_sa_host *host,
 	}
 	pdu->state = UFS_SA_REQ_RETIRED;
 	spin_unlock_irqrestore(&pdu->state_lock, flags);
-	ufs_sa_requeue_recovered(rq);
+	ufs_sa_return_recovered(rq, ufs_sa_recovery_disposition(rq));
 	return 0;
 }
 
@@ -611,9 +698,10 @@ static int ufs_sa_validate_lus(struct ufs_sa_host *host)
 
 static void ufs_sa_finish_controller_request(struct ufs_sa_host *host,
 					     struct request *rq,
-					     bool requeue)
+					     bool restored)
 {
 	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
+	enum ufs_sa_disposition disposition;
 	unsigned long flags;
 
 	spin_lock_irqsave(&pdu->state_lock, flags);
@@ -624,10 +712,20 @@ static void ufs_sa_finish_controller_request(struct ufs_sa_host *host,
 	spin_lock_irqsave(&pdu->state_lock, flags);
 	pdu->state = UFS_SA_REQ_IDLE;
 	spin_unlock_irqrestore(&pdu->state_lock, flags);
-	if (requeue)
-		blk_mq_requeue_request(rq, true);
-	else
+	if (!restored) {
+		ufs_sa_reset_retries(pdu);
 		blk_mq_end_request(rq, BLK_STS_IOERR);
+		return;
+	}
+	disposition = ufs_sa_recovery_disposition(rq);
+	if (disposition == UFS_SA_DISPOSITION_REQUEUE) {
+		blk_mq_requeue_request(rq, true);
+		return;
+	}
+	ufs_sa_reset_retries(pdu);
+	blk_mq_end_request(rq,
+		disposition == UFS_SA_DISPOSITION_END_TIMEOUT ?
+		BLK_STS_TIMEOUT : BLK_STS_IOERR);
 }
 
 static int ufs_sa_restore_controller(struct ufs_sa_host *host)
