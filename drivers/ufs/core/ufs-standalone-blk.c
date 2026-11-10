@@ -20,6 +20,16 @@ struct ufs_sa_host {
 	struct ufs_sa_lu lus[UFS_SA_MAX_LUS];
 	unsigned int nr_lus;
 	struct mutex tm_lock;
+	struct mutex recovery_lock;
+	struct work_struct recovery_work;
+};
+
+enum ufs_sa_request_state {
+	UFS_SA_REQ_IDLE,
+	UFS_SA_REQ_ACTIVE,
+	UFS_SA_REQ_TIMED_OUT,
+	UFS_SA_REQ_ABORT_COMMITTED,
+	UFS_SA_REQ_RETIRED,
 };
 
 enum ufs_sa_tm_op {
@@ -68,6 +78,9 @@ struct ufs_sa_pdu {
 	struct ufshcd_lrb lrb;
 	struct scatterlist inline_sg[UFS_SA_INLINE_SG];
 	u8 sense[SCSI_SENSE_BUFFERSIZE];
+	spinlock_t state_lock;
+	enum ufs_sa_request_state state;
+	bool hardware_released;
 };
 
 static struct ufs_sa_host *ufs_sa_host(struct ufs_hba *hba)
@@ -180,6 +193,10 @@ static blk_status_t ufs_sa_queue_rq(struct blk_mq_hw_ctx *hctx,
 			    cmd->sdb.table.sgl);
 	if (hba->mcq_enabled)
 		hwq = ufshcd_mcq_req_to_hwq(hba, rq);
+	spin_lock_irq(&pdu->state_lock);
+	pdu->state = UFS_SA_REQ_ACTIVE;
+	pdu->hardware_released = false;
+	spin_unlock_irq(&pdu->state_lock);
 	blk_mq_start_request(rq);
 	ufshcd_send_command(hba, cmd, hwq);
 	return BLK_STS_OK;
@@ -197,13 +214,31 @@ static void ufs_sa_complete(struct request *rq)
 
 static enum blk_eh_timer_return ufs_sa_timeout(struct request *rq)
 {
+	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
+	struct ufs_sa_lu *lu = rq->q->queuedata;
+	struct ufs_sa_host *host = ufs_sa_host(lu->hba);
+	unsigned long flags;
+	bool schedule = false;
+
+	spin_lock_irqsave(&pdu->state_lock, flags);
+	if (pdu->state == UFS_SA_REQ_ACTIVE) {
+		pdu->state = UFS_SA_REQ_TIMED_OUT;
+		schedule = true;
+	}
+	spin_unlock_irqrestore(&pdu->state_lock, flags);
+	if (schedule)
+		schedule_work(&host->recovery_work);
 	return BLK_EH_RESET_TIMER;
 }
 
 static int ufs_sa_init_request(struct blk_mq_tag_set *set, struct request *rq,
 			       unsigned int hctx_idx, int numa_node)
 {
-	memset(ufs_sa_pdu(rq), 0, sizeof(struct ufs_sa_pdu));
+	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
+
+	memset(pdu, 0, sizeof(*pdu));
+	spin_lock_init(&pdu->state_lock);
+	pdu->state = UFS_SA_REQ_IDLE;
 	return 0;
 }
 
@@ -332,6 +367,146 @@ static int ufs_sa_register_lus(struct ufs_hba *hba)
 	return host->nr_lus ? 0 : ret ? ret : -ENODEV;
 }
 
+struct ufs_sa_timeout_set {
+	unsigned long tags;
+};
+
+static bool ufs_sa_collect_timeout(struct request *rq, void *data)
+{
+	struct ufs_sa_timeout_set *set = data;
+	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdu->state_lock, flags);
+	if (pdu->state == UFS_SA_REQ_TIMED_OUT)
+		__set_bit(rq->tag, &set->tags);
+	spin_unlock_irqrestore(&pdu->state_lock, flags);
+	return true;
+}
+
+static struct request *ufs_sa_tag_to_rq(struct ufs_hba *hba, unsigned int tag)
+{
+	return blk_mq_tag_to_rq(hba->standalone_tag_set.shared_tags, tag);
+}
+
+static void ufs_sa_release_hardware(struct ufs_hba *hba,
+				    struct ufs_sa_pdu *pdu)
+{
+	unsigned long flags;
+	bool release = false;
+
+	spin_lock_irqsave(&pdu->state_lock, flags);
+	if (!pdu->hardware_released) {
+		pdu->hardware_released = true;
+		release = true;
+	}
+	spin_unlock_irqrestore(&pdu->state_lock, flags);
+	if (release) {
+		ufshcd_release(hba);
+		ufshcd_clk_scaling_update_busy(hba);
+	}
+}
+
+static void ufs_sa_requeue_recovered(struct request *rq)
+{
+	struct ufs_sa_lu *lu = rq->q->queuedata;
+	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
+	unsigned long flags;
+
+	ufs_sa_release_hardware(lu->hba, pdu);
+	ufs_sa_unmap(lu->hba, &pdu->cmd);
+	spin_lock_irqsave(&pdu->state_lock, flags);
+	pdu->state = UFS_SA_REQ_IDLE;
+	spin_unlock_irqrestore(&pdu->state_lock, flags);
+	blk_mq_requeue_request(rq, true);
+}
+
+static int ufs_sa_abort_request(struct ufs_sa_host *host, struct request *rq)
+{
+	struct ufs_sa_lu *lu = rq->q->queuedata;
+	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
+	struct ufs_sa_tm_result result;
+	unsigned long flags;
+
+	result = ufs_sa_exec_tm(host, UFS_SA_TM_QUERY_TASK, lu->lun, rq->tag);
+	if (result.error)
+		return result.error;
+	if (result.response != UPIU_TASK_MANAGEMENT_FUNC_SUCCEEDED)
+		return -EAGAIN;
+
+	spin_lock_irqsave(&pdu->state_lock, flags);
+	if (pdu->state != UFS_SA_REQ_TIMED_OUT) {
+		spin_unlock_irqrestore(&pdu->state_lock, flags);
+		return 0;
+	}
+	/* Publishing this state is the logical ABORT commitment boundary. */
+	pdu->state = UFS_SA_REQ_ABORT_COMMITTED;
+	spin_unlock_irqrestore(&pdu->state_lock, flags);
+
+	result = ufs_sa_exec_tm(host, UFS_SA_TM_ABORT_TASK, lu->lun, rq->tag);
+	if (result.error ||
+	    result.response != UPIU_TASK_MANAGEMENT_FUNC_COMPL)
+		return result.error ? result.error : -EIO;
+
+	spin_lock_irqsave(&pdu->state_lock, flags);
+	if (pdu->state == UFS_SA_REQ_ABORT_COMMITTED) {
+		int clear_error;
+
+		spin_unlock_irqrestore(&pdu->state_lock, flags);
+		clear_error = ufshcd_clear_cmd(host->hba, rq->tag);
+		spin_lock_irqsave(&pdu->state_lock, flags);
+		if (clear_error && pdu->state != UFS_SA_REQ_RETIRED) {
+			spin_unlock_irqrestore(&pdu->state_lock, flags);
+			return -EIO;
+		}
+		pdu->state = UFS_SA_REQ_RETIRED;
+	}
+	spin_unlock_irqrestore(&pdu->state_lock, flags);
+	ufs_sa_requeue_recovered(rq);
+	return 0;
+}
+
+static void ufs_sa_reconcile_completions(struct ufs_hba *hba)
+{
+	unsigned int queue;
+
+	if (!hba->mcq_enabled) {
+		ufshcd_poll(hba->host, 0);
+		return;
+	}
+	for (queue = 0; queue < hba->nr_hw_queues; queue++)
+		ufshcd_mcq_poll_cqe_lock(hba, &hba->uhq[queue]);
+}
+static void ufs_sa_recovery_work(struct work_struct *work)
+{
+	struct ufs_sa_host *host = container_of(work, struct ufs_sa_host,
+						 recovery_work);
+	struct ufs_hba *hba = host->hba;
+	struct ufs_sa_timeout_set timed_out = { };
+	unsigned int tag;
+	bool failed = false;
+
+	mutex_lock(&host->recovery_lock);
+	blk_mq_quiesce_tagset(&hba->standalone_tag_set);
+	ufs_sa_reconcile_completions(hba);
+	blk_mq_tagset_busy_iter(&hba->standalone_tag_set,
+				ufs_sa_collect_timeout, &timed_out);
+	for_each_set_bit(tag, &timed_out.tags, hba->nutrs) {
+		struct request *rq = ufs_sa_tag_to_rq(hba, tag);
+
+		if (rq && ufs_sa_abort_request(host, rq)) {
+			dev_err(hba->dev, "task recovery failed for tag %u\n", tag);
+			failed = true;
+		}
+	}
+	/* Keep dispatch stopped when no safe retirement proof was obtained. */
+	if (!failed) {
+		ufs_sa_reconcile_completions(hba);
+		blk_mq_unquiesce_tagset(&hba->standalone_tag_set);
+	}
+	mutex_unlock(&host->recovery_lock);
+}
+
 static int ufs_sa_init(struct ufs_hba *hba)
 {
 	struct ufs_sa_host *host;
@@ -343,6 +518,8 @@ static int ufs_sa_init(struct ufs_hba *hba)
 		return -ENOMEM;
 	host->hba = hba;
 	mutex_init(&host->tm_lock);
+	mutex_init(&host->recovery_lock);
+	INIT_WORK(&host->recovery_work, ufs_sa_recovery_work);
 	hba->standalone_host = host;
 	memset(set, 0, sizeof(*set));
 	set->ops = &ufs_sa_mq_ops;
@@ -368,6 +545,7 @@ static void ufs_sa_exit(struct ufs_hba *hba)
 
 	if (!host)
 		return;
+	cancel_work_sync(&host->recovery_work);
 	for (lun = 0; lun < UFS_SA_MAX_LUS; lun++) {
 		struct ufs_sa_lu *lu = &host->lus[lun];
 
@@ -393,7 +571,29 @@ static bool ufs_sa_is_request(const struct scsi_cmnd *cmd)
 static void ufs_sa_complete_from_hardware(struct ufs_hba *hba,
 					  struct scsi_cmnd *cmd)
 {
-	ufshcd_release(hba);
-	ufshcd_clk_scaling_update_busy(hba);
-	blk_mq_complete_request(scsi_cmd_to_rq(cmd));
+	struct request *rq = scsi_cmd_to_rq(cmd);
+	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
+	unsigned long flags;
+	bool complete = false;
+
+	spin_lock_irqsave(&pdu->state_lock, flags);
+	switch (pdu->state) {
+	case UFS_SA_REQ_ACTIVE:
+	case UFS_SA_REQ_TIMED_OUT:
+		/* A completion observed before ABORT commitment still wins. */
+		pdu->state = UFS_SA_REQ_RETIRED;
+		complete = true;
+		break;
+	case UFS_SA_REQ_ABORT_COMMITTED:
+		/* Recovery owns disposition after the commitment boundary. */
+		pdu->state = UFS_SA_REQ_RETIRED;
+		break;
+	default:
+		break;
+	}
+	spin_unlock_irqrestore(&pdu->state_lock, flags);
+
+	ufs_sa_release_hardware(hba, pdu);
+	if (complete)
+		blk_mq_complete_request(rq);
 }
