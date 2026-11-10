@@ -5995,7 +5995,7 @@ static void ufshcd_clear_polled(struct ufs_hba *hba,
 	int tag;
 
 	for_each_set_bit(tag, completed_reqs, hba->nutrs) {
-		struct scsi_cmnd *cmd = scsi_host_find_tag(hba->host, tag);
+		struct scsi_cmnd *cmd = ufshcd_tag_to_cmd(hba, tag);
 
 		if (!cmd)
 			continue;
