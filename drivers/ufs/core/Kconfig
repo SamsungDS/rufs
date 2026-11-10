@@ -8,6 +8,15 @@
 #	Santosh Yaraganavi <santosh.sy@samsung.com>
 #	Vinayak Holikatti <h.vinayak@samsung.com>
 
+config SCSI_UFSHCD_STANDALONE_ANALYSIS
+	bool "Direct blk-mq UFS frontend for EH analysis"
+	depends on SCSI_UFSHCD
+	help
+	  Build the analysis-only direct blk-mq frontend instead of the
+	  production SCSI frontend. This option exists to quantify which SCSI
+	  error-handling services a native UFS block driver must replace. It is
+	  not intended for production kernels.
+
 config SCSI_UFS_BSG
 	bool "Universal Flash Storage BSG device node"
 	select BLK_DEV_BSGLIB
