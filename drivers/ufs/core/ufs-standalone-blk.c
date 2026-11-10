@@ -22,6 +22,11 @@ struct ufs_sa_host {
 	struct mutex tm_lock;
 	struct mutex recovery_lock;
 	struct work_struct recovery_work;
+	enum {
+		UFS_SA_HOST_ONLINE,
+		UFS_SA_HOST_RECOVERING,
+		UFS_SA_HOST_FAILED,
+	} state;
 };
 
 enum ufs_sa_request_state {
@@ -30,6 +35,7 @@ enum ufs_sa_request_state {
 	UFS_SA_REQ_TIMED_OUT,
 	UFS_SA_REQ_ABORT_COMMITTED,
 	UFS_SA_REQ_LU_RESET_COMMITTED,
+	UFS_SA_REQ_CONTROLLER_RESET_COMMITTED,
 	UFS_SA_REQ_RETIRED,
 };
 
@@ -173,7 +179,8 @@ static blk_status_t ufs_sa_queue_rq(struct blk_mq_hw_ctx *hctx,
 	struct ufs_hw_queue *hwq = NULL;
 	blk_status_t status;
 
-	if (READ_ONCE(hba->ufshcd_state) != UFSHCD_STATE_OPERATIONAL)
+	if (READ_ONCE(ufs_sa_host(hba)->state) != UFS_SA_HOST_ONLINE ||
+	    READ_ONCE(hba->ufshcd_state) != UFSHCD_STATE_OPERATIONAL)
 		return BLK_STS_RESOURCE;
 	memset(cmd, 0, sizeof(*cmd));
 	memset(lrb, 0, sizeof(*lrb));
@@ -280,9 +287,9 @@ static const struct blk_mq_ops ufs_sa_mq_ops = {
 };
 
 static int ufs_sa_read_lu_geometry(struct ufs_hba *hba, u8 lun,
-				   struct ufs_sa_lu *lu)
+				   u64 *block_count, u32 *block_size)
 {
-	__be64 block_count;
+	__be64 raw_block_count;
 	u8 enabled, block_shift;
 	int ret;
 
@@ -297,12 +304,13 @@ static int ufs_sa_read_lu_geometry(struct ufs_hba *hba, u8 lun,
 		return ret;
 	ret = ufshcd_read_unit_desc_param(hba, lun,
 					  UNIT_DESC_PARAM_LOGICAL_BLK_COUNT,
-					  (u8 *)&block_count, sizeof(block_count));
+					  (u8 *)&raw_block_count,
+					  sizeof(raw_block_count));
 	if (ret)
 		return ret;
-	lu->block_size = 1U << block_shift;
-	lu->block_count = be64_to_cpu(block_count);
-	return lu->block_size < SECTOR_SIZE ? -EINVAL : 0;
+	*block_size = 1U << block_shift;
+	*block_count = be64_to_cpu(raw_block_count);
+	return *block_size < SECTOR_SIZE ? -EINVAL : 0;
 }
 
 static int ufs_sa_publish_lu(struct ufs_sa_host *host, u8 lun)
@@ -318,7 +326,8 @@ static int ufs_sa_publish_lu(struct ufs_sa_host *host, u8 lun)
 
 	lu->hba = host->hba;
 	lu->lun = lun;
-	ret = ufs_sa_read_lu_geometry(host->hba, lun, lu);
+	ret = ufs_sa_read_lu_geometry(host->hba, lun, &lu->block_count,
+				      &lu->block_size);
 	if (ret)
 		return ret;
 	lu->sdev.host = host->hba->host;
@@ -411,6 +420,28 @@ static bool ufs_sa_commit_lu_request(struct request *rq, void *data)
 	case UFS_SA_REQ_TIMED_OUT:
 	case UFS_SA_REQ_ABORT_COMMITTED:
 		pdu->state = UFS_SA_REQ_LU_RESET_COMMITTED;
+		__set_bit(rq->tag, &set->tags);
+		break;
+	default:
+		break;
+	}
+	spin_unlock_irqrestore(&pdu->state_lock, flags);
+	return true;
+}
+
+static bool ufs_sa_commit_controller_request(struct request *rq, void *data)
+{
+	struct ufs_sa_timeout_set *set = data;
+	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdu->state_lock, flags);
+	switch (pdu->state) {
+	case UFS_SA_REQ_ACTIVE:
+	case UFS_SA_REQ_TIMED_OUT:
+	case UFS_SA_REQ_ABORT_COMMITTED:
+	case UFS_SA_REQ_LU_RESET_COMMITTED:
+		pdu->state = UFS_SA_REQ_CONTROLLER_RESET_COMMITTED;
 		__set_bit(rq->tag, &set->tags);
 		break;
 	default:
@@ -555,6 +586,85 @@ static int ufs_sa_recover_lu(struct ufs_sa_host *host, u8 lun)
 	}
 	return error;
 }
+
+static int ufs_sa_validate_lus(struct ufs_sa_host *host)
+{
+	unsigned int lun;
+
+	for (lun = 0; lun < UFS_SA_MAX_LUS; lun++) {
+		struct ufs_sa_lu *lu = &host->lus[lun];
+		u64 block_count;
+		u32 block_size;
+		int error;
+
+		if (!lu->published)
+			continue;
+		error = ufs_sa_read_lu_geometry(host->hba, lun, &block_count,
+					       &block_size);
+		if (error)
+			return error;
+		if (block_count != lu->block_count || block_size != lu->block_size)
+			return -ESTALE;
+	}
+	return 0;
+}
+
+static void ufs_sa_finish_controller_request(struct ufs_sa_host *host,
+					     struct request *rq,
+					     bool requeue)
+{
+	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
+	unsigned long flags;
+
+	spin_lock_irqsave(&pdu->state_lock, flags);
+	pdu->state = UFS_SA_REQ_RETIRED;
+	spin_unlock_irqrestore(&pdu->state_lock, flags);
+	ufs_sa_release_hardware(host->hba, pdu);
+	ufs_sa_unmap(host->hba, &pdu->cmd);
+	spin_lock_irqsave(&pdu->state_lock, flags);
+	pdu->state = UFS_SA_REQ_IDLE;
+	spin_unlock_irqrestore(&pdu->state_lock, flags);
+	if (requeue)
+		blk_mq_requeue_request(rq, true);
+	else
+		blk_mq_end_request(rq, BLK_STS_IOERR);
+}
+
+static int ufs_sa_restore_controller(struct ufs_sa_host *host)
+{
+	struct ufs_hba *hba = host->hba;
+	struct ufs_sa_timeout_set requests = { };
+	ktime_t probe_start;
+	unsigned int tag;
+	int error;
+
+	blk_mq_tagset_busy_iter(&hba->standalone_tag_set,
+				ufs_sa_commit_controller_request, &requests);
+
+	ufshcd_device_reset(hba);
+	ufshcd_hba_stop(hba);
+	if (ufshcd_is_hba_active(hba))
+		return -EBUSY;
+
+	error = ufshcd_hba_enable(hba);
+	if (!error)
+		error = ufshcd_device_init(hba, false);
+	probe_start = ktime_get();
+	if (!error)
+		error = ufshcd_probe_hba(hba, false);
+	ufshcd_process_probe_result(hba, probe_start, error);
+	if (!error)
+		error = ufs_sa_validate_lus(host);
+
+	for_each_set_bit(tag, &requests.tags, hba->nutrs) {
+		struct request *rq = ufs_sa_tag_to_rq(hba, tag);
+
+		if (rq)
+			ufs_sa_finish_controller_request(host, rq, !error);
+	}
+	return error;
+}
+
 static void ufs_sa_recovery_work(struct work_struct *work)
 {
 	struct ufs_sa_host *host = container_of(work, struct ufs_sa_host,
@@ -564,8 +674,10 @@ static void ufs_sa_recovery_work(struct work_struct *work)
 	unsigned long failed_lus = 0;
 	unsigned int tag;
 	bool failed = false;
+	bool controller_recovery = false;
 
 	mutex_lock(&host->recovery_lock);
+	WRITE_ONCE(host->state, UFS_SA_HOST_RECOVERING);
 	blk_mq_quiesce_tagset(&hba->standalone_tag_set);
 	ufs_sa_reconcile_completions(hba);
 	blk_mq_tagset_busy_iter(&hba->standalone_tag_set,
@@ -582,13 +694,20 @@ static void ufs_sa_recovery_work(struct work_struct *work)
 	for_each_set_bit(tag, &failed_lus, UFS_SA_MAX_LUS) {
 		if (ufs_sa_recover_lu(host, tag)) {
 			dev_err(hba->dev, "LU recovery failed for LUN %u\n", tag);
-			failed = true;
+			controller_recovery = true;
 		}
+	}
+	if (controller_recovery && ufs_sa_restore_controller(host)) {
+		dev_err(hba->dev, "controller restoration failed\n");
+		failed = true;
 	}
 	/* Keep dispatch stopped when no safe retirement proof was obtained. */
 	if (!failed) {
 		ufs_sa_reconcile_completions(hba);
+		WRITE_ONCE(host->state, UFS_SA_HOST_ONLINE);
 		blk_mq_unquiesce_tagset(&hba->standalone_tag_set);
+	} else {
+		WRITE_ONCE(host->state, UFS_SA_HOST_FAILED);
 	}
 	mutex_unlock(&host->recovery_lock);
 }
@@ -606,6 +725,7 @@ static int ufs_sa_init(struct ufs_hba *hba)
 	mutex_init(&host->tm_lock);
 	mutex_init(&host->recovery_lock);
 	INIT_WORK(&host->recovery_work, ufs_sa_recovery_work);
+	host->state = UFS_SA_HOST_ONLINE;
 	hba->standalone_host = host;
 	memset(set, 0, sizeof(*set));
 	set->ops = &ufs_sa_mq_ops;
@@ -672,6 +792,7 @@ static void ufs_sa_complete_from_hardware(struct ufs_hba *hba,
 		break;
 	case UFS_SA_REQ_ABORT_COMMITTED:
 	case UFS_SA_REQ_LU_RESET_COMMITTED:
+	case UFS_SA_REQ_CONTROLLER_RESET_COMMITTED:
 		/* Recovery owns disposition after either commitment boundary. */
 		pdu->state = UFS_SA_REQ_RETIRED;
 		break;
