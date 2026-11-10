@@ -190,6 +190,9 @@ struct ufshcd_lrb {
 	u8 lun; /* UPIU LUN id field is only 8-bit wide */
 	bool intr_cmd;
 	bool req_abort_skip;
+#ifdef CONFIG_SCSI_UFSHCD_STANDALONE_ANALYSIS
+	bool standalone_req;
+#endif
 	ktime_t issue_time_stamp;
 	u64 issue_time_stamp_local_clock;
 	ktime_t compl_time_stamp;
@@ -1280,6 +1283,12 @@ struct ufs_hba {
 	u8 device_preshoot_cap;
 	u8 device_deemphasis_cap;
 	struct ufshcd_tx_eq_params tx_eq_params[UFS_HS_GEAR_MAX];
+
+#ifdef CONFIG_SCSI_UFSHCD_STANDALONE_ANALYSIS
+	struct blk_mq_tag_set standalone_tag_set;
+	void *standalone_host;
+	bool standalone_tag_set_allocated;
+#endif
 };
 
 /**

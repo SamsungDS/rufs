@@ -434,6 +434,15 @@ static inline bool ufs_is_valid_unit_desc_lun(struct ufs_dev_info *dev_info, u8 
  */
 static inline struct scsi_cmnd *ufshcd_tag_to_cmd(struct ufs_hba *hba, u32 tag)
 {
+#ifdef CONFIG_SCSI_UFSHCD_STANDALONE_ANALYSIS
+	if (hba->standalone_tag_set_allocated && tag >= UFSHCD_NUM_RESERVED) {
+		struct blk_mq_tags *tags = hba->standalone_tag_set.shared_tags;
+		struct request *rq = blk_mq_tag_to_rq(tags, tag);
+
+		if (rq)
+			return blk_mq_rq_to_pdu(rq);
+	}
+#endif
 	struct blk_mq_tags *tags = hba->host->tag_set.shared_tags;
 	struct request *rq = blk_mq_tag_to_rq(tags, tag);
 

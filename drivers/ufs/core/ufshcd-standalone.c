@@ -346,6 +346,9 @@ static void ufshcd_wb_toggle_buf_flush_during_h8(struct ufs_hba *hba,
 						 bool enable);
 static void ufshcd_hba_vreg_set_lpm(struct ufs_hba *hba);
 static void ufshcd_hba_vreg_set_hpm(struct ufs_hba *hba);
+static bool ufs_sa_is_request(const struct scsi_cmnd *cmd);
+static void ufs_sa_complete_from_hardware(struct ufs_hba *hba,
+					  struct scsi_cmnd *cmd);
 
 void ufshcd_enable_irq(struct ufs_hba *hba)
 {
@@ -5945,6 +5948,10 @@ void ufshcd_compl_one_cqe(struct ufs_hba *hba, int task_tag,
 			ufshcd_update_monitor(hba, cmd);
 		ufshcd_add_command_trace(hba, cmd, UFS_CMD_COMP);
 		cmd->result = ufshcd_transfer_rsp_status(hba, cmd, cqe);
+		if (ufs_sa_is_request(cmd)) {
+			ufs_sa_complete_from_hardware(hba, cmd);
+			return;
+		}
 		ufshcd_release_scsi_cmd(hba, cmd);
 	} else {
 		if (cqe) {
@@ -9526,6 +9533,8 @@ static int ufshcd_probe_hba(struct ufs_hba *hba, bool init_dev_params)
 	return 0;
 }
 
+#include "ufs-standalone-blk.c"
+
 /**
  * ufshcd_async_scan - asynchronous execution for probing hba
  * @data: data pointer to pass to this function
@@ -9546,8 +9555,8 @@ static void ufshcd_async_scan(void *data, async_cookie_t cookie)
 	if (ret)
 		goto out;
 
-	/* Probe and add UFS logical units  */
-	ret = ufshcd_add_lus(hba);
+	/* Publish logical units through the direct blk-mq frontend. */
+	ret = ufs_sa_register_lus(hba);
 
 out:
 	pm_runtime_put_sync(hba->dev);
@@ -10901,6 +10910,7 @@ static void ufshcd_wl_shutdown(struct scsi_device *sdev)
  */
 void ufshcd_remove(struct ufs_hba *hba)
 {
+	ufs_sa_exit(hba);
 	if (hba->ufs_device_wlun)
 		ufshcd_rpm_get_sync(hba);
 	ufs_hwmon_remove(hba);
@@ -11321,6 +11331,9 @@ int ufshcd_init(struct ufs_hba *hba, void __iomem *mmio_base, unsigned int irq)
 	}
 
 	err = ufshcd_add_scsi_host(hba);
+	if (err)
+		goto out_disable;
+	err = ufs_sa_init(hba);
 	if (err)
 		goto out_disable;
 
