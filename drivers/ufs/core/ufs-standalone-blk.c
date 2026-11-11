@@ -20,6 +20,7 @@ struct ufs_sa_host {
 	struct ufs_hba *hba;
 	struct ufs_sa_lu lus[UFS_SA_MAX_LUS];
 	unsigned int nr_lus;
+	bool runtime_pm_held;
 	struct mutex tm_lock;
 	struct mutex recovery_lock;
 	struct work_struct recovery_work;
@@ -28,6 +29,10 @@ struct ufs_sa_host {
 		UFS_SA_HOST_RECOVERING,
 		UFS_SA_HOST_FAILED,
 	} state;
+};
+
+static const struct block_device_operations ufs_sa_fops = {
+	.owner = THIS_MODULE,
 };
 
 enum ufs_sa_request_state {
@@ -92,6 +97,7 @@ struct ufs_sa_pdu {
 	struct ufshcd_lrb lrb;
 	struct scatterlist inline_sg[UFS_SA_INLINE_SG];
 	u8 sense[SCSI_SENSE_BUFFERSIZE];
+	unsigned int dma_nents;
 	spinlock_t state_lock;
 	enum ufs_sa_request_state state;
 	bool hardware_released;
@@ -109,14 +115,17 @@ static struct ufs_sa_pdu *ufs_sa_pdu(struct request *rq)
 	return blk_mq_rq_to_pdu(rq);
 }
 
-static void ufs_sa_unmap(struct ufs_hba *hba, struct scsi_cmnd *cmd)
+static void ufs_sa_unmap(struct ufs_hba *hba, struct ufs_sa_pdu *pdu)
 {
+	struct scsi_cmnd *cmd = &pdu->cmd;
+
 	if (!cmd->sdb.table.nents)
 		return;
-	dma_unmap_sg(hba->dev, cmd->sdb.table.sgl, cmd->sdb.table.orig_nents,
+	dma_unmap_sg(hba->dev, cmd->sdb.table.sgl, pdu->dma_nents,
 		     cmd->sc_data_direction);
 	sg_free_table_chained(&cmd->sdb.table, UFS_SA_INLINE_SG);
 	cmd->sdb.table.nents = 0;
+	pdu->dma_nents = 0;
 }
 
 static blk_status_t ufs_sa_map(struct ufs_hba *hba, struct request *rq,
@@ -134,13 +143,14 @@ static blk_status_t ufs_sa_map(struct ufs_hba *hba, struct request *rq,
 				   UFS_SA_INLINE_SG))
 		return BLK_STS_RESOURCE;
 	cmd->sdb.table.nents = __blk_rq_map_sg(rq, cmd->sdb.table.sgl, &last);
-	cmd->sdb.table.orig_nents = cmd->sdb.table.nents;
 	cmd->sdb.length = blk_rq_payload_bytes(rq);
+	pdu->dma_nents = cmd->sdb.table.nents;
 	mapped = dma_map_sg(hba->dev, cmd->sdb.table.sgl,
-			    cmd->sdb.table.orig_nents, cmd->sc_data_direction);
+			    pdu->dma_nents, cmd->sc_data_direction);
 	if (!mapped) {
 		sg_free_table_chained(&cmd->sdb.table, UFS_SA_INLINE_SG);
 		cmd->sdb.table.nents = 0;
+		pdu->dma_nents = 0;
 		return BLK_STS_RESOURCE;
 	}
 	cmd->sdb.table.nents = mapped;
@@ -204,8 +214,8 @@ static blk_status_t ufs_sa_queue_rq(struct blk_mq_hw_ctx *hctx,
 		return status;
 
 	ufshcd_hold(hba);
-	ufshcd_setup_scsi_cmd(hba, cmd, lu->lun, rq->tag);
 	lrb->standalone_req = true;
+	ufshcd_setup_scsi_cmd(hba, cmd, lu->lun, rq->tag);
 	ufshcd_sgl_to_prdt(hba, lrb, cmd->sdb.table.nents,
 			    cmd->sdb.table.sgl);
 	if (hba->mcq_enabled)
@@ -271,7 +281,7 @@ static void ufs_sa_complete(struct request *rq)
 	blk_status_t status = error ? BLK_STS_IOERR : BLK_STS_OK;
 	unsigned long flags;
 
-	ufs_sa_unmap(lu->hba, cmd);
+	ufs_sa_unmap(lu->hba, pdu);
 	spin_lock_irqsave(&pdu->state_lock, flags);
 	pdu->state = UFS_SA_REQ_IDLE;
 	spin_unlock_irqrestore(&pdu->state_lock, flags);
@@ -404,9 +414,7 @@ static int ufs_sa_publish_lu(struct ufs_sa_host *host, u8 lun)
 	lu->queue = lu->disk->queue;
 	lu->queue->queuedata = lu;
 	blk_queue_rq_timeout(lu->queue, 30 * HZ);
-	lu->disk->major = 0;
-	lu->disk->first_minor = 0;
-	lu->disk->minors = 1;
+	lu->disk->fops = &ufs_sa_fops;
 	lu->disk->private_data = lu;
 	snprintf(lu->disk->disk_name, DISK_NAME_LEN, "ufs%dlun%d",
 		 host->hba->host->host_no, lun);
@@ -426,19 +434,39 @@ static int ufs_sa_publish_lu(struct ufs_sa_host *host, u8 lun)
 static int ufs_sa_register_lus(struct ufs_hba *hba)
 {
 	struct ufs_sa_host *host = ufs_sa_host(hba);
+	u8 nr_lus;
 	unsigned int lun;
-	int ret = 0;
+	int ret;
+
+	ret = ufshcd_read_desc_param(hba, QUERY_DESC_IDN_DEVICE, 0,
+				     DEVICE_DESC_PARAM_NUM_LU, &nr_lus,
+				     sizeof(nr_lus));
+	if (ret)
+		return ret;
 
 	for (lun = 0; lun < min_t(unsigned int, hba->dev_info.max_lu_supported,
-					 UFS_SA_MAX_LUS); lun++) {
+					 UFS_SA_MAX_LUS) && host->nr_lus < nr_lus;
+	     lun++) {
 		int err = ufs_sa_publish_lu(host, lun);
 
 		if (err == -ENODEV || err == -EOPNOTSUPP)
 			continue;
-		if (err && !ret)
-			ret = err;
+		if (err)
+			return err;
 	}
-	return host->nr_lus ? 0 : ret ? ret : -ENODEV;
+	if (host->nr_lus != nr_lus)
+		return -ENODEV;
+
+	/*
+	 * The SCSI device hierarchy normally keeps the controller runtime
+	 * active while requests may be dispatched.  This direct frontend has
+	 * no such hierarchy, and queue_rq() cannot synchronously resume a PCI
+	 * device.  Keep one host reference for the lifetime of the published
+	 * disks; PM policy is outside this analysis frontend's scope.
+	 */
+	pm_runtime_get_noresume(hba->dev);
+	host->runtime_pm_held = true;
+	return 0;
 }
 
 struct ufs_sa_timeout_set {
@@ -556,7 +584,7 @@ static void ufs_sa_return_recovered(struct request *rq,
 	unsigned long flags;
 
 	ufs_sa_release_hardware(lu->hba, pdu);
-	ufs_sa_unmap(lu->hba, &pdu->cmd);
+	ufs_sa_unmap(lu->hba, pdu);
 	spin_lock_irqsave(&pdu->state_lock, flags);
 	pdu->state = UFS_SA_REQ_IDLE;
 	spin_unlock_irqrestore(&pdu->state_lock, flags);
@@ -708,7 +736,7 @@ static void ufs_sa_finish_controller_request(struct ufs_sa_host *host,
 	pdu->state = UFS_SA_REQ_RETIRED;
 	spin_unlock_irqrestore(&pdu->state_lock, flags);
 	ufs_sa_release_hardware(host->hba, pdu);
-	ufs_sa_unmap(host->hba, &pdu->cmd);
+	ufs_sa_unmap(host->hba, pdu);
 	spin_lock_irqsave(&pdu->state_lock, flags);
 	pdu->state = UFS_SA_REQ_IDLE;
 	spin_unlock_irqrestore(&pdu->state_lock, flags);
@@ -862,6 +890,10 @@ static void ufs_sa_exit(struct ufs_hba *hba)
 	if (hba->standalone_tag_set_allocated) {
 		hba->standalone_tag_set_allocated = false;
 		blk_mq_free_tag_set(&hba->standalone_tag_set);
+	}
+	if (host->runtime_pm_held) {
+		host->runtime_pm_held = false;
+		pm_runtime_put_noidle(hba->dev);
 	}
 }
 

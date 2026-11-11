@@ -3022,7 +3022,8 @@ static void ufshcd_setup_scsi_cmd(struct ufs_hba *hba, struct scsi_cmnd *cmd,
 	struct ufshcd_lrb *lrbp = scsi_cmd_priv(cmd);
 
 	__ufshcd_setup_cmd(hba, cmd, lun, tag);
-	lrbp->intr_cmd = !ufshcd_is_intr_aggr_allowed(hba);
+	lrbp->intr_cmd = lrbp->standalone_req ||
+			!ufshcd_is_intr_aggr_allowed(hba);
 	lrbp->req_abort_skip = false;
 
 	ufshcd_comp_scsi_upiu(hba, cmd);
