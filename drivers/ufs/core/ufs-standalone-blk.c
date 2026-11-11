@@ -561,6 +561,21 @@ static void ufs_sa_release_hardware(struct ufs_hba *hba,
 	}
 }
 
+static int ufs_sa_clear_request(struct ufs_hba *hba, unsigned int tag)
+{
+	unsigned long flags;
+	int error;
+
+	error = ufshcd_clear_cmd(hba, tag);
+	if (error || hba->mcq_enabled)
+		return error;
+
+	spin_lock_irqsave(&hba->outstanding_lock, flags);
+	__clear_bit(tag, &hba->outstanding_reqs);
+	spin_unlock_irqrestore(&hba->outstanding_lock, flags);
+	return 0;
+}
+
 static enum ufs_sa_disposition ufs_sa_recovery_disposition(struct request *rq)
 {
 	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
@@ -630,7 +645,7 @@ static int ufs_sa_abort_request(struct ufs_sa_host *host, struct request *rq)
 		int clear_error;
 
 		spin_unlock_irqrestore(&pdu->state_lock, flags);
-		clear_error = ufshcd_clear_cmd(host->hba, rq->tag);
+		clear_error = ufs_sa_clear_request(host->hba, rq->tag);
 		spin_lock_irqsave(&pdu->state_lock, flags);
 		if (clear_error && pdu->state != UFS_SA_REQ_RETIRED) {
 			spin_unlock_irqrestore(&pdu->state_lock, flags);
@@ -662,7 +677,7 @@ static int ufs_sa_retire_reset_request(struct ufs_sa_host *host,
 	unsigned long flags;
 	int clear_error;
 
-	clear_error = ufshcd_clear_cmd(host->hba, rq->tag);
+	clear_error = ufs_sa_clear_request(host->hba, rq->tag);
 	spin_lock_irqsave(&pdu->state_lock, flags);
 	if (clear_error && pdu->state != UFS_SA_REQ_RETIRED) {
 		spin_unlock_irqrestore(&pdu->state_lock, flags);
@@ -905,7 +920,8 @@ static bool ufs_sa_is_request(const struct scsi_cmnd *cmd)
 }
 
 static void ufs_sa_complete_from_hardware(struct ufs_hba *hba,
-					  struct scsi_cmnd *cmd)
+					  struct scsi_cmnd *cmd,
+					  struct cq_entry *cqe)
 {
 	struct request *rq = scsi_cmd_to_rq(cmd);
 	struct ufs_sa_pdu *pdu = ufs_sa_pdu(rq);
@@ -932,6 +948,8 @@ static void ufs_sa_complete_from_hardware(struct ufs_hba *hba,
 	spin_unlock_irqrestore(&pdu->state_lock, flags);
 
 	ufs_sa_release_hardware(hba, pdu);
-	if (complete)
+	if (complete) {
+		cmd->result = ufshcd_transfer_rsp_status(hba, cmd, cqe);
 		blk_mq_complete_request(rq);
+	}
 }

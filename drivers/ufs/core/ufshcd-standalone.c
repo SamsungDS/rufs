@@ -348,7 +348,8 @@ static void ufshcd_hba_vreg_set_lpm(struct ufs_hba *hba);
 static void ufshcd_hba_vreg_set_hpm(struct ufs_hba *hba);
 static bool ufs_sa_is_request(const struct scsi_cmnd *cmd);
 static void ufs_sa_complete_from_hardware(struct ufs_hba *hba,
-					  struct scsi_cmnd *cmd);
+					  struct scsi_cmnd *cmd,
+					  struct cq_entry *cqe);
 
 void ufshcd_enable_irq(struct ufs_hba *hba)
 {
@@ -5948,11 +5949,11 @@ void ufshcd_compl_one_cqe(struct ufs_hba *hba, int task_tag,
 		if (unlikely(ufshcd_should_inform_monitor(hba, cmd)))
 			ufshcd_update_monitor(hba, cmd);
 		ufshcd_add_command_trace(hba, cmd, UFS_CMD_COMP);
-		cmd->result = ufshcd_transfer_rsp_status(hba, cmd, cqe);
 		if (ufs_sa_is_request(cmd)) {
-			ufs_sa_complete_from_hardware(hba, cmd);
+			ufs_sa_complete_from_hardware(hba, cmd, cqe);
 			return;
 		}
+		cmd->result = ufshcd_transfer_rsp_status(hba, cmd, cqe);
 		ufshcd_release_scsi_cmd(hba, cmd);
 	} else {
 		if (cqe) {
